@@ -1060,8 +1060,14 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // big fader's top in every row — and the symbol column starts directly
     // below it.  The slack stays under the column, so the four symbols share
     // one absolute height across all strips.
+    // A little air under the FX fader (and under the fader top on units
+    // without one), so the symbols do not crowd the slider above them.
+    let top_gap: Element<'a, Message> = iced::widget::Space::new()
+        .height(Length::Fixed(theme::SPACE_SM * scale))
+        .into();
     let icon_col = column![
         fx_fader.unwrap_or_else(|| iced::widget::Space::new().height(Length::Fixed(0.0)).into()),
+        top_gap,
         icon_col,
         iced::widget::Space::new().height(Length::Fill),
     ]
