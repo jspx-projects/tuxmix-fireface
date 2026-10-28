@@ -71,8 +71,9 @@ Authoritative files:
 
 - `docs/spec/UCX-CONTROL-SPEC.md` — UCX transport, registers, controls,
   metering.
-- `docs/spec/TUXMIX-SPEC.md` — visible UI, panels, state and persistence.
 - `docs/spec/UC-CONTROL-SPEC.md` — UC-specific protocol and controls.
+- `docs/spec/BABYFACE-PRO-CONTROL-SPEC.md` — Babyface Pro FS channel model,
+  ALSA surface, vendor USB protocol, DSP EQ blocks and metering.
 
 ## UI rules
 
