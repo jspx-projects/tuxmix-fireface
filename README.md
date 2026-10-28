@@ -58,8 +58,7 @@ The UCX uses the isochronous interface by default (`ucx_if5=0`); set
 `ucx_if5=1` for the interrupt interface.  The UC uses the personality selected
 on the unit (PC or AP).
 
-Normal RME mode uses RME's vendor protocol.  Class Compliant mode uses UAC2
-and the host class driver; the unit's stored mixer controls routing.
+Normal RME vendor mode uses RME's proprietary protocol over USB.
 
 One module instance handles several units.  TuxMix identifies each unit by
 its serial number, remembers the selected unit across restarts, and opens that
@@ -147,7 +146,6 @@ The measured latency chain is documented in
 - Matrix, masters, mutes, pan, loopback, preamps, EQ/dynamics, clock and
   meters.
 - Several cards, including identical models, selected by serial.
-- Class Compliant cards through stock ALSA/PipeWire.
 - Babyface Pro FS through the inherited ALSA and direct-USB backends.
 - TuxMix GUI and TUI over the hwdep backend.
 
@@ -170,16 +168,22 @@ under GPL-3.0-or-later.
 
 ## Credits and attribution
 
-This tree is based on [TuxMix](https://github.com/ismail-bahloul/TuxMix) by
-Ismaïl Bahloul, at his release 0.3.1.  From that project we inherited the
-mixer application, its device model, the Babyface Pro FS support (the ALSA
-and direct-USB backends in `ui/tuxmix/tuxmix-usb`), the TUI and the scene
-system.  TuxMix is MIT licensed; the license and copyright notice are kept
-in [ui/tuxmix/LICENSE](ui/tuxmix/LICENSE), and his commit history is part of
-this repository.
+This project is built on prior work, and we are grateful to its authors.
 
-The Fireface UC/UCX kernel module, the OSC layer, the GUI's mixer and
-Control Room extensions and the Fireface backends were developed in this
-tree.  All Fireface protocol knowledge comes from our own USB captures; no
-RME documentation or code is included.
+- [TuxMix](https://github.com/ismail-bahloul/TuxMix) by Ismaïl Bahloul (MIT)
+  is the base of the mixer application: its device model, the Babyface Pro FS
+  support, the TUI and the scene system.  His commit history is preserved in
+  this repository, and the license and copyright notice stay in
+  [`ui/tuxmix/LICENSE`](ui/tuxmix/LICENSE).
+- [snd-fireface-uc](https://github.com/berndie/snd-fireface-uc) by Bernd Accou
+  (MIT) is the earlier Fireface UC kernel driver; our UC transport follows its
+  device modes, packet layout and status path.
+- [rme-fireface-ucx-linux-driver](https://github.com/OroboroModular/rme-fireface-ucx-linux-driver)
+  (GPL-2.0-or-later) is the Fireface UCX driver; our UCX transport, register
+  model and meter decoding build on it.
+
+The Fireface UC/UCX kernel module, the OSC layer and the GUI's mixer and
+Control Room extensions were developed in this tree.  All Fireface protocol
+knowledge comes from our own USB captures; no RME documentation or code is
+included.  Full notices are in [`THIRD-PARTY.md`](THIRD-PARTY.md).
 
