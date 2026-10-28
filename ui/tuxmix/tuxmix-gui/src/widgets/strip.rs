@@ -1027,7 +1027,12 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
             meter2_available: false,
             // Leaves the T / gear / EQ / D buttons their room at the
             // bottom of the column.
-            height: (fader_h - 150.0 * scale).max(48.0 * scale),
+            // 20 % taller than the earlier track: the FX send/return is
+            // the only small fader on the strip, and the extra travel
+            // matches the main fader's own feel.  Every strip on an FX
+            // unit grows by the same amount, so the symbol grid below it
+            // keeps its shared height.
+            height: ((fader_h - 150.0 * scale).max(48.0 * scale) * 1.2),
             show_meter: false,
             // Same dark slot as the main fader, but a smaller body.
                 fill: match cid {
