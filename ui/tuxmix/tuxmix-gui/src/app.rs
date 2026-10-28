@@ -172,6 +172,19 @@ fn choose_startup_kind(
     if preferred == Some(DeviceKind::Fireface) {
         return Some(DeviceKind::Fireface);
     }
+    // A fresh profile with nothing attached opens the UCX simulation: it is
+    // the reference layout (three rows, EQ/dynamics, FX) and the device the
+    // control sections are specified against.
+    let only_simulations = !available.is_empty()
+        && available.iter().all(|k| {
+            matches!(
+                k,
+                DeviceKind::Mock | DeviceKind::MockUcx | DeviceKind::MockUc
+            )
+        });
+    if preferred.is_none() && only_simulations && available.contains(&DeviceKind::MockUcx) {
+        return Some(DeviceKind::MockUcx);
+    }
     available.first().copied().or(preferred)
 }
 
@@ -11230,6 +11243,18 @@ mod tests {
                 Some(DeviceKind::Uc)
             ),
             Some(DeviceKind::Uc)
+        );
+    }
+
+    #[test]
+    fn a_fresh_profile_opens_the_ucx_simulation() {
+        assert_eq!(
+            choose_startup_kind(
+                &[DeviceKind::Mock, DeviceKind::MockUcx, DeviceKind::MockUc],
+                None
+            ),
+            Some(DeviceKind::MockUcx),
+            "no hardware and no preference: the UCX simulation is the default"
         );
     }
 
