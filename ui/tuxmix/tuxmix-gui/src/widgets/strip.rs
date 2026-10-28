@@ -1063,7 +1063,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // A little air under the FX fader (and under the fader top on units
     // without one), so the symbols do not crowd the slider above them.
     let top_gap: Element<'a, Message> = iced::widget::Space::new()
-        .height(Length::Fixed(theme::SPACE_SM * scale))
+        .height(Length::Fixed(theme::SPACE_LG * scale))
         .into();
     let icon_col = column![
         fx_fader.unwrap_or_else(|| iced::widget::Space::new().height(Length::Fixed(0.0)).into()),
