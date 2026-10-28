@@ -8424,7 +8424,7 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
     };
 
     if let ChannelId::Input(idx) = cid {
-        let mut col = column![].spacing(theme::SPACE_TIGHT * scale);
+        let mut col = column![].spacing(theme::SPACE_TIGHT * scale).width(Length::Fill);
         col = col.push(settings_slot(Some(stereo), SETTINGS_ROW_CTRL, scale));
 
         // Row 2 — the reference readout for the channels whose dropdown is
@@ -8623,10 +8623,16 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
         // Row 7 — send FX.
         let send = caps.fx.then(|| {
             settings_knob_row(
-                text("send FX")
-                    .size(theme::TEXT_SM * scale)
-                    .color(theme::TEXT_SEC)
-                    .into(),
+                column![
+                    text("send")
+                        .size(theme::TEXT_SM * scale)
+                        .color(theme::TEXT_SEC),
+                    text("FX")
+                        .size(theme::TEXT_SM * scale)
+                        .color(theme::TEXT_SEC),
+                ]
+                .spacing(0.0)
+                .into(),
                 send_knob(state.device.inputs()[idx].fx_send_db),
             )
         });
@@ -8676,7 +8682,7 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
     }
 
     if let ChannelId::Playback(i) = cid {
-        let mut col = column![].spacing(theme::SPACE_TIGHT * scale);
+        let mut col = column![].spacing(theme::SPACE_TIGHT * scale).width(Length::Fill);
         col = col.push(settings_slot(Some(stereo), SETTINGS_ROW_CTRL, scale));
         let width_knob = caps.channel_width.then(|| {
             let modifiers = state.modifiers;
@@ -8705,10 +8711,16 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
         col = col.push(settings_slot(width_knob, SETTINGS_ROW_KNOB, scale));
         let send = caps.fx.then(|| {
             settings_knob_row(
-                text("send FX")
-                    .size(theme::TEXT_SM * scale)
-                    .color(theme::TEXT_SEC)
-                    .into(),
+                column![
+                    text("send")
+                        .size(theme::TEXT_SM * scale)
+                        .color(theme::TEXT_SEC),
+                    text("FX")
+                        .size(theme::TEXT_SM * scale)
+                        .color(theme::TEXT_SEC),
+                ]
+                .spacing(0.0)
+                .into(),
                 send_knob(
                     state
                         .device
@@ -8734,7 +8746,7 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
         1..=3 => Some((state.device.settings().line_out_ref, false)),
         _ => None,
     };
-    let mut col = column![].spacing(theme::SPACE_TIGHT * scale);
+    let mut col = column![].spacing(theme::SPACE_TIGHT * scale).width(Length::Fill);
     col = col.push(settings_slot(Some(stereo), SETTINGS_ROW_CTRL, scale));
     col = col.push(settings_label_slot(
         ref_group.map(|_| {
@@ -8780,10 +8792,16 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
             .unwrap_or(-65.0);
         let modifiers = state.modifiers;
         settings_knob_row(
-            text("return FX")
-                .size(theme::TEXT_SM * scale)
-                .color(theme::TEXT_SEC)
-                .into(),
+            column![
+                text("return")
+                    .size(theme::TEXT_SM * scale)
+                    .color(theme::TEXT_SEC),
+                text("FX")
+                    .size(theme::TEXT_SM * scale)
+                    .color(theme::TEXT_SEC),
+            ]
+            .spacing(0.0)
+            .into(),
             knob(Knob {
                 value: fx,
                 range: (-65.0, 0.0),
