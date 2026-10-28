@@ -1,0 +1,12 @@
+[Unit]
+Description=Load the RME Fireface UC transport module
+After=dkms.service
+Wants=dkms.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/modprobe snd-fireface-uc
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

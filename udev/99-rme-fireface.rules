@@ -1,0 +1,13 @@
+# RME Fireface UC / UCX / UCX II — allow the desktop user to access the
+# vendor-specific USB interfaces without root.
+#
+# Installed by scripts/setup.sh.
+
+# Fireface UCX (this generation uses the SMSC/Microchip VID)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0424", ATTR{idProduct}=="3fc9", MODE="0660", GROUP="audio", TAG+="uaccess"
+
+# Fireface UC
+SUBSYSTEM=="usb", ATTR{idVendor}=="0424", ATTR{idProduct}=="3fc6", MODE="0660", GROUP="audio", TAG+="uaccess"
+
+# Newer RME VID (UCX II, Babyface Pro FS, ...)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2a39", ATTR{idProduct}=="3f*", MODE="0660", GROUP="audio", TAG+="uaccess"

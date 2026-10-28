@@ -1,0 +1,14 @@
+# Build artifacts
+target/
+*.o
+*.ko
+*.mod
+*.mod.c
+Module.symvers
+modules.order
+.*.cmd
+.tmp_versions/
+__pycache__/
+*.log
+*.pcap
+/rme-probe
