@@ -8,7 +8,8 @@ Read this file before starting work in this repository.
   transport, ALSA PCM, the `snd-hwdep` control ABI and a rawmidi port.
   The device table covers the RME Fireface UC and UCX in both USB vendor
   personalities.
-- `ui/` — TuxMix, the mixer application, a Cargo workspace (`tuxmix-core`,
+- `ui/tuxmix/` — TuxMix, the mixer application, a Cargo workspace
+  (`tuxmix-core`,
   `tuxmix-gui`, `tuxmix-tui`, `tuxmix-usb`, `tuxmix-sys`). It develops
   independently of the kernel. Babyface Pro FS support lives here, in
   userspace.
@@ -19,14 +20,15 @@ Read this file before starting work in this repository.
 - The root `Makefile` builds the `rme-probe` tool.
 
 The only interface between driver and UI is the hwdep ABI in
-`kernel/ffuc-uapi.h`, mirrored in `ui/tuxmix-core/src/fireface/abi.rs`.
+`kernel/ffuc-uapi.h`, mirrored in
+`ui/tuxmix/tuxmix-core/src/fireface/abi.rs`.
 Changing one means updating the other in the same change.
 
 ## Build and test
 
 - Driver: `make -C kernel`; install through DKMS with
   `scripts/install-dkms.sh`.
-- UI: from `ui/`, `cargo test -p tuxmix-core --lib --features alsa` and
+- UI: from `ui/tuxmix/`, `cargo test -p tuxmix-core --lib --features alsa` and
   `cargo test -p tuxmix-gui`.
 - Tools: `make` in the repository root.
 

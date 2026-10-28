@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-3.0-or-later
 //
 // rme-probe — Phase 0 characterisation tool for RME Fireface UC/UCX.
 //
