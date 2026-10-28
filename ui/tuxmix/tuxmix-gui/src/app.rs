@@ -8379,9 +8379,8 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
                 scale,
             )
         };
-        // Inputs 1/2 are the mic channels and get a worded Phase button.
-        // The other input channels use the manual's Ø symbols.
-        let mic = idx < 2;
+        // The phase control is the symbol everywhere: "Ø L" / "R Ø" for a
+        // linked pair, a single "Ø" otherwise.
         if p.stereo_linked {
             let left = idx & !1;
             let right = left + 1;
@@ -8391,11 +8390,7 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
                 .inputs()
                 .get(right)
                 .is_some_and(|c| c.phase);
-            let (left_label, right_label) = if mic {
-                ("Phase L", "Phase R")
-            } else {
-                ("Ø L", "R Ø")
-            };
+            let (left_label, right_label) = ("Ø L", "R Ø");
             col = col.push(
                 row![
                     phase_button(left_label, left, left_on),
@@ -8405,8 +8400,7 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
                 .width(Length::Fill),
             );
         } else {
-            let label = if mic { "Phase" } else { "Ø" };
-            col = col.push(row![phase_button(label, idx, p.phase)].width(Length::Fill));
+            col = col.push(row![phase_button("Ø", idx, p.phase)].width(Length::Fill));
         }
         col = col.height(Length::Fill);
     }
