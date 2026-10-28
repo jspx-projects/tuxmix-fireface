@@ -419,6 +419,10 @@ pub struct PlaybackChannel {
     /// 0x2000/0x0000 (split mono) instead of 0x1000/0x1000 (-6 dB pair).
     #[serde(default)]
     pub split: bool,
+    /// Trim (T) in dB, 0 to -65: a negative value attenuates every send
+    /// of this channel (see `RmeDevice::set_trim`).
+    #[serde(default)]
+    pub trim: f32,
     pub mute: bool,
     pub solo: bool,
 }
@@ -503,6 +507,7 @@ impl PlaybackChannel {
             pans: vec![0; outputs],
             fx_send_db: default_fx_send_channel_db(),
             split: false,
+            trim: 0.0,
             mute: false,
             solo: false,
         }

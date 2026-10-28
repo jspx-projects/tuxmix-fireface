@@ -118,7 +118,7 @@ low-cut frequency control implies enabled.
 | Varispeed | `Varispeed Pitch` volume | raw = percent×10, ±5 % in 0.1 % steps |
 | Loopback | `Loopback` switch, one per output pair | bool |
 | Phase | `<ANn> Phase` switch, AN1–4 | bool |
-| Trim | `<ANn> Trim` volume, AN1–4 | dB, −65…+6 |
+| Trim | mixer-side, all sends | 0 to −65 dB (see `TUXMIX-SPEC.md`) |
 | Stereo split | `PBn Stereo Split` switch, PB1–6 | bool, mirrored to the pair |
 | Front panel | `Front Panel In/Out` enums, `Front Panel Mix` switch | read only |
 
@@ -257,9 +257,11 @@ Output blocks (crosspoint block order differs from the strip order):
 - **Stereo split** on a linked pair writes `0x1000`/`0x1000` (−6 dB per
   side) when linked, `0x2000`/`0x0000` when split, into the low map and the
   AN1/2 standard crosspoints of the playback source.
-- **Trim** writes all eight registers of a linked AN1/2 strip: the low map
-  with the master-curve trim value and the standard map with the combined
-  value.  Combined law: `standard_raw = 0x16A0 · 10^((fader_dB + trim_dB)/20)`.
+- **Trim** is applied when each send is written, so it uses the normal
+  crosspoint writes with the trimmed gain.  The eight-register trim block
+  of the proprietary protocol stays available for device diagnostics; the
+  ALSA `Trim` control is set to 0 dB when the backend opens the unit so it
+  cannot attenuate a second time.
 - **Width** writes the low-map mirror balance pairs on AN1/AN2:
   `L = 0x2000·(1+w)/2`, `R = 0x2000 − L`; neutral width is `0x1000` both
   sides.

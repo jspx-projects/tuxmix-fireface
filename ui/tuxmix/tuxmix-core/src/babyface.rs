@@ -1201,6 +1201,31 @@ impl BabyfacePro {
                 .ok_or_else(|| Error::InvalidChannel(format!("Output {}", idx))),
         }
     }
+
+    /// Trim (T) gain factor: 1.0 at 0 dB, lower when the channel is
+    /// attenuated.  Applied when a send is written, never stored.
+    fn trim_gain(&self, channel: ChannelId) -> f32 {
+        let db = match channel {
+            ChannelId::Input(i) => self.inputs.get(i).map(|c| c.trim).unwrap_or(0.0),
+            ChannelId::Playback(i) => self.playbacks.get(i).map(|c| c.trim).unwrap_or(0.0),
+            ChannelId::Output(_) => 0.0,
+        };
+        10f32.powf(db.clamp(-65.0, 0.0) / 20.0)
+    }
+
+    /// Zero the driver's per-input `Trim` control.  Older builds wrote it
+    /// directly to the unit, which would otherwise attenuate on top of
+    /// the mixer-side trim.
+    fn zero_legacy_trim(&self) {
+        if self.grammar != ControlGrammar::Proprietary {
+            return;
+        }
+        for (idx, name) in BF_SOURCES.iter().enumerate().take(4) {
+            if let Some(selem) = self.mixer.find_selem(&format!("{name} Trim"), idx as u32) {
+                let _ = selem.set_playback_volume(SelemChannelId::mono(), 0);
+            }
+        }
+    }
 }
 
 impl RmeDevice for BabyfacePro {
@@ -1325,6 +1350,7 @@ impl RmeDevice for BabyfacePro {
             resync_at: None,
         };
         device.attach_mixer_elements(false);
+        device.zero_legacy_trim();
         Ok(device)
     }
 
@@ -1426,7 +1452,8 @@ impl RmeDevice for BabyfacePro {
         } else {
             volume.clamp(0.0, 2.0)
         };
-        self.write_crosspoint(src, ch, is_mono, output, vol, pan)?;
+        let write_vol = vol * self.trim_gain(channel);
+        self.write_crosspoint(src, ch, is_mono, output, write_vol, pan)?;
 
         match channel {
             ChannelId::Input(idx) => self.inputs[idx].volumes[output] = vol,
@@ -1502,6 +1529,7 @@ impl RmeDevice for BabyfacePro {
             )));
         }
 
+        let volume = volume * self.trim_gain(ChannelId::Input(idx));
         self.write_crosspoint(src, SelemChannelId::FrontLeft, true, output, volume, pan)?;
 
         self.inputs[idx].pans[output] = pan;
@@ -2083,20 +2111,36 @@ impl RmeDevice for BabyfacePro {
     /// guard and would silently write into an unrelated channel's
     /// crosspoint if called on e.g. AS1/2 (flagged, not fixed here —
     /// out of scope for this backend's own wiring).
-    fn set_trim(&mut self, idx: usize, db: f32) -> Result<(), Error> {
-        self.require_proprietary("Trim")?;
-        if idx >= 4 {
-            return Err(Error::InvalidChannel(format!(
-                "Input {idx} has no trim control"
-            )));
+    fn set_trim(&mut self, channel: ChannelId, db: f32) -> Result<(), Error> {
+        let db = db.clamp(-65.0, 0.0);
+        let volumes = match channel {
+            ChannelId::Input(idx) => {
+                let c = self
+                    .inputs
+                    .get_mut(idx)
+                    .ok_or_else(|| Error::InvalidChannel(format!("input {idx}")))?;
+                c.trim = db;
+                c.volumes.clone()
+            }
+            ChannelId::Playback(idx) => {
+                let c = self
+                    .playbacks
+                    .get_mut(idx)
+                    .ok_or_else(|| Error::InvalidChannel(format!("playback {idx}")))?;
+                c.trim = db;
+                c.volumes.clone()
+            }
+            ChannelId::Output(_) => {
+                return Err(Error::InvalidChannel(
+                    "trim applies to inputs and playbacks".into(),
+                ))
+            }
+        };
+        for (out, v) in volumes.iter().enumerate() {
+            if *v > 0.0 {
+                self.set_volume(channel, out, *v)?;
+            }
         }
-        let db = db.clamp(-65.0, 6.0).round();
-        let selem = self
-            .mixer
-            .find_selem(&format!("{} Trim", BF_SOURCES[idx]), idx as u32)
-            .ok_or_else(|| Error::InvalidChannel(format!("Input {idx} has no trim control")))?;
-        selem.set_playback_volume(SelemChannelId::mono(), db as i64)?;
-        self.inputs[idx].trim = db;
         Ok(())
     }
 
@@ -2510,17 +2554,17 @@ mod tests {
         let idx = 1; // AN2, verified silent (0%) before running this
         let orig = dev.inputs()[idx].trim;
 
-        dev.set_trim(idx, -5.0).unwrap();
+        dev.set_trim(ChannelId::Input(idx), -5.0).unwrap();
         let dev2 = BabyfacePro::open().expect("real device attached");
         assert_eq!(dev2.inputs()[idx].trim, -5.0);
         drop(dev2);
 
-        dev.set_trim(idx, 3.0).unwrap();
+        dev.set_trim(ChannelId::Input(idx), -3.0).unwrap();
         let dev3 = BabyfacePro::open().expect("real device attached");
-        assert_eq!(dev3.inputs()[idx].trim, 3.0);
+        assert_eq!(dev3.inputs()[idx].trim, -3.0);
         drop(dev3);
 
-        dev.set_trim(idx, orig).unwrap();
+        dev.set_trim(ChannelId::Input(idx), orig).unwrap();
     }
 
     #[test]
@@ -2773,7 +2817,7 @@ mod tests {
         // having done nothing — the failure this whole day was about.
         let mut dev = BabyfacePro::open().expect("CC-mode card");
         assert!(dev.set_phase(0, true).is_err(), "phase");
-        assert!(dev.set_trim(0, 3.0).is_err(), "trim");
+        // Trim is mixer-side and works in both grammars; no assertion.
         assert!(dev.set_loopback(0, true).is_err(), "loopback");
         assert!(dev.set_width(0.5).is_err(), "width");
         assert!(dev.set_dim(true).is_err(), "dim");

@@ -554,8 +554,8 @@ impl RmeDevice for DeviceHandle {
     fn set_input_link(&mut self, linked: bool) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_input_link(linked))
     }
-    fn set_trim(&mut self, idx: usize, db: f32) -> Result<(), tuxmix_core::Error> {
-        delegate!(self, set_trim(idx, db))
+    fn set_trim(&mut self, channel: ChannelId, db: f32) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_trim(channel, db))
     }
     fn set_phase(&mut self, idx: usize, invert: bool) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_phase(idx, invert))
@@ -1498,8 +1498,8 @@ pub enum Message {
     /// Trim in dB (-65..+6, see `RmeDevice::set_trim`) — `usize` is the
     /// input index, same scale as every other Hardware Input, unlike
     /// `Gain` which is raw per-model hardware units.
-    TrimChanged(usize, f32),
-    TrimReset(usize),
+    TrimChanged(ChannelId, f32),
+    TrimReset(ChannelId),
 
     /// Hardware 3-band + low-cut EQ (analog inputs only) — `usize` is
     /// always the input index; the `Eq*Band*` variants carry the band
@@ -2179,7 +2179,7 @@ pub enum UndoGesture {
     Volume(ChannelId, usize),
     Pan(ChannelId, usize),
     Gain(usize),
-    Trim(usize),
+    Trim(ChannelId),
     EqBand(ChannelId, usize),
     LowCut(ChannelId),
     Dynamics(ChannelId),
@@ -2200,7 +2200,7 @@ fn undo_gesture(message: &Message) -> Option<UndoGesture> {
         }
         Message::PanChanged(cid, out, _) => UndoGesture::Pan(*cid, *out),
         Message::Gain(idx, _) => UndoGesture::Gain(*idx),
-        Message::TrimChanged(idx, _) => UndoGesture::Trim(*idx),
+        Message::TrimChanged(cid, _) => UndoGesture::Trim(*cid),
         Message::EqBandFreq(cid, band, _)
         | Message::EqBandQ(cid, band, _)
         | Message::EqBandGain(cid, band, _)
@@ -3089,11 +3089,74 @@ fn channel_order(state: &TuxMix) -> Vec<ChannelId> {
 /// which path triggered the write (fader drag, reset, typed dB, OSC,
 /// grouped multi-select) — otherwise a plain `set_volume`. The single
 /// choke point every output-channel volume write should go through.
+/// Gain factor of a trim value: 1.0 at 0 dB, smaller when attenuated.
+fn trim_factor(db: f32) -> f32 {
+    10f32.powf(db.clamp(-65.0, 0.0) / 20.0)
+}
+
+/// The trim value of a channel in dB.
+fn channel_trim(state: &TuxMix, cid: ChannelId) -> f32 {
+    match cid {
+        ChannelId::Input(i) => state.device.inputs().get(i).map(|c| c.trim).unwrap_or(0.0),
+        ChannelId::Playback(i) => state
+            .device
+            .playbacks()
+            .get(i)
+            .map(|c| c.trim)
+            .unwrap_or(0.0),
+        ChannelId::Output(_) => 0.0,
+    }
+}
+
+/// Hover text for the T button: 0 dB invites opening the panel, an
+/// applied trim states its value.
+fn trim_tip(db: f32) -> String {
+    if db < 0.0 {
+        format!("Trim {db:.1} dB")
+    } else {
+        "Show trim".to_string()
+    }
+}
+
+/// Gain factor of a channel's trim, for views that show the level after
+/// the trim (the Matrix).
+pub(crate) fn channel_trim_factor(state: &TuxMix, cid: ChannelId) -> f32 {
+    trim_factor(channel_trim(state, cid))
+}
+
+/// Turn a level the user sees (after trim) into the stored send gain.
+fn effective_to_send(state: &TuxMix, cid: ChannelId, level: f32) -> f32 {
+    (level / trim_factor(channel_trim(state, cid))).clamp(0.0, 2.0)
+}
+
+/// Apply a trim value to a channel.  A linked stereo pair shares it.
+fn apply_trim(state: &mut TuxMix, cid: ChannelId, db: f32) {
+    let db = db.clamp(-65.0, 0.0);
+    let targets = match cid {
+        ChannelId::Input(i) if state.device.input_pair_linked(i / 2) => {
+            vec![ChannelId::Input(i & !1), ChannelId::Input(i | 1)]
+        }
+        ChannelId::Playback(i) if state.device.playback_linked(i / 2) => {
+            vec![ChannelId::Playback(i & !1), ChannelId::Playback(i | 1)]
+        }
+        ChannelId::Input(_) | ChannelId::Playback(_) => vec![cid],
+        ChannelId::Output(_) => return,
+    };
+    for target in targets {
+        if let Err(e) = state.device.set_trim(target, db) {
+            fail(state, "set_trim", &e);
+        }
+    }
+}
+
 fn set_channel_volume(state: &mut TuxMix, cid: ChannelId, out: usize, v: f32) {
+    // The caller passes the level shown next to the fader; the model
+    // stores the send before trim.
+    let send = effective_to_send(state, cid, v);
     let _ = match cid {
-        ChannelId::Input(ch) => state.device.set_input_volume(ch / 2, ch % 2, out, v),
-        ChannelId::Playback(ch) => state.device.set_playback_volume(ch / 2, ch % 2, out, v),
-        ChannelId::Output(ch) => state.device.set_output_volume(ch / 2, ch % 2, v),
+        ChannelId::Input(ch) => state.device.set_input_volume(ch / 2, ch % 2, out, send),
+        ChannelId::Playback(ch) => state.device.set_playback_volume(ch / 2, ch % 2, out, send),
+        ChannelId::Output(ch) => state.device.set_output_volume(ch / 2, ch % 2, send),
     };
 }
 
@@ -3211,12 +3274,14 @@ fn apply_grouped_volume(state: &mut TuxMix, cid: ChannelId, out: usize, v: f32) 
         notify_osc(state, OscOutbound::Volume(cid, out, v));
         return;
     }
-    let old = state.device.volume(cid, out).unwrap_or(v);
+    let old = state.device.volume(cid, out).unwrap_or(v)
+        * trim_factor(channel_trim(state, cid));
     let delta_db = vol_to_db(v) - vol_to_db(old);
     set_channel_volume(state, cid, out, v);
     notify_osc(state, OscOutbound::Volume(cid, out, v));
     for sel in others {
-        let cur = state.device.volume(sel, out).unwrap_or(0.0);
+        let cur = state.device.volume(sel, out).unwrap_or(0.0)
+            * trim_factor(channel_trim(state, sel));
         let new_vol = db_to_vol(vol_to_db(cur) + delta_db).clamp(0.0, 2.0);
         set_channel_volume(state, sel, out, new_vol);
         notify_osc(state, OscOutbound::Volume(sel, out, new_vol));
@@ -3435,7 +3500,10 @@ fn notify_osc_full_state(state: &mut TuxMix) {
         let cid = ChannelId::Input(ch.id);
         for out in 0..n_out {
             if let Some(v) = ch.volumes.get(out) {
-                notify_osc(state, OscOutbound::Volume(cid, out, *v));
+                notify_osc(
+                    state,
+                    OscOutbound::Volume(cid, out, *v * trim_factor(ch.trim)),
+                );
             }
             if let Some(p) = ch.pans.get(out) {
                 notify_osc(state, OscOutbound::Pan(cid, out, *p));
@@ -3525,7 +3593,10 @@ fn notify_osc_full_state(state: &mut TuxMix) {
         let cid = ChannelId::Playback(ch.id);
         for out in 0..n_out {
             if let Some(v) = ch.volumes.get(out) {
-                notify_osc(state, OscOutbound::Volume(cid, out, *v));
+                notify_osc(
+                    state,
+                    OscOutbound::Volume(cid, out, *v * trim_factor(ch.trim)),
+                );
             }
             if let Some(p) = ch.pans.get(out) {
                 notify_osc(state, OscOutbound::Pan(cid, out, *p));
@@ -3533,6 +3604,11 @@ fn notify_osc_full_state(state: &mut TuxMix) {
         }
         notify_osc(state, OscOutbound::Mute(cid, ch.mute));
         notify_osc(state, OscOutbound::Solo(cid, ch.solo));
+        notify_osc_raw(
+            state,
+            format!("/playback/{}/trim", ch.id),
+            vec![OscType::Float(ch.trim)],
+        );
         notify_osc_bool(
             state,
             format!("/playback/{}/stereo", ch.id),
@@ -4005,9 +4081,7 @@ fn changes_mix(message: &Message) -> bool {
 fn needs_protocol_features(message: &Message) -> bool {
     matches!(
         message,
-        Message::TrimChanged(..)
-            | Message::TrimReset(_)
-            | Message::LevelChanged(..)
+        Message::LevelChanged(..)
             | Message::Autoset(..)
             | Message::DynamicsEnabled(..)
             | Message::DynamicsChanged(..)
@@ -4699,17 +4773,16 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
             notify_osc_bool(state, format!("/input/{idx}/sensitivity"), plus4);
         }
-        Message::TrimChanged(idx, db) => {
-            if let Err(e) = state.device.set_trim(idx, db) {
-                fail(state, "set_trim", &e);
-            }
-            notify_osc_raw(state, format!("/input/{idx}/trim"), vec![OscType::Float(db)]);
+        Message::TrimChanged(cid, db) => {
+            let db = db.clamp(-65.0, 0.0);
+            apply_trim(state, cid, db);
+            let (kind, id) = channel_slug(cid);
+            notify_osc_raw(state, format!("/{kind}/{id}/trim"), vec![OscType::Float(db)]);
         }
-        Message::TrimReset(idx) => {
-            if let Err(e) = state.device.set_trim(idx, 0.0) {
-                fail(state, "set_trim", &e);
-            }
-            notify_osc_raw(state, format!("/input/{idx}/trim"), vec![OscType::Float(0.0)]);
+        Message::TrimReset(cid) => {
+            apply_trim(state, cid, 0.0);
+            let (kind, id) = channel_slug(cid);
+            notify_osc_raw(state, format!("/{kind}/{id}/trim"), vec![OscType::Float(0.0)]);
         }
         Message::EqEnabled(cid, on) => {            if let Err(e) = set_eq_enabled_for(state, cid, on) {
                 fail(state, "set_eq_enabled", &e);
@@ -5105,7 +5178,8 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         }
         Message::MatrixCellChanged(cid, block, v) => {
             if state.matrix_mono {
-                if let Err(e) = state.device.set_matrix_cell(cid, block, v) {
+                let send = effective_to_send(state, cid, v);
+                if let Err(e) = state.device.set_matrix_cell(cid, block, send) {
                     fail(state, "set_matrix_cell", &e);
                 }
             } else {
@@ -5129,7 +5203,8 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                     ChannelId::Output(_) => 0,
                     _ => state.sel_out,
                 };
-                let cur = state.device.volume(cid, out).unwrap_or(0.0);
+                let cur = state.device.volume(cid, out).unwrap_or(0.0)
+                    * trim_factor(channel_trim(state, cid));
                 let new_vol = db_to_vol(vol_to_db(cur) + delta_db).clamp(0.0, 2.0);
                 set_channel_volume(state, cid, out, new_vol);
                 notify_osc(state, OscOutbound::Volume(cid, out, new_vol));
@@ -7554,6 +7629,7 @@ fn strip_params<'a>(
         eq_enabled: false,
         has_trim: false,
         trim: 0.0,
+        trim_tip: String::new(),
         has_phase: false,
         phase: false,
         loopback: false,
@@ -7601,7 +7677,7 @@ fn strip_params<'a>(
                 // Input strips always use the lighter active-source
                 // surface; the current output strip uses the same tone.
                 active_surface: true,
-                vol: ch.volumes[output_idx],
+                vol: ch.volumes[output_idx] * trim_factor(ch.trim),
                 pan: ch.pans[output_idx],
                 meter: state
                     .input_meters
@@ -7633,6 +7709,7 @@ fn strip_params<'a>(
                 eq_enabled: ch.eq.is_some_and(|e| e.enabled),
                 has_trim: true,
                 trim: ch.trim,
+                trim_tip: trim_tip(ch.trim),
                 // The UC now stores phase as the sign of every routed
                 // matrix cell; it has no EQ, so the old UCX EQ test hid it.
                 has_phase: caps.phase && (ch.eq.is_some() || caps.phase_without_eq),
@@ -7652,8 +7729,11 @@ fn strip_params<'a>(
                 // no redundant "PB" tag next to every name (TotalMix).
                 type_tag: None,
                 active_surface: true,
-                vol: ch.volumes[output_idx],
+                vol: ch.volumes[output_idx] * trim_factor(ch.trim),
                 pan: ch.pans[output_idx],
+                has_trim: true,
+                trim: ch.trim,
+                trim_tip: trim_tip(ch.trim),
                 meter: state
                     .playback_meters
                     .get(i)
@@ -8116,7 +8196,7 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
                             .color(theme::TEXT_SEC),
                         container(knob(Knob {
                             value: fx,
-                            range: (-65.0, 6.0),
+                            range: (-65.0, 0.0),
                             label: format!("{fx:+.1}"),
                             arc_from_center: false,
                             level_arc_color: Some(theme::PHANTOM),
@@ -8661,17 +8741,17 @@ fn dynamics_popover(
 /// no `Option`-shaped hardware gate to check here, just the channel kind.
 /// Same "pushes the row" shape as `settings_popover`/`eq_popover`.
 fn trim_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element<'_, Message> {
-    let ChannelId::Input(idx) = cid else {
+    if matches!(cid, ChannelId::Output(_)) {
         return container(iced::widget::Space::new()).into();
-    };
+    }
     let modifiers = state.modifiers;
-    let trim = state.device.inputs()[idx].trim;
+    let trim = channel_trim(state, cid);
 
     let col = column![
         text("Trim").size(theme::TEXT_SM * scale).color(theme::TEXT_SEC),
         container(knob(Knob {
             value: trim,
-            range: (-65.0, 6.0),
+            range: (-65.0, 0.0),
             label: format!("{trim:+.1}"),
             arc_from_center: false,
             level_arc_color: Some(theme::TEXT_PRIMARY),
@@ -8679,8 +8759,8 @@ fn trim_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Eleme
             log_scale: false,
             modifiers,
             scale,
-            on_change: Box::new(move |v| Message::TrimChanged(idx, v)),
-            on_reset: Box::new(move || Message::TrimReset(idx)),
+            on_change: Box::new(move |v| Message::TrimChanged(cid, v)),
+            on_reset: Box::new(move || Message::TrimReset(cid)),
         }))
         .width(Length::Fill)
         .center_x(Length::Fill),
@@ -11009,6 +11089,7 @@ fn quick_view(state: &TuxMix) -> Element<'_, Message> {
 mod tests {
     use super::{
         any_channel_muted, any_channel_soloed, apply_pending_resize,
+        channel_trim, trim_factor,
         apply_prefs, channel_is_muted, channel_is_soloed, choose_startup_kind,
         choose_startup_target,
         frames_ms, is_undoable, new, new_with_device, apply_startup_sync, prefs_of,
@@ -11568,27 +11649,30 @@ mod tests {
     fn class_compliant_mode_drops_protocol_messages() {
         let mut state = new(true, None, None);
 
-        // The mock drives the full set by default, so the message the TRIM
-        // control sends really does reach the device.
-        let _ = update(&mut state, Message::TrimChanged(0, 6.0));
-        assert_eq!(state.device.inputs()[0].trim, 6.0);
+        // Trim is mixer-side, so it lands in both grammars.
+        let _ = update(&mut state, Message::TrimChanged(ChannelId::Input(0), -6.0));
+        assert_eq!(state.device.inputs()[0].trim, -6.0);
 
-        // On the class-compliant personality those setters can only fail,
-        // so the renderers hide the controls and `update` drops what a stale
-        // key binding or an OSC message would still send.
         let pushed = state.undo_stack.len();
         state.device.set_protocol_features(false);
-        let _ = update(&mut state, Message::TrimChanged(0, -3.0));
-        assert_eq!(state.device.inputs()[0].trim, 6.0, "trim must not move");
+        let _ = update(&mut state, Message::TrimChanged(ChannelId::Input(0), -3.0));
+        assert_eq!(
+            state.device.inputs()[0].trim, -3.0,
+            "trim is mixer-side and works in both grammars"
+        );
+        // The second change belongs to the same gesture, so it adds no
+        // second undo step.
+        assert_eq!(state.undo_stack.len(), pushed);
+
+        // On the class-compliant personality a protocol setter can only
+        // fail, so the renderers hide the control and `update` drops what a
+        // stale key binding or an OSC message would still send.
+        let pushed = state.undo_stack.len();
         let _ = update(&mut state, Message::EqEnabled(ChannelId::Input(0), true));
         assert!(
             !state.device.inputs()[0].eq.as_ref().unwrap().enabled,
             "the EQ must not engage behind a hidden button"
         );
-
-        // A dropped message leaves no scene behind: the guard has to run
-        // before the undo capture, or a trim drag in this mode would fill
-        // the stack with no-ops.
         assert_eq!(
             state.undo_stack.len(),
             pushed,
@@ -12673,6 +12757,79 @@ mod tests {
     // A click anywhere on a channel selects it; on a hardware output it
     // also shows that output's submix — including clicks on the strip's
     // own controls, which used to consume the press without selecting.
+    #[test]
+    fn a_trim_lowers_the_shown_fader_and_keeps_the_stored_send() {
+        let mut state = new(true, None, None);
+        let cid = ChannelId::Input(4);
+        state.device.set_volume(cid, 0, 0.5).unwrap();
+        let _ = update(&mut state, Message::TrimChanged(cid, -6.0));
+        // Stored send unchanged …
+        let raw = state.device.volume(cid, 0).unwrap();
+        assert!((raw - 0.5).abs() < 1e-6, "the send itself must not move");
+        // … while the level shown next to the fader is 6 dB lower.
+        let shown = raw * trim_factor(channel_trim(&state, cid));
+        assert!((shown - 0.5 * 0.501_187).abs() < 1e-3, "shown {shown}");
+    }
+
+    #[test]
+    fn a_fader_move_with_trim_active_writes_the_gain_shown() {
+        let mut state = new(true, None, None);
+        let cid = ChannelId::Input(4);
+        let _ = update(&mut state, Message::TrimChanged(cid, -6.0));
+        let _ = update(&mut state, Message::VolumeChanged(cid, 0, 0.5));
+        let raw = state.device.volume(cid, 0).unwrap();
+        let shown = raw * trim_factor(channel_trim(&state, cid));
+        assert!((shown - 0.5).abs() < 1e-3, "shown {shown}");
+    }
+
+    #[test]
+    fn trim_and_zero_restores_the_exact_send() {
+        let mut state = new(true, None, None);
+        let cid = ChannelId::Input(4);
+        state.device.set_volume(cid, 1, 0.3).unwrap();
+        let before = state.device.volume(cid, 1).unwrap();
+        let _ = update(&mut state, Message::TrimChanged(cid, -12.0));
+        let _ = update(&mut state, Message::TrimReset(cid));
+        assert_eq!(state.device.volume(cid, 1).unwrap(), before);
+    }
+
+    #[test]
+    fn a_linked_pair_shares_one_trim() {
+        let mut state = new(true, None, None);
+        let _ = update(&mut state, Message::TrimChanged(ChannelId::Input(0), -6.0));
+        assert_eq!(state.device.inputs()[0].trim, -6.0);
+        assert_eq!(state.device.inputs()[1].trim, -6.0, "linked partner");
+    }
+
+    #[test]
+    fn an_unlinked_pair_keeps_separate_trims() {
+        let mut state = new(true, None, None);
+        let _ = update(
+            &mut state,
+            Message::StereoLinkChanged(ChannelId::Input(0), false),
+        );
+        let _ = update(&mut state, Message::TrimChanged(ChannelId::Input(0), -6.0));
+        assert_eq!(state.device.inputs()[0].trim, -6.0);
+        assert_eq!(state.device.inputs()[1].trim, 0.0);
+    }
+
+    #[test]
+    fn playback_trim_works_and_survives_osc() {
+        let mut state = new(true, None, None);
+        let cid = ChannelId::Playback(1);
+        let _ = update(&mut state, Message::TrimChanged(cid, -6.0));
+        assert_eq!(state.device.playbacks()[1].trim, -6.0);
+    }
+
+    #[test]
+    fn trim_clamps_to_attenuation_only() {
+        let mut state = new(true, None, None);
+        let _ = update(&mut state, Message::TrimChanged(ChannelId::Input(4), 6.0));
+        assert_eq!(state.device.inputs()[4].trim, 0.0, "no boost");
+        let _ = update(&mut state, Message::TrimChanged(ChannelId::Input(4), -99.0));
+        assert_eq!(state.device.inputs()[4].trim, -65.0, "floor");
+    }
+
     #[test]
     fn a_plain_click_selects_the_strip_and_shows_its_submix() {
         let mut state = new(true, None, None);

@@ -179,8 +179,8 @@ impl RmeDevice for DeviceHandle {
     fn set_input_link(&mut self, linked: bool) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_input_link(linked))
     }
-    fn set_trim(&mut self, idx: usize, db: f32) -> Result<(), tuxmix_core::Error> {
-        delegate!(self, set_trim(idx, db))
+    fn set_trim(&mut self, channel: ChannelId, db: f32) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_trim(channel, db))
     }
     fn set_phase(&mut self, idx: usize, invert: bool) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_phase(idx, invert))

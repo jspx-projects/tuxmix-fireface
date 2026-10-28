@@ -525,5 +525,9 @@ The matrix is written before PCM opens. Loopback is written live.
 - The three channel rows scroll together under one horizontal slider.
 - Phase, pan, output balance, dynamics, FX and loopback survive scene recall.
 - Output balance survives output-fader movement.
-- Trim, Width, playback stereo/mono, Mono, No Trim and Talkback receive are
+- Trim attenuates a channel's sends in the mixer: the value is applied when
+  each send is written, so it adds no device register.  `T` is the first
+  icon in the strip's column on hardware inputs and software playbacks; it
+  lights while trim is below 0 dB, and its tooltip states the applied value.
+- Width, playback stereo/mono, Mono, No Trim and Talkback receive are
   host-side and do not produce device writes.

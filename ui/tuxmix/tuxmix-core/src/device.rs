@@ -964,12 +964,12 @@ pub trait RmeDevice {
         Ok(())
     }
 
-    /// Trim (T) for an input channel, dB on the master curve
-    /// (-65..+6, 0 = 0x2000; cap_trim.pcap). USB backend writes the
-    /// low map (trim) + the standard map (fader × trim, cap_trim2 —
-    /// the combined dB); ALSA/mock no-op.
-    fn set_trim(&mut self, idx: usize, db: f32) -> Result<(), Error> {
-        let _ = (idx, db);
+    /// Trim (T) for an input or software playback channel, in dB:
+    /// 0 to -65, where a negative value attenuates every send of the
+    /// channel.  The value lives in the mixer model and is applied when a
+    /// send is written; there is no device register for it.
+    fn set_trim(&mut self, channel: ChannelId, db: f32) -> Result<(), Error> {
+        let _ = (channel, db);
         Ok(())
     }
 

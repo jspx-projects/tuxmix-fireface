@@ -316,7 +316,8 @@ Level values:
 | MS processing | `NN05` | 0/1 |
 | FX send | `NN01` | 0.1 dB, signed |
 
-Width and Trim are host-side controls in the TuxMix model.
+Width is a host-side matrix operation.  Trim attenuates the channel's
+send gains in the mixer (see `TUXMIX-SPEC.md`).
 
 ### 6.3 Mute, solo and stereo mode
 

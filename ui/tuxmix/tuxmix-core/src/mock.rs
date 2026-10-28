@@ -554,18 +554,32 @@ impl RmeDevice for MockBabyfacePro {
         Ok(())
     }
 
-    /// Unlike `set_gain`, every input has a Trim control (no
-    /// `channel_type` gate) — matches `usb.rs`'s own real override,
-    /// which applies to every physical source. The trait default is a
-    /// silent no-op (no local state at all), which would make the "T"
-    /// button in `--mock` look broken; this just persists the value the
-    /// same way the real backend does, without a hardware write.
-    fn set_trim(&mut self, idx: usize, db: f32) -> Result<(), Error> {
-        let inp = self
-            .inputs
-            .get_mut(idx)
-            .ok_or_else(|| Error::InvalidChannel(format!("Input {}", idx)))?;
-        inp.trim = db.clamp(-65.0, 6.0);
+    /// Trim exists on hardware inputs and software playbacks; the mock
+    /// stores the value so `--mock` behaves like a real backend, with no
+    /// hardware write.
+    fn set_trim(&mut self, channel: ChannelId, db: f32) -> Result<(), Error> {
+        let db = db.clamp(-65.0, 0.0);
+        match channel {
+            ChannelId::Input(idx) => {
+                let inp = self
+                    .inputs
+                    .get_mut(idx)
+                    .ok_or_else(|| Error::InvalidChannel(format!("Input {}", idx)))?;
+                inp.trim = db;
+            }
+            ChannelId::Playback(idx) => {
+                let pb = self
+                    .playbacks
+                    .get_mut(idx)
+                    .ok_or_else(|| Error::InvalidChannel(format!("Playback {}", idx)))?;
+                pb.trim = db;
+            }
+            ChannelId::Output(_) => {
+                return Err(Error::InvalidChannel(
+                    "Trim applies to inputs and playbacks".into(),
+                ))
+            }
+        }
         Ok(())
     }
 

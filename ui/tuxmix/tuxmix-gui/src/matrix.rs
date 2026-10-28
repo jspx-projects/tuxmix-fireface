@@ -291,9 +291,10 @@ fn push_channel_rows<'a>(
             ]
             .spacing(theme::SPACE_HAIRLINE);
 
+            let trim_gain = crate::app::channel_trim_factor(state, cid);
             for col in 0..src.volumes.len() * 2 {
                 let pair = col / 2;
-                let stored = src.volumes[pair];
+                let stored = src.volumes[pair] * trim_gain;
                 let mono_source = match cid {
                     ChannelId::Input(i) => i < 4,
                     ChannelId::Playback(i) => state
@@ -309,7 +310,7 @@ fn push_channel_rows<'a>(
                     ChannelId::Output(_) => false,
                 };
                 let (shown, interactive) = if state.device.matrix_cells_supported() {
-                    let shown = state.device.matrix_cell(cid, col).unwrap_or(0.0);
+                    let shown = state.device.matrix_cell(cid, col).unwrap_or(0.0) * trim_gain;
                     // Linked pair: a mono signal can only be routed to the
                     // left channel.  Mono Mode unlinks the pair and makes
                     // every cell an independent mono crosspoint.
@@ -416,10 +417,11 @@ pub fn hover_readout(state: &TuxMix) -> Option<String> {
                     .unwrap_or_default()
                 });
             let src = row_source(state, cid)?;
+            let trim_gain = crate::app::channel_trim_factor(state, cid);
             let gain = if state.device.matrix_cells_supported() {
-                state.device.matrix_cell(cid, col)
+                state.device.matrix_cell(cid, col).map(|g| g * trim_gain)
             } else {
-                shown_gain(&src, i, col)
+                shown_gain(&src, i, col).map(|g| g * trim_gain)
             };
             (name, gain)
         }

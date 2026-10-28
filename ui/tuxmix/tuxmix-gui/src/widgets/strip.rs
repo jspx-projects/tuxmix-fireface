@@ -258,6 +258,9 @@ pub struct StripParams<'a> {
     pub has_trim: bool,
     /// Current trim value in dB (-65..+6) — see `InputChannel::trim`.
     pub trim: f32,
+    /// Hover text for `T`: "Show trim" at 0 dB, otherwise the applied
+    /// attenuation.
+    pub trim_tip: String,
     /// Whether this input has a Phase Ø invert switch — the 4 analog
     /// inputs only, and only where the backend decodes phase (the UC does
     /// not yet; see `UC-TODO-06`).
@@ -336,9 +339,10 @@ fn centered_label<'a>(s: &'a str, size: f32) -> Element<'a, Message> {
 /// moving across the strip toward something else.
 pub(crate) fn hint<'a>(
     content: impl Into<Element<'a, Message>>,
-    label: &'a str,
+    label: impl Into<std::borrow::Cow<'a, str>>,
     scale: f32,
 ) -> Element<'a, Message> {
+    let label: std::borrow::Cow<'a, str> = label.into();
     tooltip(
         content,
         container(text(label).size(theme::TEXT_XS * scale).color(theme::TEXT_PRIMARY))
@@ -401,7 +405,7 @@ fn tab_button<'a>(
     active: bool,
     lit: bool,
     message: Message,
-    tip: &'a str,
+    tip: impl Into<std::borrow::Cow<'a, str>>,
     scale: f32,
 ) -> Element<'a, Message> {
     tab_button_sized(
@@ -423,7 +427,7 @@ fn tab_button_sized<'a>(
     active: bool,
     lit: bool,
     message: Message,
-    tip: &'a str,
+    tip: impl Into<std::borrow::Cow<'a, str>>,
     scale: f32,
     w: f32,
     h: f32,
@@ -925,7 +929,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // the real, working control on Hardware Inputs, skip it on Playback
     // rather than either faking one there or blocking on new protocol
     // work.
-    if p.has_trim && p.protocol_features {
+    if p.has_trim {
         let trim_open = p.open_flyout == Some(FlyoutKind::Trim);
         // Lights up whenever trim is off unity too, not just while its
         // flyout is open — same "shows live state at a glance" idea as the
@@ -933,9 +937,13 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         icon_col = icon_col.push(tab_button(
             "T",
             trim_open,
-            trim_open || p.trim != 0.0,
+            trim_open || p.trim < 0.0,
             Message::ToggleFlyout(cid, FlyoutKind::Trim),
-            if trim_open { "Hide trim" } else { "Show trim" },
+            if trim_open {
+                std::borrow::Cow::Borrowed("Hide trim")
+            } else {
+                std::borrow::Cow::Owned(p.trim_tip.clone())
+            },
             scale,
         ));
     }

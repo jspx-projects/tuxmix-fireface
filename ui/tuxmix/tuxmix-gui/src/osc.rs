@@ -82,7 +82,7 @@ pub enum OscCommand {
     Level(usize, u16),
     Autoset(usize, bool),
     Phase(usize, bool),
-    Trim(usize, f32),
+    Trim(ChannelId, f32),
     EqEnabled(ChannelId, bool),
     EqBandType(ChannelId, usize, EqBandType),
     EqBandFreq(ChannelId, usize, u16),
@@ -306,9 +306,14 @@ impl OscCommand {
             ["input", id, "phase"] => {
                 Some(OscCommand::Phase(id.parse().ok()?, arg_bool(args.first()?)?))
             }
-            ["input", id, "trim"] => {
-                Some(OscCommand::Trim(id.parse().ok()?, arg_f32(args.first()?)?))
-            }
+            ["input", id, "trim"] => Some(OscCommand::Trim(
+                ChannelId::Input(id.parse().ok()?),
+                arg_f32(args.first()?)?,
+            )),
+            ["playback", id, "trim"] => Some(OscCommand::Trim(
+                ChannelId::Playback(id.parse().ok()?),
+                arg_f32(args.first()?)?,
+            )),
             [kind, id, "eq"] => {
                 Some(OscCommand::EqEnabled(parse_eq_channel(kind, id.parse().ok()?)?, arg_bool(args.first()?)?))
             }
@@ -421,7 +426,7 @@ impl OscCommand {
             OscCommand::Autoset(idx, on) => Message::Autoset(idx, on),
             OscCommand::Sensitivity(idx, plus4) => Message::Sensitivity(idx, plus4),
             OscCommand::Phase(idx, on) => Message::PhaseChanged(ChannelId::Input(idx), on),
-            OscCommand::Trim(idx, db) => Message::TrimChanged(idx, db),
+            OscCommand::Trim(cid, db) => Message::TrimChanged(cid, db),
             OscCommand::EqEnabled(cid, on) => Message::EqEnabled(cid, on),
             OscCommand::EqBandType(cid, band, t) => Message::EqBandType(cid, band, t),
             OscCommand::EqBandFreq(cid, band, f) => Message::EqBandFreq(cid, band, f),
@@ -602,6 +607,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_playback_trim() {
+        assert_eq!(
+            OscCommand::parse("/playback/1/trim", &[OscType::Float(-6.0)]),
+            Some(OscCommand::Trim(ChannelId::Playback(1), -6.0))
+        );
+    }
+
+    #[test]
     fn parses_playback_pan_with_int_arg() {
         let cmd = OscCommand::parse("/playback/1/pan/3", &[OscType::Int(-50)]);
         assert_eq!(cmd, Some(OscCommand::Pan(ChannelId::Playback(1), 3, -50)));
@@ -674,7 +687,7 @@ mod tests {
         );
         assert_eq!(
             OscCommand::parse("/input/0/trim", &[OscType::Float(-3.5)]),
-            Some(OscCommand::Trim(0, -3.5))
+            Some(OscCommand::Trim(ChannelId::Input(0), -3.5))
         );
         assert_eq!(
             OscCommand::parse("/input/0/eq/1/type", &[OscType::String("bell".into())]),

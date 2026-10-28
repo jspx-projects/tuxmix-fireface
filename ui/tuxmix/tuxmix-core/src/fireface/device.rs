@@ -959,7 +959,8 @@ impl Fireface {
                     continue;
                 };
                 for block in [left_block, right_block] {
-                    let gain = self.matrix_cell(channel, block).unwrap_or(0.0);
+                    let gain = self.matrix_cell(channel, block).unwrap_or(0.0)
+                        * self.trim_gain(channel);
                     self.uc_write_matrix(block, source, gain)?;
                 }
             }
@@ -970,7 +971,8 @@ impl Fireface {
     fn uc_write_input(&self, idx: usize, pair: usize, _volume: f32) -> Result<(), Error> {
         let pan = self.inputs[idx].pans.get(pair).copied().unwrap_or(0);
         if idx < 4 {
-            let volume = self.inputs[idx].volumes.get(pair).copied().unwrap_or(0.0);
+            let volume = self.inputs[idx].volumes.get(pair).copied().unwrap_or(0.0)
+                * self.trim_gain(ChannelId::Input(idx));
             let (l, r) = pan_split(volume, pan);
             // `pair` is the matrix display column (AN1/2 first), which is
             // already the raw UC matrix block order.  Do not run it through
@@ -982,8 +984,10 @@ impl Fireface {
         // A stereo strip: one source per side, balance only.
         let base = idx & !1;
         let other = base ^ 1;
-        let left = self.inputs[base].volumes.get(pair).copied().unwrap_or(0.0);
-        let right = self.inputs[other].volumes.get(pair).copied().unwrap_or(0.0);
+        let left = self.inputs[base].volumes.get(pair).copied().unwrap_or(0.0)
+            * self.trim_gain(ChannelId::Input(base));
+        let right = self.inputs[other].volumes.get(pair).copied().unwrap_or(0.0)
+            * self.trim_gain(ChannelId::Input(other));
         let balance = pan.clamp(-100, 100) as f32 / 100.0;
         let gl = left * (1.0 - balance.max(0.0));
         let gr = right * (1.0 + balance.min(0.0));
@@ -995,6 +999,7 @@ impl Fireface {
         let dev = self.playbacks[idx].id;
         let block = pair * 2 + (dev % 2);
         let pan = self.playbacks[idx].pans.get(pair).copied().unwrap_or(0);
+        let volume = volume * self.trim_gain(ChannelId::Playback(idx));
         let (left, right) = pan_split(volume, pan);
         let gain = if dev % 2 == 0 { left } else { right };
         // `pair` is the display column; the raw UC block order is the same.
@@ -1172,7 +1177,8 @@ impl Fireface {
             .ok_or_else(|| Error::InvalidChannel(format!("output pair {pair}")))?;
         let pan = self.inputs[idx].pans.get(pair).copied().unwrap_or(0);
         if idx < 4 {
-            let volume = self.inputs[idx].volumes.get(pair).copied().unwrap_or(0.0);
+            let volume = self.inputs[idx].volumes.get(pair).copied().unwrap_or(0.0)
+                * self.trim_gain(ChannelId::Input(idx));
             let (l, r) = pan_split(volume, pan);
             let source = Source::Input(idx);
             self.ucx_write_matrix(dsp as u8, source, l as f64)?;
@@ -1185,8 +1191,10 @@ impl Fireface {
         // Stereo strip: source `base` on the left, `base^1` on the right.
         let base = idx & !1;
         let other = base ^ 1;
-        let left = self.inputs[base].volumes.get(pair).copied().unwrap_or(0.0);
-        let right = self.inputs[other].volumes.get(pair).copied().unwrap_or(0.0);
+        let left = self.inputs[base].volumes.get(pair).copied().unwrap_or(0.0)
+            * self.trim_gain(ChannelId::Input(base));
+        let right = self.inputs[other].volumes.get(pair).copied().unwrap_or(0.0)
+            * self.trim_gain(ChannelId::Input(other));
         let balance = pan.clamp(-100, 100) as f32 / 100.0;
         let gl = left * (1.0 - balance.max(0.0));
         let gr = right * (1.0 + balance.min(0.0));
@@ -1205,6 +1213,7 @@ impl Fireface {
         let dsp = ucx::output_pair_dsp(pair)
             .ok_or_else(|| Error::InvalidChannel(format!("output pair {pair}")))?;
         let side = dev % 2;
+        let volume = volume * self.trim_gain(ChannelId::Playback(idx));
         self.ucx_write_matrix(
             (dsp + side) as u8,
             Source::Playback(dev),
@@ -1835,6 +1844,18 @@ impl Fireface {
         }
     }
 
+    /// Trim (T) gain factor: 1.0 at 0 dB, lower when the channel is
+    /// attenuated.  Applied when a send is written, never stored in the
+    /// model.
+    fn trim_gain(&self, channel: ChannelId) -> f32 {
+        let db = match channel {
+            ChannelId::Input(i) => self.inputs.get(i).map(|c| c.trim).unwrap_or(0.0),
+            ChannelId::Playback(i) => self.playbacks.get(i).map(|c| c.trim).unwrap_or(0.0),
+            ChannelId::Output(_) => 0.0,
+        };
+        10f32.powf(db.clamp(-65.0, 0.0) / 20.0)
+    }
+
     fn apply_input_volume(&mut self, idx: usize, output: usize, volume: f32) -> Result<(), Error> {
         if idx >= self.inputs.len() || output >= PAIRS {
             return Err(Error::InvalidChannel(format!("input {idx}/{output}")));
@@ -2120,7 +2141,7 @@ impl RmeDevice for Fireface {
         if !self.is_uc() {
             return self.set_volume(channel, block / 2, gain);
         }
-        self.uc_write_matrix(block, source, gain)?;
+        self.uc_write_matrix(block, source, gain * self.trim_gain(channel))?;
         if Self::matrix_natural(channel, block) {
             let pair = block / 2;
             match channel {
@@ -2873,9 +2894,37 @@ impl RmeDevice for Fireface {
         Ok(())
     }
 
-    fn set_trim(&mut self, idx: usize, db: f32) -> Result<(), Error> {
-        if let Some(input) = self.inputs.get_mut(idx) {
-            input.trim = db;
+    fn set_trim(&mut self, channel: ChannelId, db: f32) -> Result<(), Error> {
+        let db = db.clamp(-65.0, 0.0);
+        let volumes = match channel {
+            ChannelId::Input(idx) => {
+                let c = self
+                    .inputs
+                    .get_mut(idx)
+                    .ok_or_else(|| Error::InvalidChannel(format!("input {idx}")))?;
+                c.trim = db;
+                c.volumes.clone()
+            }
+            ChannelId::Playback(idx) => {
+                let c = self
+                    .playbacks
+                    .get_mut(idx)
+                    .ok_or_else(|| Error::InvalidChannel(format!("playback {idx}")))?;
+                c.trim = db;
+                c.volumes.clone()
+            }
+            ChannelId::Output(_) => {
+                return Err(Error::InvalidChannel(
+                    "trim applies to inputs and playbacks".into(),
+                ))
+            }
+        };
+        // Rewrite the sends that carry signal so the device picks up the
+        // new gain.  Silent sends stay silent and need no write.
+        for (out, v) in volumes.iter().enumerate() {
+            if *v > 0.0 {
+                self.set_volume(channel, out, *v)?;
+            }
         }
         Ok(())
     }
@@ -2894,7 +2943,8 @@ impl RmeDevice for Fireface {
             for block in 0..BLOCKS {
                 let gain = self.matrix_cell(channel, block).unwrap_or(0.0);
                 if gain > 0.0 {
-                    self.uc_write_matrix(block, idx, gain)?;
+                    let trimmed = gain * self.trim_gain(channel);
+                    self.uc_write_matrix(block, idx, trimmed)?;
                 }
             }
             return Ok(());
