@@ -10,11 +10,14 @@ in this repository.
 
 ![The TuxMix mixer and Control Room driving a Fireface UCX, with the EQ and dynamics panels, sends, and the reverb and echo panels open](ui/tuxmix/docs/screenshots/mixer-ucx.png)
 
-## What this tree adds
+## Functionality
 
 - **Fireface UC and Fireface UCX support.**  The `snd-fireface-uc` kernel
   module provides the vendor-mode USB transport, the ALSA PCM device, a
   `snd-hwdep` control ABI and per-unit identification by serial.
+- **Seamless sample-rate switching.**  The rate follows the session without
+  a reconnect, and the transport stays stable at the high rates — 192 kHz
+  included — down to buffer sizes of 96 samples.
 - **MIDI in and out over USB.**  A standard rawmidi port on the unit's
   second USB interface; works with any Linux sequencer or DAW.
 - **Full OSC support.**  The complete RME OSC dialect: per-channel
