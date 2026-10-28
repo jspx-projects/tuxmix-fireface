@@ -143,6 +143,7 @@ The measured latency chain is documented in
   meters.
 - Several cards, including identical models, selected by serial.
 - Class Compliant cards through stock ALSA/PipeWire.
+- Babyface Pro FS through the inherited ALSA and direct-USB backends.
 - TuxMix GUI and TUI over the hwdep backend.
 
 The UCX backend hides capabilities whose register or write path is not
