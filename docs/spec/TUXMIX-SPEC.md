@@ -166,12 +166,14 @@ height on every input.
 - The reference levels for 5–8 move together: any change to one applies to
   all four. Inputs 3 and 4 keep separate levels unless linked.
 - Input reference values are `-10 dBV`, `+4 dBu`, `Lo Gain`; output
-  reference values are `-10 dBV`, `+4 dBu`, `Hi Gain`. A channel in the
-  Control Room keeps its own reference level; every other hardware output
-  follows one shared setting.
+  reference values are `-10 dBV`, `+4 dBu`, `Hi Gain`. Reference levels
+  follow register groups: the three line-output pairs share one setting and
+  the Phones/Main pair has its own.
 - The Talkback row is empty on Control Room channels.
 - The Send FX knob mirrors the thin FX fader on the strip; the Return FX knob
   mirrors the thin fader on outputs. One value, two views.
+- The FX send follows the channel fader: a fader move rewrites the send with
+  the new absolute level.
 - Every slideout fits the strip height at normal size: everything is visible
   at a glance and the panel does not scroll.
 - The UCX has no PAD.

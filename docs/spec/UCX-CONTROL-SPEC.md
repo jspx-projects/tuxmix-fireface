@@ -194,6 +194,7 @@ Output registers are the input layout mirrored at `+0x1200`:
 | `0x02` | mute | 0/1 |
 | `0x03` | FX Return | 0.1 dB, signed |
 | `0x04` | stereo mode | 0 mono, 1 stereo |
+| `0x07` | phase L, and R at `+0x100` | 0/1 |
 | `0x40..0x4b` | EQ and low cut | as inputs |
 | `0x60..0x83` | dynamics and AutoLevel | as inputs |
 
@@ -316,8 +317,22 @@ Level values:
 | MS processing | `NN05` | 0/1 |
 | FX send | `NN01` | 0.1 dB, signed |
 
-Width is a host-side matrix operation.  Trim attenuates the channel's
-send gains in the mixer (see `TUXMIX-SPEC.md`).
+The unit has no register for these; the host computes them and rewrites
+the affected sends:
+
+- **Width** — the pair's send words, eight registers per stereo pair
+  (`0x4022/0x4062/…` family).
+- **MS Proc on software playback** — the playback's send words
+  (`0x4020…`, `0x4120…`, `0x41A0…` families).  On hardware inputs MS Proc
+  uses `NN05` and the same send recompute.
+- **Talkback receive per output** and **No Trim** — host-side flags; they
+  write nothing.
+- **Trim** — a per-channel attenuation applied to every send (see
+  `TUXMIX-SPEC.md`).
+
+**FX send** is an absolute level in 0.1 dB (`0x0000` = 0.0 dB, `NN01`).
+It follows the channel fader: every fader move rewrites it with the new
+absolute value (`0x0201`/`0x0301`; playback `0x47A0`/`0x47E1`).
 
 ### 6.3 Mute, solo and stereo mode
 
