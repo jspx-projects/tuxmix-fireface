@@ -12,6 +12,7 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 strum = { version = "0.26", features = ["derive"] }
+libc = "0.2"
 alsa = { version = "0.9", optional = true }
 tuxmix-usb = { version = "0.3.0", path = "../tuxmix-usb", optional = true }
 
@@ -28,4 +29,24 @@ required-features = ["alsa"]
 
 [[example]]
 name = "panel-watch"
+required-features = ["alsa"]
+
+[[example]]
+name = "ucx-scan"
+required-features = ["alsa"]
+
+[[example]]
+name = "fireface-scan"
+required-features = ["alsa"]
+
+[[example]]
+name = "fireface-events"
+required-features = ["alsa"]
+
+[[example]]
+name = "fireface-ctl"
+required-features = ["alsa"]
+
+[[example]]
+name = "fireface-levels"
 required-features = ["alsa"]

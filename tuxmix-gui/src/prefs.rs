@@ -17,12 +17,36 @@ use serde::{Deserialize, Serialize};
 use tuxmix_core::ChannelId;
 
 use crate::app::View;
+use crate::widgets::strip::FlyoutKind;
+
+/// What to do on the first connect: read the device into the GUI (the safe
+/// default, no writes), or write the saved GUI/auto scene into the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SyncDirection {
+    #[default]
+    DeviceToGui,
+    GuiToDevice,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
     pub view: Option<View>,
+    /// Last selected device kind label (`Fireface UCX`, `Fireface UC`, …).
+    /// Applied at startup; changing it in the UI also switches live.
+    pub device: Option<String>,
+    /// Serial number of the last selected physical unit.  This is the
+    /// stable identity across reconnects and card-index changes; the model
+    /// label above is only a fallback for older preference files.
+    pub device_serial: Option<String>,
     pub sidebar_open: Option<bool>,
+    /// The FX column between the mixer and the sidebar (Reverb/Echo).
+    /// Missing = shown, which is TotalMix's own default.
+    #[serde(default)]
+    pub fx_panel: Option<bool>,
+    /// Control Room monitoring assignments, by `ASSIGN_DESTS` index.
+    #[serde(default)]
+    pub assign: [Option<usize>; 7],
     pub sidebar_width: Option<f32>,
     /// Options, Snapshots, Groups, Mixer Layout, in that order.
     pub panels_open: Option<[bool; 4]>,
@@ -39,7 +63,7 @@ pub struct Prefs {
     /// TotalMix's "Show Names": display the original names even where the
     /// user renamed a channel.
     pub show_original_names: bool,
-    /// The PipeWire rate / buffer size forced from the device settings
+    /// The PipeWire rate / buffer size forced from the Settings panel
     /// (`0` = PipeWire's own), applied again at launch.
     pub engine_force_rate: Option<u32>,
     /// Logical size of the window at the last close.
@@ -47,6 +71,22 @@ pub struct Prefs {
     /// Closing the window hides it in the tray instead of quitting.
     pub keep_in_tray: Option<bool>,
     pub engine_force_quantum: Option<u32>,
+    /// Per-strip UI state: collapsed strips and the Settings/EQ/Trim
+    /// panels that were left open.  This is GUI state, like TotalMix's
+    /// Workspace, not mixer/device state.
+    pub collapsed: Vec<ChannelId>,
+    pub flyouts: Vec<(ChannelId, FlyoutKind)>,
+    /// Last selected hardware-output submix (output-pair index).
+    pub sel_out: Option<usize>,
+    /// First-connect direction.  Missing = DeviceToGui (safe, no writes).
+    pub sync_direction: Option<SyncDirection>,
+    /// RME's "Always init DSP devices with TotalMix FX settings": suppress
+    /// the startup mismatch prompt and write the saved TuxMix scene.
+    #[serde(default)]
+    pub always_init_device: bool,
+    /// Stereo-link groupings (pure GUI model state, no device writes).
+    pub input_pair_link: Vec<bool>,
+    pub output_link: Vec<bool>,
 }
 
 /// Where the preferences live. `None` only if neither `XDG_CONFIG_HOME`
@@ -108,6 +148,7 @@ mod tests {
             window_size: Some((1600.0, 900.0)),
             keep_in_tray: Some(false),
             engine_force_quantum: Some(128),
+            ..Default::default()
         };
         save(&file, &prefs).unwrap();
         assert_eq!(load(&file), prefs);

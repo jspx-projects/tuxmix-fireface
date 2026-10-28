@@ -5,9 +5,9 @@
 //! stereo pair for every PB channel), so per-PB levels have to come from
 //! the host mixer. PipeWire exposes the card sink's monitor, which is
 //! the mixed playback at the sink's own channel count: 2 channels in the
-//! default stereo profile (PB1 only) and 12 channels in the "Pro Audio"
-//! profile (all six PB pairs), with the same order as the device's
-//! playback channels.
+//! default stereo profile (PB1 only), 12 channels for a Babyface in the
+//! "Pro Audio" profile (all six PB pairs), or 18 for a UCX in "Pro Audio"
+//! (all nine pairs), with the same order as the device's playback channels.
 //!
 //! `pw-record` is the capture child: it ships with PipeWire, needs no
 //! build dependency, and can write raw S32LE to stdout. The sink is
@@ -18,8 +18,8 @@
 //! Pulse index, not its name: with a name, a suspended target silently
 //! falls back to the default sink instead (caught live: the Pro Audio
 //! record linked to the laptop speakers while the Babyface was
-//! suspended). If either tool or the Babyface sink is missing, the
-//! meters simply stay unavailable and the rest of the app is unaffected.
+//! suspended). If either tool or the RME sink is missing, the meters
+//! simply stay unavailable and the rest of the app is unaffected.
 //!
 //! The tap is disabled in mock mode: the mock generates its own playback
 //! levels and must not depend on the host's audio server.
@@ -31,9 +31,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// The Pro Audio profile's playback channel count. Anything past this
-/// is not a Babyface layout and is ignored.
-const MAX_CHANNELS: usize = 12;
+/// The largest RME Pro Audio playback layout: 18 channels on the UCX
+/// (nine pairs); the Babyface uses 12 (six pairs). Anything past this is
+/// not an RME layout and is ignored.
+const MAX_CHANNELS: usize = 18;
 /// Frames per read: at 48 kHz this is ~21 ms, enough for a smooth meter
 /// and small enough to keep the mutex cheap.
 const PERIOD_FRAMES: usize = 1024;
@@ -64,9 +65,9 @@ pub struct PlaybackTap {
 }
 
 impl PlaybackTap {
-    /// Start discovering and capturing the Babyface sink monitor. Cheap:
-    /// the actual work runs on a background thread, and a missing
-    /// `pactl`/`pw-record` just leaves the meters at zero channels.
+    /// Start discovering and capturing the RME sink monitor (Babyface or
+    /// UCX). Cheap: the actual work runs on a background thread, and a
+    /// missing `pactl`/`pw-record` just leaves the meters at zero channels.
     pub fn start() -> Self {
         let levels = Arc::new(Mutex::new([0.0; MAX_CHANNELS]));
         let channels = Arc::new(AtomicUsize::new(0));
@@ -246,10 +247,10 @@ fn watch_monitor(
     }
 }
 
-/// Ask Pulse/PipeWire for its sources and pick the widest Babyface
-/// monitor. `pactl` prints one JSON object per source; the monitor name
+/// Ask Pulse/PipeWire for its sink list and pick the widest RME
+/// monitor. `pactl` prints one JSON object per sink; the monitor name
 /// carries the card and profile, and `sample_specification` is a string
-/// like `"s32le 12ch 48000Hz"`.
+/// like `"s32le 18ch 48000Hz"`.
 fn discover_monitor() -> Option<Monitor> {
     let output = Command::new("pactl")
         .args(["--format=json", "list", "sinks"])
@@ -271,7 +272,7 @@ fn parse_monitor(json: &[u8]) -> Option<Monitor> {
         let Some(name) = sink.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
-        if !name.contains("Babyface") {
+        if !name.contains("RME_") {
             continue;
         }
         let Some(spec) = sink.get("sample_specification").and_then(|v| v.as_str()) else {
@@ -330,8 +331,10 @@ fn spawn_record(monitor: &Monitor) -> Option<Child> {
         .arg("stream.capture.sink=true")
         .arg("--format")
         .arg("s32")
-        .arg("--rate")
-        .arg(monitor.rate.to_string())
+        // Never pin the playback meter to the discovery-time rate: doing
+        // so keeps the graph at that rate when the device runs at 88.2 kHz
+        // or higher.  The tap follows the graph; a rate change is still
+        // detected by `watch_monitor`, which respawns it.
         .arg("--channels")
         .arg(monitor.channels.to_string())
         .arg("--media-category")
@@ -434,24 +437,26 @@ mod tests {
     use super::{add_peaks, parse_monitor, parse_spec, MAX_CHANNELS};
 
     #[test]
-    fn picks_the_widest_babyface_sink() {
+    fn picks_the_widest_rme_sink() {
         let json = br#"[
             {"index":11,"name":"alsa_output.pci-0.HiFi",
              "sample_specification":"s32le 2ch 48000Hz"},
             {"index":2628,"name":"alsa_output.usb-RME_Babyface_Pro__x.stereo-fallback",
              "sample_specification":"s32le 2ch 48000Hz"},
             {"index":2629,"name":"alsa_output.usb-RME_Babyface_Pro__x.pro-output-0",
-             "sample_specification":"s32le 12ch 48000Hz"}
+             "sample_specification":"s32le 12ch 48000Hz"},
+            {"index":2630,"name":"alsa_output.usb-RME_Fireface_UCX__x.pro-output-0",
+             "sample_specification":"s32le 18ch 48000Hz"}
         ]"#;
-        let monitor = parse_monitor(json).expect("a Babyface sink");
-        assert_eq!(monitor.index, 2629);
-        assert_eq!(monitor.channels, 12);
+        let monitor = parse_monitor(json).expect("an RME sink");
+        assert_eq!(monitor.index, 2630);
+        assert_eq!(monitor.channels, 18);
         assert_eq!(monitor.rate, 48_000);
-        assert!(monitor.name.ends_with("pro-output-0"));
+        assert!(monitor.name.contains("Fireface_UCX"));
     }
 
     #[test]
-    fn ignores_sinks_that_are_not_babyface() {
+    fn ignores_non_rme_sinks() {
         let json = br#"[
             {"index":11,"name":"alsa_output.pci-0.HiFi",
              "sample_specification":"s32le 2ch 48000Hz"},

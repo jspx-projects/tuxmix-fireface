@@ -43,9 +43,18 @@
 //! dead until TuxMix is restarted. `is_connected()` reports the gap so
 //! the UI does not keep showing stale peaks.
 //!
+//! `CaptureMeter::start` takes the channel count, so the same reader
+//! serves the 18-channel UCX (`UcxAlsa`): capture 0..17 maps identity
+//! to AN1-8, SPDIF L/R and ADAT 1-8. Those words are the unit's raw
+//! input stream, i.e. **pre-fader**: moving a matrix fader, panning or
+//! muting a channel does not change them, matching TotalMix, whose
+//! input and playback meters are pre-fader and whose output meters are
+//! post-fader.
+//!
 //! `TUXMIX_METER_DEBUG=1` prints every channel once a second for future
 //! hardware checks; the normal path only uses the table.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -91,13 +100,13 @@ const PERIOD_FRAMES: alsa::pcm::Frames = 1024;
 /// the driver exposes. Every step is tolerant: a missing card, or a
 /// card currently held by PipeWire, just returns `None` and the reader
 /// thread retries.
-fn open_pcm(card_name: &str, rate: u32) -> Option<PCM> {
+fn open_pcm(card_name: &str, rate: u32, channels: usize) -> Option<PCM> {
     let pcm = PCM::new(card_name, Direction::Capture, false).ok()?;
     {
         let hwp = HwParams::any(&pcm).ok()?;
         hwp.set_access(Access::RWInterleaved).ok()?;
         hwp.set_format(Format::S32LE).ok()?;
-        hwp.set_channels(CAPTURE_CHANNELS as u32).ok()?;
+        hwp.set_channels(channels as u32).ok()?;
         hwp.set_rate_near(rate, ValueOr::Nearest).ok()?;
         hwp.set_period_size_near(PERIOD_FRAMES, ValueOr::Nearest)
             .ok()?;
@@ -121,7 +130,8 @@ fn open_pcm(card_name: &str, rate: u32) -> Option<PCM> {
 /// and drops it on `false` before reopening.
 fn read_loop(
     pcm: PCM,
-    peaks: &Mutex<[f32; CAPTURE_CHANNELS]>,
+    peaks: &Mutex<Vec<f32>>,
+    channels: usize,
     connected: &AtomicBool,
     stop: &AtomicBool,
 ) -> bool {
@@ -129,7 +139,9 @@ fn read_loop(
         connected.store(false, Ordering::Relaxed);
         return false;
     };
-    let mut buf = vec![0i32; PERIOD_FRAMES as usize * CAPTURE_CHANNELS];
+    let mut buf = vec![0i32; PERIOD_FRAMES as usize * channels];
+    let mut dump = std::env::var_os("TUXMIX_CAPTURE_DUMP")
+        .and_then(|p| std::fs::File::create(p).ok());
     connected.store(true, Ordering::Relaxed);
 
     loop {
@@ -139,16 +151,27 @@ fn read_loop(
         }
         match io.readi(&mut buf) {
             Ok(n) if n > 0 => {
+                if let Some(f) = dump.as_mut() {
+                    // Diagnostic only (TUXMIX_CAPTURE_DUMP): raw S32_LE,
+                    // interleaved, exactly what the device sent.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            buf.as_ptr() as *const u8,
+                            n * channels * std::mem::size_of::<i32>(),
+                        )
+                    };
+                    let _ = f.write_all(bytes);
+                }
                 // `i32::abs()` panics (in debug builds) on exactly
                 // `i32::MIN` — a real, hit-in-practice bit pattern in
                 // raw audio samples, not a theoretical edge case.
                 // `unsigned_abs()` has no such hole: `i32::MIN`'s
                 // magnitude fits a `u32` fine, unlike its `i32`
                 // negation.
-                let mut local = [0u32; CAPTURE_CHANNELS];
+                let mut local = vec![0u32; channels];
                 for frame in 0..n {
                     for (ch, slot) in local.iter_mut().enumerate() {
-                        let s = buf[frame * CAPTURE_CHANNELS + ch].unsigned_abs();
+                        let s = buf[frame * channels + ch].unsigned_abs();
                         if s > *slot {
                             *slot = s;
                         }
@@ -197,7 +220,8 @@ fn sleep_unless_stopped(stop: &AtomicBool, duration: Duration) -> bool {
 /// blocks, so this can't run on the UI thread) — `drain()` is the only
 /// thing the rest of `tuxmix-core` touches.
 pub struct CaptureMeter {
-    peaks: Arc<Mutex<[f32; CAPTURE_CHANNELS]>>,
+    peaks: Arc<Mutex<Vec<f32>>>,
+    channels: usize,
     connected: Arc<AtomicBool>,
     reconnects: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
@@ -210,9 +234,9 @@ impl CaptureMeter {
     /// thread. `None` if the capture device can't be opened or
     /// configured — metering is a nice-to-have, not something that
     /// should keep the rest of the device from working.
-    pub fn start(card_name: &str, rate: u32) -> Option<Self> {
-        let pcm = open_pcm(card_name, rate)?;
-        let peaks = Arc::new(Mutex::new([0.0f32; CAPTURE_CHANNELS]));
+    pub fn start(card_name: &str, rate: u32, channels: usize) -> Option<Self> {
+        let pcm = open_pcm(card_name, rate, channels)?;
+        let peaks = Arc::new(Mutex::new(vec![0.0f32; channels]));
         let connected = Arc::new(AtomicBool::new(true));
         let reconnects = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -232,7 +256,7 @@ impl CaptureMeter {
                 }
                 let current = match next_pcm.take() {
                     Some(pcm) => pcm,
-                    None => match open_pcm(&card, rate) {
+                    None => match open_pcm(&card, rate, channels) {
                         Some(pcm) => {
                             reconnects2.fetch_add(1, Ordering::Relaxed);
                             log::info!("capture meter: reopened the capture PCM");
@@ -249,7 +273,7 @@ impl CaptureMeter {
                         }
                     },
                 };
-                if read_loop(current, &peaks2, &connected2, &stop2) {
+                if read_loop(current, &peaks2, channels, &connected2, &stop2) {
                     return;
                 }
                 // Fatal stream error (a profile change, a re-probe, an
@@ -264,6 +288,7 @@ impl CaptureMeter {
 
         Some(Self {
             peaks,
+            channels,
             connected,
             reconnects,
             stop,
@@ -289,12 +314,12 @@ impl CaptureMeter {
     /// call, per capture channel: resets the accumulator, matching
     /// `tuxmix-usb`'s own `input_peaks()` draining convention (poll
     /// once per UI tick, not once per channel).
-    pub fn drain(&self) -> [f32; CAPTURE_CHANNELS] {
+    pub fn drain(&self) -> Vec<f32> {
         let Ok(mut p) = self.peaks.lock() else {
-            return [0.0; CAPTURE_CHANNELS];
+            return vec![0.0; self.channels];
         };
-        let out = *p;
-        *p = [0.0; CAPTURE_CHANNELS];
+        let out = p.clone();
+        p.fill(0.0);
         out
     }
 
@@ -302,9 +327,10 @@ impl CaptureMeter {
     /// `TUXMIX_METER_DEBUG` is set, in dBFS (`-120.0` for silence).
     /// Exists for hardware checks like the 2026-10-17 loopback mapping:
     /// play a known signal into one bus at a time and watch which index
-    /// moves. Index map: 0/1 = AN1/2, 2/3 = IN3/4, 4/5 = AS1/2,
-    /// 6/7 = ADAT3/4, 8/9 = ADAT5/6, 10/11 = ADAT7/8.
-    pub fn debug_log(peaks: &[f32; CAPTURE_CHANNELS]) {
+    /// moves. Babyface index map: 0/1 = AN1/2, 2/3 = IN3/4, 4/5 = AS1/2,
+    /// 6/7 = ADAT3/4, 8/9 = ADAT5/6, 10/11 = ADAT7/8. UCX map is the
+    /// identity: 0-7 = AN1-8, 8/9 = SPDIF, 10-17 = ADAT 1-8.
+    pub fn debug_log(peaks: &[f32]) {
         use std::sync::OnceLock;
 
         static ENABLED: OnceLock<bool> = OnceLock::new();

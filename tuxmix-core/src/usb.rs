@@ -298,9 +298,22 @@ impl BabyfaceProUsb {
             eq_for_record: false,
             optical_out_spdif: false,
             dim: false,
+            speaker_b: false,
+            main_out: None,
+            main_b_out: None,
+            mono: false,
+            mute_fx: false,
             fx_send_db: None,
+            reverb: None,
+            echo: None,
             width: 0.0,
             sample_rate: 48_000,
+            line_in_ref: 0,
+            line_in_ref_58: 0,
+            line_out_ref: 2,
+            phones_ref: 1,
+            word_clock_single_speed: false,
+            word_clock_termination: false,
             input_link: true,
             output_link: Vec::new(),
             input_pair_link: Vec::new(),
@@ -524,6 +537,21 @@ impl BabyfaceProUsb {
         self.dev.send_all(&reqs)?;
         Ok(())
     }
+
+    /// Trim (T) gain factor: 1.0 at 0 dB, lower when the channel is
+    /// attenuated.  Applied when a send is written, never stored.
+    fn trim_gain(&self, channel: ChannelId) -> f32 {
+        let db = match channel {
+            ChannelId::Input(i) => self.inputs.get(i).map(|c| c.trim).unwrap_or(0.0),
+            ChannelId::Playback(i) => self.playbacks.get(i).map(|c| c.trim).unwrap_or(0.0),
+            ChannelId::Output(_) => 0.0,
+        };
+        10f32.powf(db.clamp(-65.0, 0.0) / 20.0)
+    }
+
+    fn send_raw(&self, channel: ChannelId, volume: f32) -> u16 {
+        volume_to_raw(volume * self.trim_gain(channel))
+    }
 }
 
 impl RmeDevice for BabyfaceProUsb {
@@ -617,7 +645,7 @@ impl RmeDevice for BabyfaceProUsb {
             ChannelId::Playback(c) => playback_source(c)?,
             ChannelId::Output(_) => unreachable!("handled above"),
         };
-        let raw = volume_to_raw(volume);
+        let raw = self.send_raw(channel, volume);
         self.dev.set_volume(out, src, raw)?;
         // Keep the AN1/2 low-map mirror in sync (TotalMix writes both).
         if out == Output::An12 {
@@ -669,13 +697,8 @@ impl RmeDevice for BabyfaceProUsb {
             ChannelId::Playback(c) => self.playbacks[c].volumes[output],
             _ => 0.0,
         };
-        self.dev.set_balance(
-            out,
-            src,
-            balance,
-            volume_to_raw(fixed_volume),
-            fixed_is_left,
-        )?;
+        let fixed_raw = self.send_raw(channel, fixed_volume);
+        self.dev.set_balance(out, src, balance, fixed_raw, fixed_is_left)?;
         match channel {
             ChannelId::Input(i) => self.inputs[i].pans[output] = pan,
             ChannelId::Playback(c) => self.playbacks[c].pans[output] = pan,
@@ -722,14 +745,14 @@ impl RmeDevice for BabyfaceProUsb {
                 let low = if mute {
                     0
                 } else {
-                    volume_to_raw(self.inputs[i].volumes[0])
+                    self.send_raw(ChannelId::Input(i), self.inputs[i].volumes[0])
                 };
                 self.dev.set_low_map_volume(src, low)?;
                 for o in 0..self.output_pair_count() {
                     let raw = if mute {
                         0
                     } else {
-                        volume_to_raw(self.inputs[i].volumes[o])
+                        self.send_raw(ChannelId::Input(i), self.inputs[i].volumes[o])
                     };
                     let out = output_for(o)?;
                     self.dev.set_volume(out, src, raw)?;
@@ -746,7 +769,7 @@ impl RmeDevice for BabyfaceProUsb {
                     let raw = if mute {
                         0
                     } else {
-                        volume_to_raw(self.playbacks[c].volumes[o])
+                        self.send_raw(ChannelId::Playback(c), self.playbacks[c].volumes[o])
                     };
                     let out = output_for(o)?;
                     self.dev.set_volume(out, src, raw)?;
@@ -803,7 +826,7 @@ impl RmeDevice for BabyfaceProUsb {
                         0x2000
                     }
                 } else {
-                    volume_to_raw(self.inputs[i].volumes[0])
+                    self.send_raw(ChannelId::Input(i), self.inputs[i].volumes[0])
                 };
                 (src, raw)
             }
@@ -813,7 +836,7 @@ impl RmeDevice for BabyfaceProUsb {
                 let raw = if solo {
                     0x2000
                 } else {
-                    volume_to_raw(self.playbacks[c].volumes[0])
+                    self.send_raw(ChannelId::Playback(c), self.playbacks[c].volumes[0])
                 };
                 (src, raw)
             }
@@ -835,7 +858,7 @@ impl RmeDevice for BabyfaceProUsb {
             let low = if solo || ch.mute {
                 0
             } else {
-                volume_to_raw(ch.volumes[0])
+                self.send_raw(ChannelId::Input(j), ch.volumes[0])
             };
             let src = input_source(j)?;
             self.dev.set_low_map_volume(src, low)?;
@@ -843,7 +866,7 @@ impl RmeDevice for BabyfaceProUsb {
                 let raw = if solo || ch.mute {
                     0
                 } else {
-                    volume_to_raw(ch.volumes[o])
+                    self.send_raw(ChannelId::Input(j), ch.volumes[o])
                 };
                 let out = output_for(o)?;
                 self.dev.set_volume(out, src, raw)?;
@@ -860,7 +883,7 @@ impl RmeDevice for BabyfaceProUsb {
             let low = if solo || ch.mute {
                 0
             } else {
-                volume_to_raw(ch.volumes[0])
+                self.send_raw(ChannelId::Playback(j), ch.volumes[0])
             };
             let src = playback_source(j)?;
             self.dev.set_low_map_volume(src, low)?;
@@ -868,7 +891,7 @@ impl RmeDevice for BabyfaceProUsb {
                 let raw = if solo || ch.mute {
                     0
                 } else {
-                    volume_to_raw(ch.volumes[o])
+                    self.send_raw(ChannelId::Playback(j), ch.volumes[o])
                 };
                 let out = output_for(o)?;
                 self.dev.set_volume(out, src, raw)?;
@@ -999,37 +1022,36 @@ impl RmeDevice for BabyfaceProUsb {
         Ok(())
     }
 
-    fn set_trim(&mut self, idx: usize, db: f32) -> Result<(), Error> {
-        // Restricted to AN1-4: `protocol::set_trim` always also writes
-        // the sibling channel's registers via a `+1`-adjacency trick
-        // (index_l/r(src)+1), which only lands on the correct sibling
-        // for the two pairs PROTOCOL.md's captures actually cover
-        // (AN1/2, AN3/4 — cap_trim2/3/4.pcap). `input_source(idx)`
-        // itself succeeds for every hardware input, so without this
-        // guard, calling Trim on e.g. AS1/2 would silently compute
-        // ADAT3/4's registers instead and corrupt that unrelated
-        // channel — found 2026-09-06 while wiring the sibling ALSA
-        // backend's own Trim control, fixed here to match (that
-        // backend's own `set_trim` already has the identical guard).
-        if idx >= 4 {
-            return Err(Error::InvalidChannel(format!(
-                "Input {idx} has no trim control"
-            )));
+    fn set_trim(&mut self, channel: ChannelId, db: f32) -> Result<(), Error> {
+        let db = db.clamp(-65.0, 0.0);
+        let volumes = match channel {
+            ChannelId::Input(idx) => {
+                let c = self
+                    .inputs
+                    .get_mut(idx)
+                    .ok_or_else(|| Error::InvalidChannel(format!("input {idx}")))?;
+                c.trim = db;
+                c.volumes.clone()
+            }
+            ChannelId::Playback(idx) => {
+                let c = self
+                    .playbacks
+                    .get_mut(idx)
+                    .ok_or_else(|| Error::InvalidChannel(format!("playback {idx}")))?;
+                c.trim = db;
+                c.volumes.clone()
+            }
+            ChannelId::Output(_) => {
+                return Err(Error::InvalidChannel(
+                    "trim applies to inputs and playbacks".into(),
+                ))
+            }
+        };
+        for (out, v) in volumes.iter().enumerate() {
+            if *v > 0.0 {
+                self.set_volume(channel, out, *v)?;
+            }
         }
-        let src = input_source(idx)?;
-        // cap_trim2.pcap + cap_trim3/4.pcap (2026-08-24): the low map
-        // = the trim ALONE on the master curve (0x2000 = 0 dB, 0 =
-        // -inf); the standard map = fader × trim — the fader-curve
-        // value of the SUMMED dB (regression on 188 labeled pairs:
-        // standard_raw = 0x16A0 · 10^((fader_dB + trim_dB)/20), exact
-        // to 3 decimals). The old ×27/256 placeholder is gone.
-        let db = db.clamp(-65.0, 6.0);
-        let trim_raw = master_db_to_raw(db);
-        let fader_db = 20.0 * self.inputs[idx].volumes[0].clamp(f32::EPSILON, 2.0).log10();
-        let standard_raw = fader_db_to_raw(fader_db + db);
-        let reqs = tuxmix_usb::protocol::set_trim(src, trim_raw, standard_raw);
-        self.dev.send_all(&reqs)?;
-        self.inputs[idx].trim = db;
         Ok(())
     }
 
@@ -1041,7 +1063,7 @@ impl RmeDevice for BabyfaceProUsb {
         let value = if on {
             0x0000
         } else {
-            volume_to_raw(self.inputs[1].volumes[0])
+            self.send_raw(ChannelId::Input(1), self.inputs[1].volumes[0])
         };
         let reqs = tuxmix_usb::protocol::set_ms_proc(value);
         self.dev.send_all(&reqs)?;
@@ -1055,7 +1077,7 @@ impl RmeDevice for BabyfaceProUsb {
         // the input routes into; the AN1/2 destination also gets the
         // low-map mirror (matching the capture: 0x0EA0 → 0xF15F).
         for o in 0..self.output_pair_count() {
-            let raw = volume_to_raw(self.inputs[idx].volumes[o]);
+            let raw = self.send_raw(ChannelId::Input(idx), self.inputs[idx].volumes[o]);
             let out = output_for(o)?;
             self.write_l_with_phase(out, src, raw, invert)?;
         }
@@ -1198,6 +1220,7 @@ impl RmeDevice for BabyfaceProUsb {
         Scene {
             name: "capture".into(),
             model: self.canonical_model().into(),
+            matrix_overrides: Vec::new(),
             inputs: self.inputs.clone(),
             playbacks: self.playbacks.clone(),
             outputs: self.outputs.clone(),
@@ -1384,7 +1407,7 @@ impl BabyfaceProUsb {
                     } else {
                         sel[0]
                     };
-                    self.mix_raw = volume_to_raw(self.inputs[i].volumes[o]);
+                    self.mix_raw = self.send_raw(ChannelId::Input(i), self.inputs[i].volumes[o]);
                 }
                 PanelEvent::MixReleased => {
                     self.dev.send(&tuxmix_usb::protocol::VendorRequest::new(

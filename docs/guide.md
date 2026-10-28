@@ -23,8 +23,11 @@ project status.
   software playback, hardware outputs) or two on a wide window.
 - **Matrix**: the full routing grid.
 
-`tuxmix --view quick|mixer|matrix` opens a given view; `--mock` runs against
-a simulated device, no hardware needed.
+`tuxmix --view quick|mixer|matrix` opens a given view; `--mock`, `--mock-ucx`
+and `--mock-uc` run against a simulated Babyface Pro FS, Fireface UCX or
+Fireface UC, no hardware needed. Each simulation carries exactly the panels its
+unit has, so the UCX one shows EQ, dynamics, FX and the Control Room while the
+UC one shows the gated set. All three are also listed in the Device picker.
 
 ## Running in the background
 

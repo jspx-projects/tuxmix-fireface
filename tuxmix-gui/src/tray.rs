@@ -106,6 +106,19 @@ impl ksni::Tray for Icon {
             .collect()
     }
 
+    fn tool_tip(&self) -> ksni::ToolTip {
+        ksni::ToolTip {
+            icon_name: String::new(),
+            icon_pixmap: self.icon_pixmap(),
+            title: "TuxMix".into(),
+            description: if self.status.window_visible {
+                "RME Fireface mixer and router — click to hide".into()
+            } else {
+                "RME Fireface mixer and router — click to show".into()
+            },
+        }
+    }
+
     fn activate(&mut self, _x: i32, _y: i32) {
         send(TrayEvent::Toggle);
     }
@@ -317,6 +330,18 @@ mod tests {
         // One opaque red pixel and one transparent one.
         let rgba = [255, 0, 0, 255, 10, 20, 30, 0];
         assert_eq!(argb_network_order(&rgba), vec![255, 255, 0, 0, 0, 10, 20, 30]);
+    }
+
+    #[test]
+    fn the_tray_tooltip_names_tuxmix() {
+        let icon = Icon {
+            status: Status::default(),
+        };
+        let tip = ksni::Tray::tool_tip(&icon);
+        assert_eq!(tip.title, "TuxMix");
+        assert!(tip.description.contains("Fireface"));
+        assert_eq!(tip.icon_pixmap.len(), 4);
+        assert!(tip.icon_pixmap.iter().all(|i| i.width == i.height));
     }
 
     #[test]

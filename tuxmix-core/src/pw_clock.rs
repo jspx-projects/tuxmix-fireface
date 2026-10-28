@@ -14,7 +14,7 @@
 //! last until PipeWire restarts. `pw-metadata` ships with PipeWire, so this
 //! needs no build dependency, like `pw_meter`'s use of `pw-record`.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// The graph clock as PipeWire reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,17 +131,112 @@ impl CardStream {
         }
         self.period as f32 * 1000.0 / self.rate as f32
     }
+
+    /// The whole ALSA ring buffer's worth of time, in milliseconds.
+    pub fn buffer_ms(&self) -> f32 {
+        if self.rate == 0 {
+            return 0.0;
+        }
+        self.buffer as f32 * 1000.0 / self.rate as f32
+    }
 }
 
-/// The smallest period the kernel driver accepts, from its module
-/// parameter (`urb_frames_min`, 32 by default; the driver's period floor
-/// is one URB). `None` when the module is not loaded.
+/// The smallest period the kernel driver accepts.  The UC's period floor is
+/// one URB (`urb_frames`, 48 samples at 1x); the Babyface Pro FS uses its
+/// `urb_frames_min`.  `None` when no RME transport module is loaded.
 pub fn driver_period_floor() -> Option<u32> {
-    std::fs::read_to_string("/sys/module/snd_usb_babyface_pro/parameters/urb_frames_min")
+    for path in [
+        "/sys/module/snd_fireface_uc/parameters/urb_frames",
+        "/sys/module/snd_usb_babyface_pro/parameters/urb_frames_min",
+    ] {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(value) = text.trim().parse() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+/// The UC's USB queue: `(frames per URB, URBs in flight)`.  `None` when the
+/// Fireface UC transport module is not loaded.
+pub fn driver_urb_queue() -> Option<(u32, u32)> {
+    let frames = std::fs::read_to_string("/sys/module/snd_fireface_uc/parameters/urb_frames")
         .ok()?
         .trim()
         .parse()
-        .ok()
+        .ok()?;
+    let urbs = std::fs::read_to_string("/sys/module/snd_fireface_uc/parameters/nurbs")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some((frames, urbs))
+}
+
+/// Whether the RME Pro Audio sink is actually running a playback stream.
+/// `pactl list short sinks` reports the node state in its last field.
+pub fn fireface_sink_running() -> bool {
+    let Ok(out) = Command::new("pactl")
+        .args(["list", "short", "sinks"])
+        .output()
+    else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        line.contains("RME")
+            && line.contains("pro-output-0")
+            && line.split_whitespace().last() == Some("RUNNING")
+    })
+}
+
+/// Name of the RME Pro Audio sink/source node, for suspend/resume around a
+/// UC rate change.  The UC latches matrix routing when its engine starts, so
+/// the scene must be written while both PCM directions are closed.
+fn fireface_node(kind: &str, suffix: &str) -> Option<String> {
+    let out = Command::new("pactl")
+        .args(["list", "short", kind])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
+        if !line.contains("RME") || !line.contains(suffix) || line.contains(".monitor") {
+            return None;
+        }
+        line.split_whitespace().nth(1).map(str::to_owned)
+    })
+}
+
+pub fn fireface_sink_name() -> Option<String> {
+    fireface_node("sinks", "pro-output-0")
+}
+
+pub fn fireface_source_name() -> Option<String> {
+    fireface_node("sources", "pro-input-0")
+}
+
+fn set_suspended(command: &str, node: &str, suspended: bool) -> bool {
+    Command::new("pactl")
+        .args([command, node, if suspended { "1" } else { "0" }])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn set_sink_suspended(node: &str, suspended: bool) -> bool {
+    set_suspended("suspend-sink", node, suspended)
+}
+
+pub fn set_source_suspended(node: &str, suspended: bool) -> bool {
+    set_suspended("suspend-source", node, suspended)
 }
 
 /// Parses a `hw_params` file. `None` for "closed" (the card is idle).
@@ -263,6 +358,7 @@ update: id:0 key:'clock.force-rate' value:'0' type:''
             }
         );
         assert!((s.period_ms() - 5.333).abs() < 0.01);
+        assert!((s.buffer_ms() - 10.667).abs() < 0.01);
         assert_eq!(parse_hw_params("closed\n"), None);
     }
 

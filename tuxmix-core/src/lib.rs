@@ -16,7 +16,12 @@
 #[cfg(feature = "alsa")]
 pub mod babyface;
 #[cfg(feature = "alsa")]
+pub mod fireface;
+#[cfg(feature = "alsa")]
+pub mod ucx_alsa;
+#[cfg(feature = "alsa")]
 pub(crate) mod capture_meter;
+pub mod capabilities;
 pub mod channel;
 pub(crate) mod curves;
 pub mod device;
@@ -28,6 +33,7 @@ pub mod panel;
 pub mod profile;
 pub mod profiles;
 pub mod pw_clock;
+pub mod pw_input;
 pub mod pw_meter;
 pub mod scene;
 #[cfg(feature = "usb")]
@@ -35,8 +41,14 @@ pub mod usb;
 
 #[cfg(feature = "alsa")]
 pub use babyface::BabyfacePro;
+#[cfg(feature = "alsa")]
+pub use fireface::{DeviceIdentity as FirefaceIdentity, DeviceInfo as FirefaceInfo, Fireface, Model as FirefaceModel};
+#[cfg(feature = "alsa")]
+pub use ucx_alsa::UcxAlsa;
+pub use capabilities::DeviceCapabilities;
 pub use channel::{
-    ChannelId, ChannelType, InputChannel, OutputChannel, PlaybackChannel, Sensitivity,
+    ChannelId, ChannelType, Dynamics, Echo, InputChannel, InputLevel, OutputChannel,
+    PlaybackChannel, Reverb, Sensitivity,
 };
 pub use device::{DeviceSettings, RmeDevice};
 pub use error::Error;

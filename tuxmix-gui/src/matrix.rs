@@ -29,7 +29,7 @@ use iced::{Color, Element, Length};
 
 use tuxmix_core::{ChannelId, ChannelType, RmeDevice};
 
-use crate::app::{pair_bus_label, short_label, Message, TuxMix, OUT_LABELS};
+use crate::app::{pair_bus_label, short_label, Message, TuxMix};
 use crate::theme;
 use crate::widgets::crosspoint::{cell_text, crosspoint, Crosspoint};
 
@@ -38,13 +38,12 @@ use crate::widgets::crosspoint::{cell_text, crosspoint, Crosspoint};
 const CELL_W: f32 = 42.0;
 const CELL_H: f32 = 20.0;
 /// Row-group label column ("AN1", "IN3/4", "AS1/2", ...).
-const GROUP_LABEL_W: f32 = 64.0;
+const GROUP_LABEL_W: f32 = 72.0;
 /// Per-row sequential label column ("In 1", "Pb 12", ...).
-const IDX_LABEL_W: f32 = 40.0;
+const IDX_LABEL_W: f32 = 44.0;
 /// Matches `strip.rs`'s own "recall a sane starting point" reset value
 /// (see `Message::Reset`) — a double-clicked crosspoint goes back to
 /// this, not to full unity (Ctrl+click is the 0 dB toggle).
-const RESET_VOLUME: f32 = 0.75;
 
 /// Extra space after each output pair's two columns (and between source
 /// groups' rows), on top of the grid's hairline: without it twelve equal
@@ -58,7 +57,7 @@ const PAIR_GAP: f32 = theme::SPACE_SM;
 fn cell(
     state: &TuxMix,
     cid: ChannelId,
-    pair: usize,
+    _pair: usize,
     col: usize,
     value: f32,
     shown: f32,
@@ -79,8 +78,7 @@ fn cell(
             hovered: state.matrix_hover == Some((cid, col)),
             modifiers,
             scale,
-            reset_value: RESET_VOLUME,
-            on_change: Box::new(move |v| Message::VolumeChanged(cid, pair, v)),
+            on_change: Box::new(move |v| Message::MatrixCellChanged(cid, col, v)),
             on_release: Message::RangeCleared(cid),
             on_hover: Box::new(move |over| Message::MatrixHover(cid, col, over)),
         },
@@ -90,7 +88,7 @@ fn cell(
 }
 
 fn header_cell(label: String, lit: bool, width: f32, scale: f32) -> Element<'static, Message> {
-    container(text(label).size(theme::TEXT_MICRO * scale).color(if lit {
+    container(text(label).size(theme::TEXT_XS * scale).color(if lit {
         theme::ACCENT
     } else {
         theme::TEXT_SEC
@@ -105,7 +103,7 @@ fn header_cell(label: String, lit: bool, width: f32, scale: f32) -> Element<'sta
 fn label_cell(label: String, width: f32, color: Color, scale: f32) -> Element<'static, Message> {
     container(
         text(label)
-            .size(theme::TEXT_MICRO * scale)
+            .size(theme::TEXT_XS * scale)
             .color(color)
             .wrapping(iced::advanced::text::Wrapping::None),
     )
@@ -142,8 +140,13 @@ fn input_row_groups(state: &TuxMix) -> Vec<RowGroup> {
     let mut i = 0;
     while i < inputs.len() {
         let ty = inputs[i].channel_type;
-        let (label, count) = if ty == ChannelType::Mic {
-            (inputs[i].name.clone(), 1)
+        let (label, count) = if i < 4 {
+            let label = if ty == ChannelType::Mic {
+                format!("Mic {}", i + 1)
+            } else {
+                format!("AN {}", i + 1)
+            };
+            (label, 1)
         } else if let Some(next) = inputs.get(i + 1) {
             (pair_bus_label(&inputs[i].name, &next.name), 2)
         } else {
@@ -174,7 +177,7 @@ fn playback_row_groups(state: &TuxMix) -> Vec<RowGroup> {
         .map(|pair| RowGroup {
             label: crate::app::user_label(state, ChannelId::Playback(pair * 2))
                 .map(str::to_string)
-                .or_else(|| OUT_LABELS.get(pair).map(|s| s.to_string()))
+                .or_else(|| state.pair_labels().get(pair).cloned())
                 .unwrap_or_default(),
             color: crate::app::PB_TAG,
             first_idx: pair * 2,
@@ -285,28 +288,66 @@ fn push_channel_rows<'a>(
                     if lit { theme::ACCENT } else { g.color },
                     scale
                 ),
-                label_cell(
-                    format!("{row_prefix} {}", idx + 1),
-                    IDX_LABEL_W,
-                    if lit { theme::ACCENT } else { theme::TEXT_SEC },
-                    scale
-                ),
             ]
             .spacing(theme::SPACE_HAIRLINE);
 
+            let trim_gain = crate::app::channel_trim_factor(state, cid);
             for col in 0..src.volumes.len() * 2 {
                 let pair = col / 2;
-                let stored = src.volumes[pair];
-                r = r.push(match shown_gain(&src, idx, col) {
-                    Some(shown) => cell(
-                        state, cid, pair, col, stored, shown, true, src.muted, src.phase,
-                    ),
-                    None => cell(state, cid, pair, col, 0.0, 0.0, false, false, false),
-                });
+                let stored = src.volumes[pair] * trim_gain;
+                let mono_source = match cid {
+                    ChannelId::Input(i) => i < 4,
+                    ChannelId::Playback(i) => state
+                        .device
+                        .playbacks()
+                        .get(i)
+                        .is_some_and(|ch| ch.split),
+                    ChannelId::Output(_) => false,
+                };
+                let natural = match cid {
+                    ChannelId::Input(i) => i >= 4 && col % 2 == i % 2,
+                    ChannelId::Playback(i) => col % 2 == i % 2,
+                    ChannelId::Output(_) => false,
+                };
+                let (shown, interactive) = if state.device.matrix_cells_supported() {
+                    let shown = state.device.matrix_cell(cid, col).unwrap_or(0.0) * trim_gain;
+                    // Linked pair: a mono signal can only be routed to the
+                    // left channel.  Mono Mode unlinks the pair and makes
+                    // every cell an independent mono crosspoint.
+                    let interactive = state.matrix_mono
+                        || if mono_source { col % 2 == 0 } else { natural };
+                    (shown, interactive)
+                } else {
+                    match shown_gain(&src, idx, col) {
+                        Some(shown) => (shown, true),
+                        None => (0.0, false),
+                    }
+                };
+                r = r.push(cell(
+                    state,
+                    cid,
+                    pair,
+                    col,
+                    if state.device.matrix_cells_supported() {
+                        shown
+                    } else {
+                        stored
+                    },
+                    shown,
+                    interactive,
+                    src.muted,
+                    src.phase,
+                ));
                 if col % 2 == 1 {
                     r = r.push(pair_gap(scale));
                 }
             }
+            r = r.push(label_cell(
+                format!("{row_prefix} {}", idx + 1),
+                IDX_LABEL_W,
+                if lit { theme::ACCENT } else { theme::TEXT_SEC },
+                scale,
+            ));
             rows = rows.push(r);
         }
     }
@@ -353,8 +394,8 @@ pub fn hover_readout(state: &TuxMix) -> Option<String> {
     let (cid, col) = state.matrix_hover?;
     let pair = col / 2;
     let bus = crate::app::user_label(state, ChannelId::Output(pair * 2))
-        .unwrap_or(OUT_LABELS.get(pair).copied().unwrap_or_default())
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| state.pair_labels().get(pair).cloned().unwrap_or_default());
     let side = if col % 2 == 0 { "L" } else { "R" };
     let (source, gain) = match cid {
         ChannelId::Output(i) => {
@@ -376,7 +417,13 @@ pub fn hover_readout(state: &TuxMix) -> Option<String> {
                     .unwrap_or_default()
                 });
             let src = row_source(state, cid)?;
-            (name, shown_gain(&src, i, col))
+            let trim_gain = crate::app::channel_trim_factor(state, cid);
+            let gain = if state.device.matrix_cells_supported() {
+                state.device.matrix_cell(cid, col).map(|g| g * trim_gain)
+            } else {
+                shown_gain(&src, i, col).map(|g| g * trim_gain)
+            };
+            (name, gain)
         }
     };
     let level = match gain {
@@ -402,12 +449,22 @@ fn grid_view(state: &TuxMix, size: iced::Size) -> Element<'_, Message> {
     let scale = state.ui_scale;
     let n_outputs = state.device.outputs().len();
     let hovered_col = state.matrix_hover.map(|(_, c)| c);
+    let outs = state.device.outputs();
+    let display_order = state.device.matrix_uses_display_order();
+    let pair_order = state.device.output_display_order();
+    let out_internal = |col: usize| -> usize {
+        if display_order {
+            let pair = col / 2;
+            pair_order.get(pair).copied().unwrap_or(pair) * 2 + (col % 2)
+        } else {
+            col
+        }
+    };
 
     // ── Column header: individual output channels ("Out 1".."Out 12"),
     // lit for the selected submix's pair and for the hovered column.
     let mut header = row![
         label_cell(String::new(), GROUP_LABEL_W, theme::TEXT_SEC, scale),
-        label_cell(String::new(), IDX_LABEL_W, theme::TEXT_SEC, scale),
     ]
     .spacing(theme::SPACE_HAIRLINE);
     for out in 0..n_outputs {
@@ -421,6 +478,7 @@ fn grid_view(state: &TuxMix, size: iced::Size) -> Element<'_, Message> {
             header = header.push(pair_gap(scale));
         }
     }
+    header = header.push(label_cell(String::new(), IDX_LABEL_W, theme::TEXT_SEC, scale));
 
     let mut sources =
         column![section_caption("Hardware inputs", scale)].spacing(theme::SPACE_HAIRLINE);
@@ -455,37 +513,38 @@ fn grid_view(state: &TuxMix, size: iced::Size) -> Element<'_, Message> {
             },
             scale
         ),
-        label_cell(String::new(), IDX_LABEL_W, theme::TEXT_SEC, scale),
     ]
     .spacing(theme::SPACE_HAIRLINE);
-    for (idx, out) in state.device.outputs()[..n_outputs].iter().enumerate() {
+    for col in 0..n_outputs {
+        let idx = out_internal(col);
+        let out = &outs[idx];
         out_row = out_row.push(cell(
             state,
             ChannelId::Output(idx),
             0,
-            idx,
+            col,
             out.volume,
             out.volume,
             true,
             out.mute,
             false,
         ));
-        if idx % 2 == 1 {
+        if col % 2 == 1 {
             out_row = out_row.push(pair_gap(scale));
         }
     }
+    out_row = out_row.push(label_cell(String::new(), IDX_LABEL_W, theme::TEXT_SEC, scale));
 
     // ── Column-group footer: each output pair's bus label, one label
     // spanning both its columns.
     let mut footer = row![
         label_cell(String::new(), GROUP_LABEL_W, theme::TEXT_SEC, scale),
-        label_cell(String::new(), IDX_LABEL_W, theme::TEXT_SEC, scale),
     ]
     .spacing(theme::SPACE_HAIRLINE);
     for pair in 0..(n_outputs / 2) {
         let label = crate::app::user_label(state, ChannelId::Output(pair * 2))
-            .unwrap_or(OUT_LABELS.get(pair).copied().unwrap_or_default())
-            .to_string();
+            .map(str::to_string)
+            .unwrap_or_else(|| state.pair_labels().get(pair).cloned().unwrap_or_default());
         footer = footer.push(header_cell(
             label,
             pair == state.sel_out || hovered_col.is_some_and(|c| c / 2 == pair),
@@ -494,6 +553,7 @@ fn grid_view(state: &TuxMix, size: iced::Size) -> Element<'_, Message> {
         ));
         footer = footer.push(pair_gap(scale));
     }
+    footer = footer.push(label_cell(String::new(), IDX_LABEL_W, theme::TEXT_SEC, scale));
 
     // Frozen panes: only the source rows scroll vertically, under a fixed
     // header and above the fixed output row and bus labels; the whole grid
@@ -514,7 +574,7 @@ fn grid_view(state: &TuxMix, size: iced::Size) -> Element<'_, Message> {
     let grid_w = (GROUP_LABEL_W + IDX_LABEL_W) * scale
         + n_outputs as f32 * CELL_W * scale
         + (n_outputs / 2) as f32 * PAIR_GAP * scale
-        + (n_outputs + 2) as f32 * theme::SPACE_HAIRLINE;
+        + (n_outputs + 3) as f32 * theme::SPACE_HAIRLINE;
     let pad = theme::SPACE_LG;
 
     let sideways_bar = if grid_w > size.width - 2.0 * pad {

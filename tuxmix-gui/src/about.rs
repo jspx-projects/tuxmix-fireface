@@ -105,7 +105,7 @@ pub fn about_modal(state: &TuxMix) -> Element<'_, Message> {
             "disconnected"
         } else if state.device.is_mock() {
             "simulated"
-        } else if !state.device.protocol_features() {
+        } else if state.device.class_compliant() {
             "class-compliant"
         } else {
             "proprietary"

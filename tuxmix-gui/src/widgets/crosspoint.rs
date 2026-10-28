@@ -6,7 +6,7 @@
 //!   `DRAG_TRAVEL` pixels, not the cell's own 20. Shift drags finely.
 //! * Ctrl+click toggles the crosspoint between unrouted and 0 dB ("Two
 //!   green 0.0 dB field pop in, another click removes them").
-//! * Double-click recalls the caller's reset value.
+//! * Double-click toggles between 0.0 dB and mute, as in TotalMix.
 //! * The mouse wheel is left alone, so it scrolls the grid. These cells
 //!   used to be hidden faders, which took every wheel event (a wheel
 //!   scroll over the grid rewrote crosspoints instead of scrolling) and
@@ -53,7 +53,6 @@ pub struct Crosspoint<Message> {
     pub hovered: bool,
     pub modifiers: Modifiers,
     pub scale: f32,
-    pub reset_value: f32,
     pub on_change: Box<dyn Fn(f32) -> Message>,
     /// End of a press/drag gesture (closes its undo step).
     pub on_release: Message,
@@ -146,7 +145,7 @@ impl<Message: Clone> canvas::Program<Message> for Crosspoint<Message> {
                 state.last_y = Some(pos.y);
                 state.drag_t = vol_to_t(self.value);
                 let value = if double {
-                    self.reset_value
+                    toggled(self.value)
                 } else if self.modifiers.control() {
                     toggled(self.value)
                 } else {
@@ -288,6 +287,13 @@ mod tests {
     }
 
     #[test]
+    fn double_click_uses_the_same_off_unity_toggle() {
+        assert_eq!(toggled(1.0), 0.0);
+        assert_eq!(toggled(0.25), 0.0);
+        assert_eq!(toggled(0.0), 1.0);
+    }
+
+    #[test]
     fn a_drag_needs_real_travel_to_sweep_the_range() {
         // A 20px move (one cell height) used to sweep everything.
         let t = dragged(0.5, -20.0, 1.0, false);
@@ -298,3 +304,4 @@ mod tests {
         assert!(dragged(0.5, -20.0, 1.0, true) - 0.5 < (t - 0.5) / 2.0);
     }
 }
+

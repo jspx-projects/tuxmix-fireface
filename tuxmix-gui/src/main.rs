@@ -2,11 +2,14 @@
 //!
 //! ```bash
 //! cargo run -p tuxmix-gui              # with real hardware
-//! cargo run -p tuxmix-gui -- --mock    # simulation
+//! cargo run -p tuxmix-gui -- --mock    # simulation (Babyface Pro FS)
+//! cargo run -p tuxmix-gui -- --mock-ucx # simulation (Fireface UCX)
+//! cargo run -p tuxmix-gui -- --mock-uc  # simulation (Fireface UC)
 //! cargo run -p tuxmix-gui -- --mock --osc   # + OSC control surface
 //! cargo run -p tuxmix-gui -- --backend usb  # force libusb over the kernel driver
 //! cargo run -p tuxmix-gui -- --view mixer  # open straight on the Mixer page
 //! cargo run -p tuxmix-gui -- --fullscreen  # start fullscreen (F11 toggles)
+//! cargo run -p tuxmix-gui -- --mock-ucx --flyouts settings:input:0  # open a panel
 //! ```
 
 mod about;
@@ -18,11 +21,14 @@ mod osc;
 mod prefs;
 mod scenes;
 mod sidebar;
+mod sync_dialog;
 mod theme;
 mod tray;
 mod widgets;
 
 use std::net::{IpAddr, Ipv4Addr};
+
+use tuxmix_core::RmeDevice;
 
 use iced::window;
 use iced::{Font, Size};
@@ -75,7 +81,26 @@ fn parse_view(args: &[String]) -> Option<app::View> {
 fn main() -> iced::Result {
     env_logger::init();
     let args: Vec<String> = std::env::args().collect();
-    let mock = args.iter().any(|a| a == "--mock");
+    // The UC latches its matrix when the audio engine starts.  Defer the
+    // input meter tap (which opens the capture PCM) until the startup scene
+    // has been written, so the scene is latched instead of ignored.
+    std::env::set_var("TUXMIX_DEFER_METER_TAP", "1");
+    // `--mock` simulates a Babyface Pro FS; `--mock-ucx` simulates a
+    // Fireface UCX (EQ, dynamics, FX bus, Control Room), so the gated UI can
+    // be used without the hardware.
+    if args.iter().any(|a| a == "--mock-ucx") {
+        std::env::set_var("TUXMIX_MOCK_MODEL", "ucx");
+    } else if args.iter().any(|a| a == "--mock-uc") {
+        std::env::set_var("TUXMIX_MOCK_MODEL", "uc");
+    }
+    let mock = args.iter().any(|a| a == "--mock")
+        || args.iter().any(|a| a == "--mock-ucx")
+        || args.iter().any(|a| a == "--mock-uc");
+    // Control-only/DAW mode: the DAW owns the PCM device.  Keep TuxMix on
+    // the ALSA control plane only; see docs/PIPEWIRE-PRO-AUDIO.md.
+    if args.iter().any(|a| a == "--control-only") {
+        std::env::set_var("TUXMIX_NO_CAPTURE", "1");
+    }
 
     // `None` = auto-detect (ALSA/kernel-driver first, USB fallback — see
     // `DeviceHandle::open_real`). An unrecognized value falls back to
@@ -103,10 +128,26 @@ fn main() -> iced::Result {
     });
 
     let start_view = parse_view(&args);
-    let saved_size = prefs::path()
-        .and_then(|p| prefs::load(&p).window_size)
+    // Screenshot/automation overrides.  These are applied after the saved
+    // layout, so one launch can open exactly the panels a check needs.
+    let start_scale = arg_value(&args, "--scale").and_then(|v| v.parse::<f32>().ok()).map(
+        |scale| scale.clamp(theme::SCALE_MIN, theme::SCALE_MAX),
+    );
+    let start_out = arg_value(&args, "--select-out").and_then(|v| v.parse::<usize>().ok());
+    let start_flyouts = arg_value(&args, "--flyouts");
+    let saved_prefs = prefs::path().map(|p| prefs::load(&p));
+    let saved_size = saved_prefs
+        .as_ref()
+        .and_then(|p| p.window_size)
         .map(|(w, h)| Size::new(w.max(app::MIN_WINDOW.0), h.max(app::MIN_WINDOW.1)))
         .unwrap_or(Size::new(1280.0, 800.0));
+    let preferred_device = saved_prefs
+        .as_ref()
+        .and_then(|p| p.device.as_deref())
+        .and_then(app::DeviceKind::from_label);
+    let preferred_serial = saved_prefs
+        .as_ref()
+        .and_then(|p| p.device_serial.clone());
     let start_fullscreen = args.iter().any(|a| a == "--fullscreen");
 
     // One TuxMix per session: a second launch asks the first to show its
@@ -127,16 +168,36 @@ fn main() -> iced::Result {
     // exits with its last window).
     iced::daemon(
         move || {
-            let mut state = app::new(mock, osc_config.clone(), backend.clone());
+            let mut state =
+                app::new_with_device(
+                    mock,
+                    osc_config.clone(),
+                    backend.clone(),
+                    preferred_device,
+                    preferred_serial.clone(),
+                );
             // Restore the window's own layout (view, sidebar, rows, zoom,
             // channel names) before the command line overrides any of it.
             if let Some(path) = prefs::path() {
-                app::apply_prefs(&mut state, prefs::load(&path));
+                if let Some(prefs) = saved_prefs.clone() {
+                    app::apply_prefs(&mut state, prefs);
+                }
                 state.prefs_path = Some(path);
             }
+            app::apply_startup_sync(&mut state);
             app::restore_engine(&mut state);
             if let Some(view) = start_view {
                 state.view = view;
+            }
+            if let Some(scale) = start_scale {
+                state.ui_scale = scale;
+            }
+            if let Some(out) = start_out {
+                let pairs = state.device.output_pair_count().max(1);
+                state.sel_out = out.min(pairs - 1);
+            }
+            if let Some(spec) = start_flyouts.as_deref() {
+                app::open_startup_flyouts(&mut state, spec);
             }
             state.fullscreen = start_fullscreen;
             state.tray_active = tray_active;
