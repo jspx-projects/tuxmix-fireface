@@ -1210,7 +1210,8 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
                     .width(Length::Fill),
                 )
                 .width(Length::Fill)
-                .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
+                .height(Length::Fixed(btn_h))
+                .padding([0.0, theme::SPACE_SM * scale])
                 .style(theme::toggle_button(p.open_flyout == Some(FlyoutKind::Route), theme::ACCENT))
                 .on_press(Message::ToggleFlyout(cid, FlyoutKind::Route)),
                 "Change output bus",
