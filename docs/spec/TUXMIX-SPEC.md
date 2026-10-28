@@ -438,12 +438,12 @@ other output does, which is how the manual describes every hardware output
 it is selected as current submix"). The Main Out is a submix like any other;
 FX Send can follow it.
 
-Every click on a strip counts, not only the strip's empty surface: its mute
-and solo switches, its T / gear / EQ / D buttons, its faders, knobs and name
-field select the channel the same way. A click on a hardware output also
-switches the visible submix to that output. A strip that is already part of a
-multi-selection keeps the selection when one of its controls is clicked, so
-group edits still apply.
+Every click on a hardware output counts, not only the strip's empty surface:
+its mute and cue switches, its slideout buttons (gear, EQ, D), its fader and
+its name field select that output the same way, and the visible submix
+switches to it.  An output strip that is already part of a multi-selection
+keeps the selection when one of its controls is clicked, so group edits still
+apply.
 
 Assigning a pair moves its channel out of the Hardware Outputs row into the
 Control Room section, renamed for the destination — `Main`, `Speaker B`,

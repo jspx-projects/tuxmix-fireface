@@ -4642,14 +4642,12 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 state.last_cleared_solos = soloed;
             }
         }
-        Message::Phantom(idx, p) => {
-            if let Err(e) = state.device.set_input_phantom(idx, p) {
+        Message::Phantom(idx, p) => {            if let Err(e) = state.device.set_input_phantom(idx, p) {
                 fail(state, "set_input_phantom", &e);
             }
             notify_osc_bool(state, format!("/input/{idx}/phantom"), p);
         }
-        Message::Pad(idx, p) => {
-            if let Err(e) = state.device.set_input_pad(idx, p) {
+        Message::Pad(idx, p) => {            if let Err(e) = state.device.set_input_pad(idx, p) {
                 fail(state, "set_input_pad", &e);
             }
             notify_osc_bool(state, format!("/input/{idx}/pad"), p);
@@ -4670,15 +4668,12 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 vec![OscType::Int(level.code() as i32)],
             );
         }
-        Message::Autoset(idx, on) => {
-            if let Err(e) = state.device.set_autoset(idx, on) {
+        Message::Autoset(idx, on) => {            if let Err(e) = state.device.set_autoset(idx, on) {
                 fail(state, "set_autoset", &e);
             }
             notify_osc_bool(state, format!("/input/{idx}/autoset"), on);
         }
-        Message::Gain(idx, g) => {
-            select_strip(state, ChannelId::Input(idx));
-            if let Err(e) = state.device.set_input_gain(idx, g) {
+        Message::Gain(idx, g) => {            if let Err(e) = state.device.set_input_gain(idx, g) {
                 fail(state, "set_input_gain", &e);
             }
             let actual = state
@@ -4716,15 +4711,13 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
             notify_osc_raw(state, format!("/input/{idx}/trim"), vec![OscType::Float(0.0)]);
         }
-        Message::EqEnabled(cid, on) => {
-            if let Err(e) = set_eq_enabled_for(state, cid, on) {
+        Message::EqEnabled(cid, on) => {            if let Err(e) = set_eq_enabled_for(state, cid, on) {
                 fail(state, "set_eq_enabled", &e);
             }
             let (kind, id) = channel_slug(cid);
             notify_osc_bool(state, format!("/{kind}/{id}/eq"), on);
         }
-        Message::EqBandType(cid, band, t) => {
-            if let Err(e) = set_eq_band_type_for(state, cid, band, t) {
+        Message::EqBandType(cid, band, t) => {            if let Err(e) = set_eq_band_type_for(state, cid, band, t) {
                 fail(state, "set_eq_band_type", &e);
             }
             let code = match t {
@@ -4741,8 +4734,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 vec![OscType::Int(code)],
             );
         }
-        Message::EqBandFreq(cid, band, freq) => {
-            if let Err(e) = set_eq_band_freq_for(state, cid, band, freq) {
+        Message::EqBandFreq(cid, band, freq) => {            if let Err(e) = set_eq_band_freq_for(state, cid, band, freq) {
                 fail(state, "set_eq_band_freq", &e);
             }
             let (kind, id) = channel_slug(cid);
@@ -4752,8 +4744,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 vec![OscType::Float(freq as f32)],
             );
         }
-        Message::EqBandQ(cid, band, q) => {
-            if let Err(e) = set_eq_band_q_for(state, cid, band, q) {
+        Message::EqBandQ(cid, band, q) => {            if let Err(e) = set_eq_band_q_for(state, cid, band, q) {
                 fail(state, "set_eq_band_q", &e);
             }
             let (kind, id) = channel_slug(cid);
@@ -4763,8 +4754,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 vec![OscType::Float(q)],
             );
         }
-        Message::EqBandGain(cid, band, gain) => {
-            if let Err(e) = set_eq_band_gain_for(state, cid, band, gain) {
+        Message::EqBandGain(cid, band, gain) => {            if let Err(e) = set_eq_band_gain_for(state, cid, band, gain) {
                 fail(state, "set_eq_band_gain", &e);
             }
             let (kind, id) = channel_slug(cid);
@@ -4774,8 +4764,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 vec![OscType::Float(gain)],
             );
         }
-        Message::EqBandPoint(cid, band, freq, gain) => {
-            if let Err(e) = set_eq_band_freq_for(state, cid, band, freq) {
+        Message::EqBandPoint(cid, band, freq, gain) => {            if let Err(e) = set_eq_band_freq_for(state, cid, band, freq) {
                 fail(state, "set_eq_band_freq", &e);
             }
             if let Err(e) = set_eq_band_gain_for(state, cid, band, gain) {
@@ -4793,8 +4782,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 vec![OscType::Float(gain)],
             );
         }
-        Message::EqBandReset(cid, band) => {
-            let reset = match cid {
+        Message::EqBandReset(cid, band) => {            let reset = match cid {
                 ChannelId::Input(idx) => {
                     let mut result = state.device.set_eq_band_freq(idx, band, 1000);
                     if result.is_ok() {
@@ -4824,15 +4812,13 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 );
             }
         }
-        Message::EqLowCutEnabled(cid, on) => {
-            if let Err(e) = set_low_cut_enabled_for(state, cid, on) {
+        Message::EqLowCutEnabled(cid, on) => {            if let Err(e) = set_low_cut_enabled_for(state, cid, on) {
                 fail(state, "set_eq_low_cut_enabled", &e);
             }
             let (kind, id) = channel_slug(cid);
             notify_osc_bool(state, format!("/{kind}/{id}/lowcut"), on);
         }
-        Message::EqLowCutFreq(cid, freq) => {
-            if let Err(e) = set_low_cut_freq_for(state, cid, freq) {
+        Message::EqLowCutFreq(cid, freq) => {            if let Err(e) = set_low_cut_freq_for(state, cid, freq) {
                 fail(state, "set_eq_low_cut_freq", &e);
             }
             let (kind, id) = channel_slug(cid);
@@ -4842,8 +4828,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 vec![OscType::Float(freq as f32)],
             );
         }
-        Message::EqLowCutSlope(cid, slope) => {
-            if let Err(e) = set_low_cut_slope_for(state, cid, slope) {
+        Message::EqLowCutSlope(cid, slope) => {            if let Err(e) = set_low_cut_slope_for(state, cid, slope) {
                 fail(state, "set_eq_low_cut_slope", &e);
             }
             let (kind, id) = channel_slug(cid);
@@ -4853,8 +4838,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 vec![OscType::Int(slope as i32)],
             );
         }
-        Message::DynamicsEnabled(cid, on) => {
-            let mut d = dynamics_for(state, cid);
+        Message::DynamicsEnabled(cid, on) => {            let mut d = dynamics_for(state, cid);
             d.on = on;
             if let Err(e) = state.device.set_dynamics(cid, &d) {
                 fail(state, "set_dynamics", &e);
@@ -4862,8 +4846,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             let (kind, id) = channel_slug(cid);
             notify_osc_bool(state, format!("/{kind}/{id}/dynamics"), on);
         }
-        Message::DynamicsChanged(cid, d) => {
-            if let Err(e) = state.device.set_dynamics(cid, &d) {
+        Message::DynamicsChanged(cid, d) => {            if let Err(e) = state.device.set_dynamics(cid, &d) {
                 fail(state, "set_dynamics", &e);
             }
             let (kind, id) = channel_slug(cid);
@@ -4990,9 +4973,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         Message::ResetMix(kind) => {
             apply_reset_mix(state, kind);
         }
-        Message::FxSendChanged(cid, db) => {
-            select_strip(state, cid);
-            if let Err(e) = state.device.set_channel_fx_send(cid, db) {
+        Message::FxSendChanged(cid, db) => {            if let Err(e) = state.device.set_channel_fx_send(cid, db) {
                 fail(state, "set_channel_fx_send", &e);
             }
             let (kind, id) = channel_slug(cid);
@@ -5015,8 +4996,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
             notify_osc_bool(state, format!("/output/{i}/loopback"), on);
         }
-        Message::StereoLinkChanged(cid, linked) => {
-            let _ = match cid {
+        Message::StereoLinkChanged(cid, linked) => {            let _ = match cid {
                 ChannelId::Input(i) => state.device.set_input_pair_linked(i / 2, linked),
                 ChannelId::Playback(i) => state.device.set_playback_linked(i / 2, linked),
                 ChannelId::Output(i) => state.device.set_output_linked(i / 2, linked),
@@ -5112,8 +5092,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 notify_osc_bool(state, format!("/output/{idx}/cue"), on);
             }
         }
-        Message::PhaseChanged(cid, invert) => {
-            if let ChannelId::Input(idx) = cid {
+        Message::PhaseChanged(cid, invert) => {            if let ChannelId::Input(idx) = cid {
                 if let Err(e) = state.device.set_phase(idx, invert) {
                     fail(state, "set_phase", &e);
                 }
@@ -5172,6 +5151,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
         }
         Message::Reset(cid, out, default_vol) => {
+            select_strip(state, cid);
             if state.selected.len() > 1 && state.selected.contains(&cid) {
                 // Reset means "back to default" for the whole group, not a
                 // relative move — every selected fader snaps to the same
@@ -5188,13 +5168,9 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 state.drag_range = None;
             }
         }
-        Message::PanChanged(cid, out, pan) => {
-            select_strip(state, cid);
-            apply_grouped_pan(state, cid, out, pan);
+        Message::PanChanged(cid, out, pan) => {            apply_grouped_pan(state, cid, out, pan);
         }
-        Message::PanReset(cid, out) => {
-            select_strip(state, cid);
-            if state.selected.len() > 1 && state.selected.contains(&cid) {
+        Message::PanReset(cid, out) => {            if state.selected.len() > 1 && state.selected.contains(&cid) {
                 for sel in state.selected.clone() {
                     if let Err(e) = state.device.set_pan(sel, out, 0) {
                         fail(state, "set_pan", &e);
@@ -12747,4 +12723,6 @@ mod tests {
         let _ = update(&mut state, Message::Solo(a, true));
         assert!(state.selected.contains(&a) && state.selected.contains(&b));
     }
+
+
 }
