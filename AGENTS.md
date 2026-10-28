@@ -99,10 +99,12 @@ Authoritative files:
   with the top of the main fader in every row. The T / gear / EQ / D column
   starts directly below it, as high as the strip allows; spare height stays
   below the column.
-- Every strip keeps each of the four symbols at the same absolute height as
-  the hardware-input row. A channel that lacks a symbol keeps its empty slot
-  (same height, same gap), and a strip without an FX fader keeps that slot
-  empty too, so the symbols below never move.
+- Every strip has a main fader, and the four symbols are anchored to it: the
+  T / gear / EQ / D column sits below the FX fader when the unit has one,
+  directly below the fader top otherwise. Every strip keeps each symbol at the
+  same absolute height as the hardware-input row; a channel that lacks a
+  symbol keeps its empty slot (same height, same gap), so no symbol below
+  moves.
 - The pointer never changes over a fader or a knob; the grab hand hides
   the values underneath it.
 - Slideouts always open to the right of their own channel. In the Control
