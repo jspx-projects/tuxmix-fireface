@@ -112,9 +112,11 @@ Authoritative files:
   the control is live. No always-on coloured outline.
 - Phase buttons use the `Ø` symbol, never the word: `Ø L` / `R Ø` for a
   linked pair, `Ø` alone otherwise.
-- The Settings slideout is one vertical stack per channel type; shared
-  controls keep the same height between channel types. The per-channel
-  order is in `docs/spec/TUXMIX-SPEC.md` §3.
+- The Settings slideout is one fixed row grid per channel type; a control a
+  channel lacks leaves its row empty, so nothing below it moves. The
+  per-channel grid is in `docs/spec/TUXMIX-SPEC.md` §3.
+- Every slideout fits the strip height at normal size: everything visible at
+  a glance, no scrolling.
 - Slideouts always open to the right of their own channel. In the Control
   Room the section shifts its own channels left by one slot to make the
   space; its left edge may overlap the channel row but never moves it.

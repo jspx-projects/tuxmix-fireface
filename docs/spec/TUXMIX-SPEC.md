@@ -147,27 +147,32 @@ applies to Dynamics, Auto Level, Reverb and Echo.
 
 The panel follows the channel type.
 
-The layout is one vertical stack per channel type; shared controls sit at the
-same height in every panel.
+The layout is one vertical stack per channel type. Inputs share a nine-row
+grid; a control a channel lacks leaves its row empty, so the rows below never
+move and `width`, `send FX`, `MS proc` and the phase pair sit at the same
+height on every input.
 
 | Channel | Contents, top to bottom |
 |---|---|
-| Input 1/2 | Stereo, 48V, AutoSet, Gain, Width, Send FX, MS Proc, Ø L / R Ø |
-| Input 3/4 | Stereo, reference level, Inst + Gain, AutoSet, Width, Send FX, MS Proc, Ø L / R Ø |
-| Inputs 5–8 | Stereo, reference level (one setting shared by 5–8), Width, Send FX, MS Proc, Ø L / R Ø |
-| Digital inputs (9+) | Stereo, Width, Send FX, MS Proc, Ø L / R Ø |
+| Input 1/2 | Stereo, space, 48V, AutoSet, Gain, Width, Send FX, MS Proc, Ø L / R Ø |
+| Input 3/4 | Stereo, `ref. dBu`, Inst + reference dropdown, AutoSet, Gain, Width, Send FX, MS Proc, Ø L / R Ø |
+| Inputs 5–8 | Stereo, `ref. level`, reference dropdown, two empty rows, Width, Send FX, MS Proc, Ø L / R Ø |
+| Inputs 9+ | Stereo, four empty rows, Width, Send FX, MS Proc, Ø L / R Ø |
 | Software playback | Stereo, Width, Send FX, MS Proc, Ø L / R Ø |
-| Hardware output | Stereo, reference level, Return FX, Ø L / R Ø, No Trim, Talkback, Loopback |
+| Hardware output | Stereo, `ref. level`, reference dropdown, Return FX, Ø L / R Ø, No Trim, space, Talkback, Loopback |
 
-- 48 V is available on inputs 1/2; AutoSet on 1/2 and 3/4; Inst and a gain
-  knob on 3/4; inputs 5–8 have a reference-level selector instead of
-  Inst + Gain, and inputs 9+ have no reference-level control.
-- The reference levels for 5–8 move together: any change to one of them
-  applies to all four.  Inputs 3 and 4 keep separate reference levels unless
-  they are linked.
-- Reference-level values are `-10 dBV`, `+4 dBu` and `Lo Gain`.
+- 48 V is available on inputs 1/2; AutoSet on inputs 1–4; Inst and a gain
+  knob on 3/4; a reference dropdown on 3–8; none from channel 9 on.
+- The reference levels for 5–8 move together: any change to one applies to
+  all four. Inputs 3 and 4 keep separate levels unless linked.
+- Input reference values are `-10 dBV`, `+4 dBu`, `Lo Gain`; output
+  reference values are `-10 dBV`, `+4 dBu`, `Hi Gain`. All line outputs
+  follow one setting; Phones has its own.
+- The Talkback row is empty on Control Room channels.
 - The Send FX knob mirrors the thin FX fader on the strip; the Return FX knob
-  mirrors the thin fader on outputs.  One value, two views.
+  mirrors the thin fader on outputs. One value, two views.
+- Every slideout fits the strip height at normal size: everything is visible
+  at a glance and the panel does not scroll.
 - The UCX has no PAD.
 
 Control styles:
