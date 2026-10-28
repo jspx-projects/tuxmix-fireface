@@ -1877,6 +1877,7 @@ fn eq_band_type_label(t: EqBandType) -> &'static str {
         EqBandType::Bell => "Bell",
         EqBandType::LowShelf => "Low Shelf",
         EqBandType::HighShelf => "High Shelf",
+        EqBandType::LowPass => "Low Pass",
     }
 }
 

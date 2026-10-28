@@ -8,7 +8,7 @@ Ismaïl Bahloul — his Babyface Pro FS mixer — and extends it into a full
 control surface for the Fireface UC family.  His commit history is preserved
 in this repository.
 
-![The TuxMix mixer and Control Room driving a Fireface UCX, with the channel dynamics, sends and the reverb and echo panels open](ui/tuxmix/docs/screenshots/mixer-ucx.png)
+![The TuxMix mixer and Control Room driving a Fireface UCX, with the EQ and dynamics panels, sends, and the reverb and echo panels open](ui/tuxmix/docs/screenshots/mixer-ucx.png)
 
 ## What this tree adds
 
