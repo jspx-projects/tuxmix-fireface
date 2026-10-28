@@ -4,12 +4,12 @@
 use iced::advanced::text as advanced_text;
 use iced::keyboard::Modifiers;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry};
-use iced::widget::{button, column, container, mouse_area, row, text, text_input, tooltip};
-use iced::{alignment, mouse, Color, Element, Length, Point, Rectangle, Renderer, Theme, Vector};
+use iced::widget::{button, column, container, mouse_area, row, text, text_input, tooltip, Stack};
+use iced::{alignment, mouse, Color, Element, Length, Point, Rectangle, Renderer, Size, Theme, Vector};
 use std::time::Instant;
 use tuxmix_core::ChannelId;
 
-use crate::app::{db_text, short_label, Message, OUT_LABELS};
+use crate::app::{db_text, short_label, Message};
 use crate::theme;
 use crate::widgets::fader::{fader, vu_meter, Fader, MeterFrame};
 use crate::widgets::knob::{knob, Knob};
@@ -18,15 +18,48 @@ use crate::widgets::knob::{knob, Knob};
 /// in a strip is one of these times `StripParams::scale`, so the window's
 /// adaptive scale (see `app::recompute_ui_scale`) resizes strips the same
 /// way it resizes text.
-const FADER_H: f32 = 170.0;
-/// Widened from the original 80 — with `Fader::layout_x` centering a
-/// `[track][ruler][meter]` group inside the fader canvas *and* a side
-/// icon column (gear/EQ/collapse, see `full_strip`) claiming space in
-/// the same row, 80 wasn't wide enough for both: the group overflowed
-/// into the icon column's space, clipping the ruler's two-digit ticks
-/// under the buttons (confirmed via a live screenshot). 96 gives ~5px
-/// of headroom at `scale == 1.0` after both claims.
-pub(crate) const STRIP_W: f32 = 96.0;
+/// Fixed chrome (header, pan, M/S, dB row, route/collapse and padding)
+/// around the fader.  The fader absorbs every extra pixel of `STRIP_H`, so
+/// changing the standard channel height stretches the strip instead of
+/// leaving a blank band.
+const FADER_CHROME_H: f32 = 144.0;
+/// Full-strip height at scale 1.0: header, pan, M/S, fader, dB and route
+/// rows, plus the card padding and gaps.  Every full strip is pinned to this
+/// height (inputs, playback and outputs), and the Settings/Trim/EQ slideouts
+/// use the same value, so a slideout always matches the channel beside it.
+pub(crate) const STRIP_H: f32 = 350.0;
+
+/// Size of the Settings/Trim/EQ tab buttons on the strip's right flank.
+/// Bigger than the T/phase icon buttons so the open-tab rectangle reads as a
+/// tab attached to the slideout, not a tiny status dot.
+const TAB_BTN_W: f32 = 24.0;
+const TAB_BTN_H: f32 = 22.0;
+/// The Settings gear is the most-used tab, so it gets a larger hit box and
+/// glyph than the T/EQ tabs.  The fader's reserved right edge tracks this.
+const SETTINGS_TAB_W: f32 = 28.0;
+const SETTINGS_TAB_H: f32 = 26.0;
+const SETTINGS_GLYPH: f32 = 19.0;
+/// Width of a full channel strip: track, ruler, meter, and the side icon
+/// column at `scale == 1.0`.
+pub(crate) const STRIP_W: f32 = 90.0;
+
+/// The message a Control Room strip's FX fader sends: FX Return on an
+/// output, FX send on anything else.
+fn fx_message(cid: ChannelId, db: f32) -> Message {
+    match cid {
+        ChannelId::Output(idx) => Message::FxReturnChanged(idx, db),
+        _ => Message::FxSendChanged(cid, db),
+    }
+}
+
+/// Linear amplitude to dB, for the FX fader's value field.
+fn db_of(linear: f32) -> f32 {
+    if linear <= 0.000_01 {
+        -65.0
+    } else {
+        (20.0 * linear.log10()).clamp(-65.0, 6.0)
+    }
+}
 /// Collapsed strips need to stand the same total height as a full strip
 /// (see `collapsed_strip`'s own doc comment) despite having far fewer
 /// rows — name/M/S/meter/expand vs. the full strip's
@@ -37,7 +70,14 @@ pub(crate) const STRIP_W: f32 = 96.0;
 /// old flat offset existed to add. Empirically measured the same way the
 /// original number was (pixel-measuring a collapsed and an adjacent full
 /// strip side by side in a live screenshot), not derived on paper.
-const COLLAPSED_METER_H: f32 = FADER_H + 30.0;
+/// Fixed chrome of a collapsed strip: outer padding, the four row gaps, the
+/// rotated name, and the mute, solo and expand rows.  The meter absorbs the
+/// rest so a collapsed strip and a full strip share the same `STRIP_H`.
+const COLLAPSED_CHROME_H: f32 = theme::SPACE_SM * 2.0
+    + theme::SPACE_HAIRLINE * 4.0
+    + ROTATED_LABEL_LEN
+    + ICON_BTN_H * 3.0;
+const COLLAPSED_METER_H: f32 = STRIP_H - COLLAPSED_CHROME_H;
 /// Collapsed strips are a glance-only readout: name, Mute/Solo (kept
 /// live — see this function's own doc comment), and a VU meter; no
 /// fader, no pan, no route. Width is set by the header (name + expand
@@ -75,6 +115,10 @@ pub(crate) const FLYOUT_W: f32 = 140.0;
 /// the response plot above it.
 pub(crate) const EQ_FLYOUT_W: f32 = 248.0;
 
+/// Width of the Dynamics flyout — two control columns plus the Auto Level
+/// block, matching the manual's panel grouping.
+pub(crate) const DYN_FLYOUT_W: f32 = 230.0;
+
 /// Which flyout (at most one, and only one per strip) is open — the gear
 /// icon opens `Settings` (48V/PAD/Sensitivity, moved out of the strip's
 /// own vertical flow so it doesn't grow/shrink the whole card; Gain stays
@@ -87,11 +131,12 @@ pub(crate) const EQ_FLYOUT_W: f32 = 248.0;
 /// strip's right neighbor — see `app.rs::with_flyout` (Route) and
 /// `mixer_view`'s input loop (Settings/Eq/Trim, which push the row
 /// instead).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FlyoutKind {
     Route,
     Settings,
     Eq,
+    Dynamics,
     Trim,
 }
 
@@ -109,7 +154,10 @@ pub(crate) fn full_width(_cid: ChannelId) -> f32 {
 /// Same linear ease-style interpolation as `fader::MeterFrame`, just a
 /// dedicated type since the duration and the thing being interpolated
 /// (a pixel width, not a volume/pan value) are both different.
-const COLLAPSE_INTERP_MS: f32 = 160.0;
+///
+/// Kept brisk: the slide-in/out is a navigation aid, not an effect.  The
+/// earlier 160ms felt sluggish when opening EQ/Settings repeatedly.
+const COLLAPSE_INTERP_MS: f32 = 90.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CollapseAnim {
@@ -134,6 +182,8 @@ impl CollapseAnim {
 pub struct StripParams<'a> {
     pub cid: ChannelId,
     pub output_idx: usize,
+    /// Human label of the current submix/output bus (device-derived).
+    pub bus_label: String,
     /// Whether the connection this strip is drawn for can drive RME's own
     /// protocol (see `RmeDevice::protocol_features`). False on the
     /// class-compliant personality, where EQ, Trim, Phase, Split and
@@ -141,10 +191,22 @@ pub struct StripParams<'a> {
     /// the same thing the `has_*` flags above already do for features a
     /// channel does not have.
     pub protocol_features: bool,
+    /// Whether this backend can toggle a playback pair's stereo split
+    /// (see `RmeDevice::stereo_split_supported`).  Separate from
+    /// `protocol_features`: the UCX v1 backend supports the split through
+    /// its matrix model without the full RME feature set.
+    pub stereo_split_supported: bool,
     pub name: String,
     pub type_tag: Option<(&'static str, Color)>,
     pub vol: f32,
     pub pan: i8,
+    /// Hardware-output balance is available for this strip (UC: unequal
+    /// left/right output levels; UCX/other backends not implemented).
+    pub output_balance_supported: bool,
+    /// FX send (inputs and software playback) or FX Return (outputs), in dB.
+    /// `None` on a backend without the FX bus. Drawn as the thin fader to
+    /// the right of the main one, as TotalMix does.
+    pub fx_level: Option<f32>,
     pub meter: MeterFrame,
     /// Whether `meter` is a real reading on the active backend — see
     /// `fader::draw_meter`'s doc comment.
@@ -157,18 +219,32 @@ pub struct StripParams<'a> {
     pub meter2_available: bool,
     pub has_48v: bool,
     pub has_pad: bool,
+    pub has_instrument: bool,
     pub phantom: bool,
     pub pad: bool,
+    pub instrument: bool,
     /// Whether this input has a preamp gain control at all (Mic and
     /// Instrument only — Line/SPDIF/ADAT inputs have no gain knob).
     pub has_gain: bool,
     /// Raw hardware gain units, not dB — see `Message::Gain`.
     pub gain: u32,
     pub gain_max: u32,
+    /// Inputs 3/4 use 0.5 dB units; display `gain / 2.0` dB.
+    pub gain_half: bool,
     /// Whether this input has a sensitivity switch (Instrument only).
     pub has_sensitivity: bool,
     /// `true` = +4dBu, `false` = -10dBV.
     pub sensitivity_plus4: bool,
+    /// Whether this input has the UCX three-value Level control.
+    pub has_level: bool,
+    /// Current Level label (`-10dBV`, `+4dBu`, `LoGain`).
+    pub level: tuxmix_core::InputLevel,
+    /// Whether this input has AutoSet (UCX inputs 1/2).
+    pub has_autoset: bool,
+    pub autoset: bool,
+    /// Whether this channel has a Dynamics panel (UCX inputs/outputs).
+    pub has_dynamics: bool,
+    pub dynamics_on: bool,
     /// Whether this input has an EQ strip at all (the 4 analog inputs
     /// only — see `InputChannel::eq`).
     pub has_eq: bool,
@@ -183,12 +259,16 @@ pub struct StripParams<'a> {
     /// Current trim value in dB (-65..+6) — see `InputChannel::trim`.
     pub trim: f32,
     /// Whether this input has a Phase Ø invert switch — the 4 analog
-    /// inputs only (`InputChannel::eq.is_some()` already means exactly
-    /// that set, reused rather than a parallel gate that could drift).
+    /// inputs only, and only where the backend decodes phase (the UC does
+    /// not yet; see `UC-TODO-06`).
     pub has_phase: bool,
     pub phase: bool,
     /// Output-only: `OutputChannel::loopback`.
     pub loopback: bool,
+    /// Whether this connection can drive the loopback register (`0x15`).
+    /// Separate from `protocol_features`: the UC has no EQ/FX but does
+    /// have loopback.
+    pub loopback_supported: bool,
     /// Whether this channel's pair is currently a linked stereo bus
     /// (`RmeDevice::{input_pair,playback,output}_linked`, whichever
     /// matches `cid`'s kind) — TotalMix's default, shown/toggled from
@@ -224,6 +304,12 @@ pub struct StripParams<'a> {
     pub scale: f32,
     pub selected: bool,
     pub hovered: bool,
+    /// This output strip is the current submix destination (TotalMix's
+    /// lighter active-output card).
+    pub active_surface: bool,
+    /// `name` is the user's own label; do not strip a hardware "PCM "/"OUT "
+    /// prefix from it, unlike the original names.
+    pub name_custom: bool,
 }
 
 /// A button's own padding-based centering isn't reliable across glyphs of
@@ -263,6 +349,108 @@ pub(crate) fn hint<'a>(
     .gap(4.0 * scale)
     .delay(std::time::Duration::from_millis(400))
     .into()
+}
+
+/// The active-tab background: a rounded rectangle 6 px wider on each side
+/// than the icon box, so the icon stays put and centred while the rectangle
+/// reaches the strip's right padding and touches the slideout.  Drawn as a
+/// Canvas underlay so it can overflow the icon box without affecting layout.
+struct TabUnderlay {
+    active: bool,
+    scale: f32,
+    w: f32,
+    h: f32,
+}
+
+impl<Message> canvas::Program<Message> for TabUnderlay {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        if !self.active {
+            return Vec::new();
+        }
+        let w = (self.w + 12.0) * self.scale;
+        let h = self.h * self.scale;
+        let mut frame = Frame::new(renderer, Size::new(w, h));
+        let path = canvas::Path::new(|p| {
+            p.rounded_rectangle(
+                Point::new(-6.0 * self.scale, 0.0),
+                Size::new(w, h),
+                (3.0 * self.scale).into(),
+            )
+        });
+        frame.fill(&path, theme::SURFACE);
+        let _ = bounds;
+        vec![frame.into_geometry()]
+    }
+}
+
+/// Settings/Trim/EQ tab.  The underlay is 6 px wider on each side than the
+/// button, so the dark rectangle reaches the strip edge without moving the
+/// icon or the channel content.  The rectangle is only drawn while that
+/// slideout is open.  Settings passes the larger `SETTINGS_TAB_*` size.
+fn tab_button<'a>(
+    label: &'static str,
+    active: bool,
+    lit: bool,
+    message: Message,
+    tip: &'a str,
+    scale: f32,
+) -> Element<'a, Message> {
+    tab_button_sized(
+        label,
+        active,
+        lit,
+        message,
+        tip,
+        scale,
+        TAB_BTN_W,
+        TAB_BTN_H,
+        theme::TEXT_MD + 2.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tab_button_sized<'a>(
+    label: &'static str,
+    active: bool,
+    lit: bool,
+    message: Message,
+    tip: &'a str,
+    scale: f32,
+    w: f32,
+    h: f32,
+    glyph_size: f32,
+) -> Element<'a, Message> {
+    let underlay = Canvas::new(TabUnderlay {
+        active,
+        scale,
+        w,
+        h,
+    })
+    .width(Length::Fixed(w * scale))
+    .height(Length::Fixed(h * scale));
+    // The underlay draws 6 px to the left of its frame, but that part is
+    // clipped, so the visible rectangle is centred 3 px right of the glyph.
+    // A 6 px left content padding moves the centred glyph right by 3 px;
+    // the glyph now sits in the middle of the visible back rectangle.
+    let face = button(centered_label(label, glyph_size * scale))
+        .padding(iced::Padding {
+            left: 6.0 * scale,
+            ..iced::Padding::ZERO
+        })
+        .width(Length::Fixed(w * scale))
+        .height(Length::Fixed(h * scale))
+        .style(theme::panel_tab(false, lit))
+        .on_press(message);
+    hint(Stack::new().push(underlay).push(face), tip, scale)
 }
 
 /// How long (in canvas-local x, *before* the -90° rotation — i.e. how
@@ -344,13 +532,19 @@ fn rotated_label<'a, Msg: 'a + Clone>(text: String, size: f32, scale: f32) -> El
 fn header_row<'a>(
     cid: ChannelId,
     name: &str,
+    name_custom: bool,
     type_tag: Option<(&'static str, Color)>,
     renaming: bool,
     rename_buf: &'a str,
     scale: f32,
 ) -> Element<'a, Message> {
+    let shown_name = if name_custom {
+        name
+    } else {
+        short_label(name)
+    };
     if renaming {
-        return text_input(short_label(name), rename_buf)
+        return text_input(shown_name, rename_buf)
             .id(crate::app::RENAME_INPUT_ID)
             .on_input(Message::RenameChanged)
             .on_submit(Message::RenameCommit)
@@ -364,14 +558,15 @@ fn header_row<'a>(
     // "ADAT7/8") wraps to two lines partway through the collapse/expand
     // width animation, once the shrinking card gets narrower than the
     // name's natural width, growing the whole strip's *height* for the
-    // ~160ms the animation is mid-flight before it settles back down —
+    // ~90ms the animation is mid-flight before it settles back down —
     // user report: "pendant que ça se minimise le bus augmente de hauteur
     // un peu." No text in this card is meant to ever wrap (every label
     // here is a single short line by design), so this is a correctness
     // fix for the whole card, not just the header specifically — see the
     // matching `.wrapping(None)` added to every other `text()` in
     // `full_strip` below for the same reason.
-    let mut header = row![text(short_label(name).to_string())
+    let mut header = row![text(shown_name.to_string())
+        .color(theme::TEXT_PRIMARY)
         .size(theme::TEXT_MD * scale)
         .wrapping(advanced_text::Wrapping::None)]
     .spacing(theme::SPACE_HAIRLINE);
@@ -457,7 +652,15 @@ fn collapsed_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         solo_btn.into()
     };
     let rows = column![
-        rotated_label(short_label(&p.name).to_string(), theme::TEXT_SM * scale, scale),
+        rotated_label(
+            if p.name_custom {
+                p.name.to_string()
+            } else {
+                short_label(&p.name).to_string()
+            },
+            theme::TEXT_SM * scale,
+            scale,
+        ),
         mute_btn,
         solo_slot,
         container(vu_meter(
@@ -480,9 +683,11 @@ fn collapsed_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
                 p.selected,
                 p.hovered,
                 p.type_tag.map(|(_, c)| c),
+                p.active_surface,
             ))
             .padding([theme::SPACE_SM * p.scale, theme::SPACE_MD * p.scale])
             .width(Length::Fixed(w * p.scale))
+            .height(Length::Fixed(STRIP_H * p.scale))
             .clip(true),
     )
     .on_press(Message::StripClicked(cid))
@@ -520,17 +725,6 @@ pub fn strip<'a>(p: StripParams<'a>) -> Element<'a, Message> {
     }
 }
 
-/// The output index behind `cid`, when this strip should show the loopback
-/// toggle at all: outputs only, and only on a connection that can drive
-/// RME's own protocol (`OutputChannel::loopback` is a register the
-/// class-compliant personality does not have).
-fn loopback_target(cid: ChannelId, protocol_features: bool) -> Option<usize> {
-    match cid {
-        ChannelId::Output(i) if protocol_features => Some(i),
-        _ => None,
-    }
-}
-
 fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     let cid = p.cid;
     let out = p.output_idx;
@@ -541,7 +735,15 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // (see `app.rs::settings_popover`) — 48V/PAD/Sensitivity/Gain are
     // just the input-only additions to the same panel.
     let has_settings = true;
-    let header = header_row(cid, &p.name, p.type_tag, p.renaming, p.rename_buf, scale);
+    let header = header_row(
+        cid,
+        &p.name,
+        p.name_custom,
+        p.type_tag,
+        p.renaming,
+        p.rename_buf,
+        scale,
+    );
 
     let mute_btn = hint(
         button(centered_label("M", theme::TEXT_SM * scale))
@@ -602,64 +804,49 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // route picker (below) after it, the fader ends up vertically
     // centered in the strip's own flow instead of front-loaded.
     //
-    // Outputs get this row too now, even though there's nothing real to
-    // back it with yet — the user caught that skipping it made Output
-    // strips visibly *shorter* than Input/Playback ones (confirmed via a
-    // live screenshot: ~257px vs ~307px), when the real TotalMix
-    // reference shows every strip, outputs included, at the exact same
-    // height *and* with a knob in this exact spot (labeled "C", same as
-    // an input's pan). That knob is very likely a real output-bus
-    // **balance** control, not pan-into-a-bus (which wouldn't make sense
-    // for an output) — but `RmeDevice::set_pan`'s signature is
-    // `(channel, output)`, built for routing a channel's signal *into* a
-    // submix, and neither `tuxmix-core` nor `tuxmix-usb`'s protocol layer
-    // has anything resembling an output-master balance register (checked
-    // both before writing this).
-    //
-    // First attempt reserved a blank `Space` here instead of a knob — the
-    // user pointed out that read as the control being entirely missing,
-    // not "present but not applicable yet." A dimmed, non-interactive
-    // knob (`Knob::interactive: false`, see its own doc comment) reads
-    // correctly as the latter — same footprint, same "C" TotalMix shows,
-    // just visibly inert — without shipping a knob that would silently
-    // do nothing if someone tried to drag it. `on_change`/`on_reset` are
-    // genuinely unreachable: `interactive: false` makes `Knob::update`
-    // return early before either could ever be invoked.
+    // Outputs get this row too.  On the UC it is a real output balance:
+    // the two physical channels carry different 0x1a levels, and the knob
+    // is derived from their difference.  Backends without a balance path
+    // keep the knob dimmed (the same footprint, so every strip stays the
+    // same height).
     let pan_str = match p.pan.cmp(&0) {
         std::cmp::Ordering::Less => format!("L{}", -p.pan),
         std::cmp::Ordering::Greater => format!("R{}", p.pan),
         std::cmp::Ordering::Equal => "C".to_string(),
     };
     let is_output = matches!(cid, ChannelId::Output(_));
-    let pan_knob = if is_output {
-        Knob {
-            value: 0.0,
-            range: (-100.0, 100.0),
-            label: "C".to_string(),
-            arc_from_center: true,
-            interactive: false,
-            log_scale: false,
-            modifiers: p.modifiers,
-            scale,
-            on_change: Box::new(|_| unreachable!("interactive: false suppresses all input")),
-            on_reset: Box::new(|| unreachable!("interactive: false suppresses all input")),
-        }
-    } else {
-        Knob {
-            value: p.pan as f32,
-            range: (-100.0, 100.0),
-            label: pan_str,
-            arc_from_center: true,
-            interactive: true,
-            log_scale: false,
-            modifiers: p.modifiers,
-            scale,
-            on_change: Box::new(move |v| Message::PanChanged(cid, out, v.round() as i8)),
-            on_reset: Box::new(move || Message::PanReset(cid, out)),
-        }
+    let balance_available = !is_output || p.output_balance_supported;
+    let pan_knob = Knob {
+        value: if balance_available { p.pan as f32 } else { 0.0 },
+        range: (-100.0, 100.0),
+        label: if balance_available {
+            pan_str
+        } else {
+            "C".to_string()
+        },
+        arc_from_center: true,
+        level_arc_color: Some(theme::PHANTOM),
+        interactive: balance_available,
+        log_scale: false,
+        modifiers: p.modifiers,
+        scale,
+        on_change: if balance_available {
+            Box::new(move |v| Message::PanChanged(cid, out, v.round() as i8))
+        } else {
+            Box::new(|_| unreachable!("balance unavailable suppresses all input"))
+        },
+        on_reset: if balance_available {
+            Box::new(move || Message::PanReset(cid, out))
+        } else {
+            Box::new(|| unreachable!("balance unavailable suppresses all input"))
+        },
     };
     let pan_hint = if is_output {
-        "Output balance — not yet implemented (no known hardware register)"
+        if p.output_balance_supported {
+            "Output balance — drag, scroll, or double-click to reset"
+        } else {
+            "Output balance — not implemented for this output/backend"
+        }
     } else {
         "Pan — drag, scroll, or double-click to reset"
     };
@@ -681,7 +868,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // that failure mode doesn't apply and Gain moved in with the rest.
 
     let default_vol = p.default_vol;
-    let fader_h = FADER_H * scale;
+    let fader_h = (STRIP_H - FADER_CHROME_H) * scale;
     let fader_widget = fader(Fader {
         value: p.vol,
         range: p.drag_range.unwrap_or((0.0, 2.0)),
@@ -692,6 +879,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         meter2_available: p.meter2_available,
         height: fader_h,
         show_meter: true,
+        fill: theme::FADER,
         // The icon column (`icon_col`, built below) is this canvas's
         // `row!` sibling — same width regardless of how many buttons it
         // holds (T/gear/EQ all share `ICON_BTN_W`), plus the row's own
@@ -702,7 +890,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         // — like several other spacings in this file — doesn't scale;
         // matching that exactly (not just approximately) is the point,
         // since this value feeds a pixel-level centering fix.
-        reserved_right: ICON_BTN_W * scale + theme::SPACE_TIGHT,
+        reserved_right: SETTINGS_TAB_W * scale + theme::SPACE_TIGHT,
         modifiers: p.modifiers,
         scale,
         show_track: true,
@@ -739,67 +927,126 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // work.
     if p.has_trim && p.protocol_features {
         let trim_open = p.open_flyout == Some(FlyoutKind::Trim);
-        icon_col = icon_col.push(hint(
-            button(centered_label("T", theme::TEXT_MICRO * scale))
-                .padding(0)
-                .width(ICON_BTN_W * scale)
-                .height(ICON_BTN_H * scale)
-                // Lights up whenever trim is off unity too, not just
-                // while its flyout is open — same "shows live state at a
-                // glance" idea as the EQ trigger's own `eq_open ||
-                // eq_enabled`.
-                .style(theme::toggle_button(trim_open || p.trim != 0.0, theme::ACCENT))
-                .on_press(Message::ToggleFlyout(cid, FlyoutKind::Trim)),
+        // Lights up whenever trim is off unity too, not just while its
+        // flyout is open — same "shows live state at a glance" idea as the
+        // EQ trigger's own `eq_open || eq_enabled`.
+        icon_col = icon_col.push(tab_button(
+            "T",
+            trim_open,
+            trim_open || p.trim != 0.0,
+            Message::ToggleFlyout(cid, FlyoutKind::Trim),
             if trim_open { "Hide trim" } else { "Show trim" },
             scale,
         ));
     }
-    if p.has_phase && p.protocol_features {
-        icon_col = icon_col.push(hint(
-            button(centered_label("Ø", theme::TEXT_MICRO * scale))
-                .padding(0)
-                .width(ICON_BTN_W * scale)
-                .height(ICON_BTN_H * scale)
-                .style(theme::toggle_button(p.phase, theme::ACCENT))
-                .on_press(Message::PhaseChanged(cid, !p.phase)),
-            "Phase Ø invert",
-            scale,
-        ));
-    }
+    // Phase now lives in the Settings flyout, at the bottom of the manual's
+    // Input row, rather than as an extra glyph in this narrow column.
     // No "SP" button here any more: a playback pair's stereo split IS its
     // link state (`RmeDevice::playback_linked` is `!split`), so it was the
     // STEREO switch of the settings flyout a second time, lit under
     // another name.
     if has_settings {
         let settings_open = p.open_flyout == Some(FlyoutKind::Settings);
-        icon_col = icon_col.push(hint(
-            button(centered_label("⚙", theme::TEXT_MICRO * scale))
-                .padding(0)
-                .width(ICON_BTN_W * scale)
-                .height(ICON_BTN_H * scale)
-                .style(theme::toggle_button(settings_open, theme::ACCENT))
-                .on_press(Message::ToggleFlyout(cid, FlyoutKind::Settings)),
+        icon_col = icon_col.push(tab_button_sized(
+            "⚙",
+            settings_open,
+            settings_open,
+            Message::ToggleFlyout(cid, FlyoutKind::Settings),
             if settings_open { "Hide settings" } else { "Show settings (48V/PAD/Sensitivity)" },
             scale,
+            SETTINGS_TAB_W,
+            SETTINGS_TAB_H,
+            SETTINGS_GLYPH,
         ));
     }
     if p.has_eq && p.protocol_features {
         let eq_open = p.open_flyout == Some(FlyoutKind::Eq);
-        icon_col = icon_col.push(hint(
-            button(centered_label("EQ", theme::TEXT_MICRO * scale))
-                .padding(0)
-                .width(ICON_BTN_W * scale)
-                .height(ICON_BTN_H * scale)
-                .style(theme::toggle_button(eq_open || p.eq_enabled, theme::ACCENT))
-                .on_press(Message::ToggleFlyout(cid, FlyoutKind::Eq)),
+        icon_col = icon_col.push(tab_button(
+            "EQ",
+            eq_open,
+            eq_open || p.eq_enabled,
+            Message::ToggleFlyout(cid, FlyoutKind::Eq),
             if eq_open { "Hide EQ" } else { "Show EQ (3-band + low cut)" },
             scale,
         ));
+
     }
+    if p.has_dynamics && p.protocol_features {
+        let dyn_open = p.open_flyout == Some(FlyoutKind::Dynamics);
+        icon_col = icon_col.push(tab_button(
+            "D",
+            dyn_open,
+            dyn_open || p.dynamics_on,
+            Message::ToggleFlyout(cid, FlyoutKind::Dynamics),
+            if dyn_open { "Hide Dynamics" } else { "Show Dynamics (Compressor, Expander, Auto Level)" },
+            scale,
+        ));
+    }
+    // The FX fader: send on inputs and playbacks, return on outputs. A thin
+    // track beside the main fader, no meter, its own value drag — measured
+    // from the TotalMix strip (small cap, no scale of its own).
+    // The FX fader: send on inputs and playbacks, return on outputs. A thin
+    // track to the right of the main fader, starting at the same height,
+    // with a short line under it — orange for a send, green for a return.
+    let fx_fader: Option<Element<'a, Message>> = p.fx_level.map(move |db| {
+        let value = 10f32.powf(db / 20.0).clamp(0.0, 2.0);
+        let inner = fader(Fader {
+            value,
+            range: (0.0, 1.0),
+            default_value: 10f32.powf(-65.0 / 20.0),
+            meter: MeterFrame::still(0.0),
+            meter_available: false,
+            meter2: None,
+            meter2_available: false,
+            // Leaves the T / gear / EQ / D buttons their room at the
+            // bottom of the column.
+            height: (fader_h - 150.0 * scale).max(48.0 * scale),
+            show_meter: false,
+            // Same dark slot as the main fader, but a smaller body.
+                fill: match cid {
+                ChannelId::Output(_) => theme::MGREEN,
+                _ => theme::PHANTOM,
+            },
+            reserved_right: 0.0,
+            modifiers: p.modifiers,
+            // A smaller body: the cap and rail scale down with it.
+            scale: scale * 0.62,
+            show_track: true,
+            label: None,
+            label_color: theme::TEXT_SEC,
+            compact_width: 26.0,
+            on_press: Box::new(move |v, _| fx_message(cid, db_of(v))),
+            on_drag: Box::new(move |v| fx_message(cid, db_of(v))),
+            on_release: Box::new(move || Message::RangeCleared(cid)),
+            on_reset: Box::new(move || fx_message(cid, -65.0)),
+        });
+        // The fader's own coloured fill says everything; the dark channel
+        // behind it is what marks the slot above the cap.
+        column![container(inner).width(Length::Fixed(26.0 * 0.62 * scale))]
+            .align_x(iced::Alignment::Center)
+            .into()
+    });
+
+    // The FX fader sits at the top of the strip's right-hand control column,
+    // above T / gear / EQ / D, so the main fader keeps the full height.
+    let icon_col = match fx_fader {
+        // FX fader on top, the button stack pushed down to the bottom of the
+        // column, the slack between them.
+        // FX fader pinned to the top of the row — the same line as the big
+        // fader's top in every row — with the button stack at the bottom.
+        Some(fx) => column![
+            fx,
+            iced::widget::Space::new().height(Length::Fill),
+            icon_col,
+        ]
+        .spacing(theme::SPACE_TIGHT)
+        .align_x(iced::Alignment::Center),
+        None => icon_col,
+    };
     rows = rows.push(
         row![fader_widget, icon_col]
             .spacing(theme::SPACE_TIGHT)
-            .align_y(iced::Alignment::Center)
+            .align_y(iced::Alignment::Start)
             .width(Length::Fill),
     );
 
@@ -820,7 +1067,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         };
         mouse_area(
             text(db_text(p.vol))
-                .color(theme::TEXT_SEC)
+                .color(theme::TEXT_PRIMARY)
                 .size(theme::TEXT_XS * scale)
                 .wrapping(advanced_text::Wrapping::None),
         )
@@ -859,7 +1106,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // centered in it) instead of a `plain_button` of its own height, so
     // the strip's small controls are one family.
     let collapse_btn = hint(
-        button(centered_label("−", theme::TEXT_MICRO * scale))
+        button(centered_label("−", theme::TEXT_SM * scale))
             .padding(0)
             .width(ICON_BTN_W * scale)
             .height(ICON_BTN_H * scale)
@@ -885,7 +1132,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     rows = rows.push(
         row![
             iced::widget::Space::new().width(Length::Fixed(ICON_BTN_W * scale)),
-            container(db_display).width(Length::Fill).center_x(Length::Fill),
+            container(db_display),
             collapse_btn,
         ]
         .spacing(theme::SPACE_TIGHT)
@@ -908,7 +1155,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
             container(hint(
                 button(
                     row![
-                        text(OUT_LABELS[out])
+                        text(p.bus_label.clone())
                             .size(theme::TEXT_XS * scale)
                             .wrapping(advanced_text::Wrapping::None),
                         text("▸").size(theme::TEXT_XS * scale),
@@ -919,33 +1166,6 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
                 .style(theme::toggle_button(p.open_flyout == Some(FlyoutKind::Route), theme::ACCENT))
                 .on_press(Message::ToggleFlyout(cid, FlyoutKind::Route)),
                 "Change output bus",
-                scale,
-            ))
-            .padding(iced::Padding {
-                top: theme::SPACE_MD * scale,
-                ..iced::Padding::ZERO
-            })
-            .width(Length::Fill)
-            .center_x(Length::Fill),
-        );
-    } else if let Some(i) = loopback_target(cid, p.protocol_features) {
-        // Outputs have no route trigger (a single master, not a
-        // per-submix crosspoint) — the same row slot shows the loopback
-        // toggle instead (`OutputChannel::loopback`, bReq 0x15: feeds the
-        // input signal back into this output's own playback path). The
-        // STEREO link/split toggle lives in the Settings flyout now
-        // (`app.rs::settings_popover`), same as every other channel kind.
-        rows = rows.push(
-            container(hint(
-                button(
-                    text("LOOP")
-                        .size(theme::TEXT_XS * scale)
-                        .wrapping(advanced_text::Wrapping::None),
-                )
-                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
-                    .style(theme::toggle_button(p.loopback, theme::ACCENT))
-                    .on_press(Message::LoopbackChanged(i, !p.loopback)),
-                "Loopback — feed the input signal back into this output",
                 scale,
             ))
             .padding(iced::Padding {
@@ -974,6 +1194,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
             p.selected,
             p.hovered,
             p.type_tag.map(|(_, c)| c),
+            p.active_surface,
         ))
         // Bottom padding wider than the top three sides — the route
         // trigger (the card's last row) otherwise sat almost flush against
@@ -981,11 +1202,15 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         // readout right above it.
         .padding(iced::Padding {
             top: theme::SPACE_SM * scale,
+            // Keep the strip's content stationary when a slideout opens;
+            // the panel overlaps this right padding instead (see app.rs).
             right: theme::SPACE_MD * scale,
             bottom: theme::SPACE_XL * scale,
             left: theme::SPACE_MD * scale,
         })
         .width(Length::Fixed(w * scale))
+        .height(Length::Fixed(STRIP_H * scale))
+        .align_y(iced::Alignment::Start)
         .clip(true),
     )
     .on_press(Message::StripClicked(cid))
@@ -999,17 +1224,13 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn loopback_is_output_only_and_needs_the_protocol() {
-        assert_eq!(loopback_target(ChannelId::Output(2), true), Some(2));
-        assert_eq!(
-            loopback_target(ChannelId::Output(2), false),
-            None,
-            "the class-compliant personality has no loopback register"
-        );
-        assert_eq!(loopback_target(ChannelId::Input(2), true), None);
-    }
     use std::time::Duration;
+
+    #[test]
+    fn collapsed_strip_fills_the_standard_strip_height() {
+        assert!((COLLAPSED_METER_H + COLLAPSED_CHROME_H - STRIP_H).abs() < f32::EPSILON);
+        assert!(COLLAPSED_METER_H > 0.0);
+    }
 
     #[test]
     fn settled_anim_is_never_settling() {
@@ -1036,8 +1257,13 @@ mod tests {
     fn at_interpolates_linearly_from_prev_to_value() {
         let a = CollapseAnim { prev: STRIP_W, value: COLLAPSED_W, since: Instant::now() };
         assert_eq!(a.at(a.since), STRIP_W);
-        assert_eq!(a.at(a.since + Duration::from_millis(160)), COLLAPSED_W);
-        let mid = a.at(a.since + Duration::from_millis(80));
+        assert_eq!(
+            a.at(a.since + Duration::from_millis(COLLAPSE_INTERP_MS as u64)),
+            COLLAPSED_W
+        );
+        let mid = a.at(
+            a.since + Duration::from_millis((COLLAPSE_INTERP_MS / 2.0) as u64),
+        );
         let expected_mid = (STRIP_W + COLLAPSED_W) / 2.0;
         assert!(
             (mid - expected_mid).abs() < 0.5,

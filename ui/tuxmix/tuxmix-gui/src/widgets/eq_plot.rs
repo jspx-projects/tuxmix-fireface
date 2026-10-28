@@ -25,8 +25,10 @@ use tuxmix_core::channel::{EqBand, EqBandType, InputEq};
 use super::fader::{DOUBLE_CLICK, SCROLL_IDLE};
 use crate::theme;
 
-/// Plot height at scale 1.
-const PLOT_H: f32 = 64.0;
+/// Plot height at scale 1.  Taller than the original 64 so the coloured
+/// low/mid/high curve reads clearly; the flyout scrolls if the window is
+/// short.
+const PLOT_H: f32 = 92.0;
 const MARGIN_LEFT: f32 = 26.0;
 const MARGIN_RIGHT: f32 = 6.0;
 const MARGIN_TOP: f32 = 6.0;
@@ -36,6 +38,8 @@ const DB_MIN: f32 = -24.0;
 const DB_MAX: f32 = 24.0;
 const F_MIN: f32 = 20.0;
 const F_MAX: f32 = 20_000.0;
+/// The hardware low cut only covers 20-500 Hz, unlike the three EQ bands.
+const LC_MAX: f32 = 500.0;
 
 /// Samples along the curve. Enough for the Q=10 peaks to read as peaks at
 /// any window width without rebuilding the path per pixel.
@@ -114,17 +118,27 @@ impl<Message> EqPlot<Message> {
     fn band_handle(&self, band: &EqBand, plot: Rectangle) -> Point {
         let r = HANDLE_R * self.scale;
         Point::new(
-            freq_to_x(band.freq_hz as f32, plot).clamp(plot.x + r, plot.x + plot.width - r),
-            db_to_y(band.gain_db.clamp(DB_MIN, DB_MAX), plot)
-                .clamp(plot.y + r, plot.y + plot.height - r),
+            clamp_handle(
+                freq_to_x(band.freq_hz as f32, plot),
+                plot.x + r,
+                plot.x + plot.width - r,
+            ),
+            clamp_handle(
+                db_to_y(band.gain_db.clamp(DB_MIN, DB_MAX), plot),
+                plot.y + r,
+                plot.y + plot.height - r,
+            ),
         )
     }
 
     fn low_cut_handle(&self, plot: Rectangle) -> Point {
         let r = LOW_CUT_HANDLE_R * self.scale;
         Point::new(
-            freq_to_x(self.eq.low_cut_freq_hz as f32, plot)
-                .clamp(plot.x + r, plot.x + plot.width - r),
+            clamp_handle(
+                freq_to_x(self.eq.low_cut_freq_hz as f32, plot),
+                plot.x + r,
+                plot.x + plot.width - r,
+            ),
             plot.y + plot.height,
         )
     }
@@ -340,16 +354,34 @@ impl<Message> canvas::Program<Message> for EqPlot<Message> {
 
         draw_low_cut(&mut frame, &self.eq, plot, scale, state.drag);
 
-        let points = response_points(plot, |f| response_db(&self.eq, f, rate));
-        let color = if self.eq.enabled {
-            theme::ACCENT
-        } else {
-            theme::TEXT_SEC
-        };
-        frame.stroke(
-            &path_from(&points),
-            Stroke::default().with_color(color).with_width(1.6 * scale),
-        );
+        // RME TotalMix colours the response line red/green/blue at the
+        // logarithmic midpoint between adjacent band centre frequencies.
+        // The split is independent of the curve's shape: f1=77 Hz,
+        // f2=3 kHz, f3=10 kHz render boundaries at ~481 Hz and ~5.5 kHz,
+        // matching the manual's own EQ screenshot.
+        let (low_mid, mid_high) = eq_band_boundaries(&self.eq);
+        let edges = [F_MIN, low_mid, mid_high, F_MAX];
+        for (i, colour) in theme::EQ_BAND.iter().enumerate() {
+            let (start, end) = (edges[i].max(F_MIN), edges[i + 1].min(F_MAX));
+            if end <= start {
+                continue;
+            }
+            let points = response_points_range(plot, start, end, |f| {
+                response_db(&self.eq, f, rate)
+            });
+            let color = if self.eq.enabled {
+                *colour
+            } else {
+                Color {
+                    a: 0.55,
+                    ..*colour
+                }
+            };
+            frame.stroke(
+                &path_from(&points),
+                Stroke::default().with_color(color).with_width(1.6 * scale),
+            );
+        }
 
         for (i, band) in self.eq.bands.iter().enumerate() {
             if band.band_type == EqBandType::Off {
@@ -503,6 +535,17 @@ impl<Message> EqPlot<Message> {
     }
 }
 
+fn clamp_handle(v: f32, lo: f32, hi: f32) -> f32 {
+    // During the flyout's open/close animation the plot can briefly be
+    // narrower than two handle radii.  f32::clamp panics when lo > hi, so
+    // collapse to the midpoint instead of taking the app down.
+    if lo <= hi {
+        v.clamp(lo, hi)
+    } else {
+        0.5 * (lo + hi)
+    }
+}
+
 fn band_at(plot: Rectangle, pos: Point) -> (u16, f32) {
     let t = ((pos.x - plot.x) / plot.width.max(1.0)).clamp(0.0, 1.0);
     let freq = F_MIN * (F_MAX / F_MIN).powf(t);
@@ -519,7 +562,7 @@ fn low_cut_at(plot: Rectangle, pos: Point) -> u16 {
     let t = ((pos.x - plot.x) / plot.width.max(1.0)).clamp(0.0, 1.0);
     (F_MIN * (F_MAX / F_MIN).powf(t))
         .round()
-        .clamp(F_MIN, F_MAX) as u16
+        .clamp(F_MIN, LC_MAX) as u16
 }
 
 fn response_points(plot: Rectangle, db_at: impl Fn(f32) -> f32) -> Vec<Point> {
@@ -529,6 +572,48 @@ fn response_points(plot: Rectangle, db_at: impl Fn(f32) -> f32) -> Vec<Point> {
             let f = F_MIN * (F_MAX / F_MIN).powf(t);
             let db = db_at(f).clamp(DB_MIN, DB_MAX);
             Point::new(plot.x + plot.width * t, db_to_y(db, plot))
+        })
+        .collect()
+}
+
+/// The two colour boundaries on TotalMix's EQ line: the geometric mean
+/// (log midpoint) of adjacent band centre frequencies.  TotalMix keeps
+/// all three band frequencies present even while a band is Off, and the
+/// screenshot in the UCX manual (77 Hz / 3 kHz / 10 kHz) puts the splits
+/// at ~481 Hz and ~5.5 kHz.  Frequencies are sorted so the red segment is
+/// always the low end, green the middle, blue the high end even if the
+/// user enters them out of order.
+fn eq_band_boundaries(eq: &InputEq) -> (f32, f32) {
+    let mut f = [
+        eq.bands[0].freq_hz as f32,
+        eq.bands[1].freq_hz as f32,
+        eq.bands[2].freq_hz as f32,
+    ];
+    f.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let low_mid = (f[0].max(1.0) * f[1].max(1.0)).sqrt().clamp(F_MIN, F_MAX);
+    let mid_high = (f[1].max(1.0) * f[2].max(1.0)).sqrt().clamp(F_MIN, F_MAX);
+    (low_mid.min(mid_high), mid_high)
+}
+
+fn response_points_range(
+    plot: Rectangle,
+    f_start: f32,
+    f_end: f32,
+    db_at: impl Fn(f32) -> f32,
+) -> Vec<Point> {
+    let start = f_start.max(F_MIN);
+    let end = f_end.min(F_MAX).max(start);
+    let span = (end / start).max(1.0);
+    let t0 = (start / F_MIN).ln() / (F_MAX / F_MIN).ln();
+    let t1 = (end / F_MIN).ln() / (F_MAX / F_MIN).ln();
+    let steps = ((t1 - t0) * CURVE_POINTS as f32).ceil().clamp(8.0, 120.0) as usize;
+    (0..=steps)
+        .map(|i| {
+            let t = i as f32 / steps as f32;
+            let f = start * span.powf(t);
+            let db = db_at(f).clamp(DB_MIN, DB_MAX);
+            let x = freq_to_x(f, plot);
+            Point::new(x, db_to_y(db, plot))
         })
         .collect()
 }
@@ -545,7 +630,8 @@ fn path_from(points: &[Point]) -> Path {
 }
 
 fn draw_low_cut(frame: &mut Frame, eq: &InputEq, plot: Rectangle, scale: f32, drag: Option<Drag>) {
-    let x = freq_to_x(eq.low_cut_freq_hz as f32, plot).clamp(
+    let x = clamp_handle(
+        freq_to_x(eq.low_cut_freq_hz as f32, plot),
         plot.x + LOW_CUT_HANDLE_R * scale,
         plot.x + plot.width - LOW_CUT_HANDLE_R * scale,
     );
@@ -553,7 +639,7 @@ fn draw_low_cut(frame: &mut Frame, eq: &InputEq, plot: Rectangle, scale: f32, dr
         theme::ACCENT
     } else {
         Color {
-            a: 0.55,
+            a: if eq.low_cut_enabled { 0.55 } else { 0.22 },
             ..theme::TEXT_SEC
         }
     };
@@ -673,6 +759,11 @@ fn band_coeffs(band: &EqBand, rate: f32) -> ([f32; 3], [f32; 3]) {
                 ],
             )
         }
+        // Band 3's Hi Cut: a second-order low pass, gain ignored.
+        EqBandType::LowPass => (
+            [(1.0 - cos) / 2.0, 1.0 - cos, (1.0 - cos) / 2.0],
+            [1.0 + alpha, -2.0 * cos, 1.0 - alpha],
+        ),
     }
 }
 
@@ -686,6 +777,9 @@ fn biquad_response(c: &[f32; 3], w: f32) -> (f32, f32) {
 /// Butterworth high-pass of order `slope / 6`, normalized to 0 dB well
 /// above the cutoff and -3 dB at it.
 fn low_cut_db(eq: &InputEq, f: f32) -> f32 {
+    if !eq.low_cut_enabled {
+        return 0.0;
+    }
     let order = (eq.low_cut_slope_db_oct.max(6) / 6) as i32;
     let r = f / eq.low_cut_freq_hz.max(1) as f32;
     let mag = r.powi(order) / (1.0 + r.powi(2 * order)).sqrt();
@@ -695,9 +789,10 @@ fn low_cut_db(eq: &InputEq, f: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        band_at, db_to_y, freq_to_x, low_cut_at, low_cut_db, response_db, DB_MAX, DB_MIN, F_MAX,
-        F_MIN,
+        band_at, clamp_handle, db_to_y, eq_band_boundaries, freq_to_x, low_cut_at, low_cut_db,
+        response_db, EqPlot, EqPlotActions, DB_MAX, DB_MIN, F_MIN, LC_MAX,
     };
+    use iced::keyboard::Modifiers;
     use iced::{Point, Rectangle, Size};
     use tuxmix_core::channel::{EqBand, EqBandType, InputEq};
 
@@ -729,10 +824,42 @@ mod tests {
     #[test]
     fn low_cut_uses_the_expected_slope() {
         let mut eq = InputEq::default();
+        eq.low_cut_enabled = true;
         eq.low_cut_freq_hz = 1_000;
         eq.low_cut_slope_db_oct = 24;
         let db = low_cut_db(&eq, 500.0);
         assert!((db + 24.0).abs() < 1.0, "24 dB/oct low cut read {db} dB");
+    }
+
+    #[test]
+    fn low_cut_off_is_flat() {
+        let mut eq = InputEq::default();
+        eq.low_cut_freq_hz = 1_000;
+        eq.low_cut_slope_db_oct = 24;
+        assert_eq!(low_cut_db(&eq, 500.0), 0.0);
+    }
+
+    #[test]
+    fn colour_boundaries_are_the_log_midpoints_between_bands() {
+        // The UCX manual's example: 77 Hz / 3 kHz / 10 kHz.
+        let mut eq = InputEq::default();
+        eq.bands[0].freq_hz = 77;
+        eq.bands[1].freq_hz = 3_000;
+        eq.bands[2].freq_hz = 10_000;
+        let (low_mid, mid_high) = eq_band_boundaries(&eq);
+        assert!((low_mid - 480.6).abs() < 1.0, "low/mid = {low_mid}");
+        assert!((mid_high - 5_477.2).abs() < 1.0, "mid/high = {mid_high}");
+    }
+
+    #[test]
+    fn colour_boundaries_sort_out_of_order_bands() {
+        let mut eq = InputEq::default();
+        eq.bands[0].freq_hz = 10_000;
+        eq.bands[1].freq_hz = 77;
+        eq.bands[2].freq_hz = 3_000;
+        let (low_mid, mid_high) = eq_band_boundaries(&eq);
+        assert!((low_mid - 480.6).abs() < 1.0);
+        assert!((mid_high - 5_477.2).abs() < 1.0);
     }
 
     #[test]
@@ -752,12 +879,39 @@ mod tests {
     }
 
     #[test]
+    fn handle_clamps_survive_a_degenerate_plot() {
+        // The EQ flyout animates its width; a frame can be narrower than
+        // two handle radii.  f32::clamp used to panic there and kill the
+        // GUI, so the handle maths must stay finite at width/height 1.
+        assert!((clamp_handle(0.0, 31.0, 26.762) - 28.881).abs() < 1e-3);
+        let eq = InputEq::default();
+        let band = eq.bands[0].clone();
+        let plot = EqPlot {
+            eq,
+            sample_rate: 48_000,
+            scale: 1.0,
+            modifiers: Modifiers::default(),
+            actions: EqPlotActions {
+                on_band: Box::new(|_, _, _| ()),
+                on_band_reset: Box::new(|_| ()),
+                on_band_q: Box::new(|_, _| ()),
+                on_low_cut: Box::new(|_| ()),
+            },
+        };
+        let rect = plot.plot_rect(Size::new(1.0, 1.0));
+        let p = plot.band_handle(&band, rect);
+        assert!(p.x.is_finite() && p.y.is_finite());
+        let p = plot.low_cut_handle(rect);
+        assert!(p.x.is_finite());
+    }
+
+    #[test]
     fn low_cut_mapping_stays_inside_the_plot() {
         let plot = Rectangle::new(Point::new(10.0, 20.0), Size::new(200.0, 100.0));
         assert_eq!(low_cut_at(plot, Point::new(plot.x, plot.y)), F_MIN as u16);
         assert_eq!(
             low_cut_at(plot, Point::new(plot.x + plot.width, plot.y)),
-            F_MAX as u16
+            LC_MAX as u16
         );
     }
 }

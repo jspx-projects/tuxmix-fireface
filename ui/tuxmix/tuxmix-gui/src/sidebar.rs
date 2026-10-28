@@ -41,8 +41,13 @@ use crate::theme;
 /// the resize strip — wide enough for the longest label in the Options
 /// panel ("solo/pfl mode") without wrapping. Its rows act as a
 /// self-contained readout, so this is a starting point rather than
-/// something the layout negotiates with the mixer.
-pub const DEFAULT_WIDTH: f32 = 210.0;
+/// something the layout negotiates with the mixer. Kept deliberately a
+/// little narrower than the original 210 px so the mixer gets the space.
+pub const DEFAULT_WIDTH: f32 = 200.0;
+/// The pre-2026-10-26 default.  Existing prefs at exactly this value are
+/// migrated to `DEFAULT_WIDTH` once; a user who deliberately chose another
+/// width keeps it.
+pub const OLD_DEFAULT_WIDTH: f32 = 210.0;
 /// Bounds on `TuxMix::sidebar_width`. The floor is set by the same
 /// measurement as `DEFAULT_WIDTH`: below roughly 200 the Options rows'
 /// two segments stop fitting their labels, and iced wraps the text onto a
@@ -264,7 +269,7 @@ pub fn sidebar(state: &TuxMix) -> Element<'_, Message> {
                     .height(Length::Fixed(TOGGLE_H * scale))
                     .style(theme::ghost_button)
                     .on_press(Message::ToggleDevicePanel),
-                "Device settings",
+                "Settings",
                 scale,
             ),
         ]
@@ -292,27 +297,31 @@ pub fn sidebar(state: &TuxMix) -> Element<'_, Message> {
         .into();
     }
 
-    let col = column![
+    let mut col = column![
         title_row(scale),
         device_chip(state, scale),
         undo_redo_row(state, scale),
         msf_row(state, scale),
-        panel(options_panel(state, scale), scale),
-        panel(snapshots_panel(state, scale), scale),
-        panel(groups_panel(state, scale), scale),
-        panel(layout_panel(state, scale), scale),
-    ]
-    .spacing(theme::SPACE_MD * scale)
-    // Left padding dropped in favour of the resize strip (`RESIZE_W`):
-    // rows still start `SPACE_MD` from the column's edge, with the strip
-    // sitting in what used to be that padding.
-    .padding(iced::Padding {
-        top: theme::SPACE_MD * scale,
-        right: theme::SPACE_MD * scale,
-        bottom: theme::SPACE_MD * scale,
-        left: 0.0,
-    })
-    .width(Length::Fill);
+    ];
+    if state.device.capabilities().fx {
+        col = col.push(fx_row(state, scale));
+    }
+    let col = col
+        .push(panel(options_panel(state, scale), scale))
+        .push(panel(snapshots_panel(state, scale), scale))
+        .push(panel(groups_panel(state, scale), scale))
+        .push(panel(layout_panel(state, scale), scale))
+        .spacing(theme::SPACE_MD * scale)
+        // Left padding dropped in favour of the resize strip (`RESIZE_W`):
+        // rows still start `SPACE_MD` from the column's edge, with the strip
+        // sitting in what used to be that padding.
+        .padding(iced::Padding {
+            top: theme::SPACE_MD * scale,
+            right: theme::SPACE_MD * scale,
+            bottom: theme::SPACE_MD * scale,
+            left: 0.0,
+        })
+        .width(Length::Fill);
 
     // Thin scrollbar, like `app.rs::page` — the default 10px one eats 5%
     // of a 210px column's width when (as with every panel open) the full
@@ -424,7 +433,7 @@ pub(crate) fn device_state(state: &TuxMix) -> (Color, &'static str) {
         (theme::MRED, "Disconnected")
     } else if state.device.is_mock() {
         (theme::YSIM, "Simulated")
-    } else if !state.device.protocol_features() {
+    } else if state.device.class_compliant() {
         (theme::YSIM, "Class Compliant")
     } else {
         (theme::GCONN, "Proprietary")
@@ -449,7 +458,7 @@ pub(crate) fn device_state(state: &TuxMix) -> (Color, &'static str) {
 /// under it: one line for both wraps "Class Compliant", the longest word,
 /// against the default column width (seen live), and a clipped or
 /// wrapping state word is worse than a second line. It is a button that
-/// opens the device settings (2026-10-20), so its `▾` means something
+/// opens Settings (2026-10-20), so its `▾` means something
 /// again: an earlier one decorated a chip nothing could click, and was
 /// removed for that.
 fn device_chip(state: &TuxMix, scale: f32) -> Element<'_, Message> {
@@ -472,7 +481,7 @@ fn device_chip(state: &TuxMix, scale: f32) -> Element<'_, Message> {
     let settings = state.device.settings();
     // The device card is the one way into the device's settings: it says
     // what the card is, what state it is in and how it is clocked, and a
-    // click on it opens Device settings beside it. The gear
+    // click on it opens Settings beside it. The gear
     // says "settings"; a caret said "dropdown", and the top bar's clock
     // field opening the same popover made two doors for one room.
     hint(
@@ -489,7 +498,14 @@ fn device_chip(state: &TuxMix, scale: f32) -> Element<'_, Message> {
                     iced::widget::Space::new().width(Length::Fill),
                     text("\u{2699}")
                         .size(theme::TEXT_SM * scale)
-                        .color(theme::TEXT_SEC),
+                        .color(if state.connected {
+                            theme::TEXT_SEC
+                        } else {
+                            iced::Color {
+                                a: 0.35,
+                                ..theme::TEXT_SEC
+                            }
+                        }),
                 ]
                 .spacing(theme::SPACE_SM * scale)
                 .align_y(iced::Alignment::Center),
@@ -510,36 +526,35 @@ fn device_chip(state: &TuxMix, scale: f32) -> Element<'_, Message> {
         // A narrow sidebar clips a long model name instead of letting it
         // run past the card's border.
         .clip(true),
-        "Device settings: clock, sample rate, pitch, global options",
+        "Settings (only while a device is connected)",
         scale,
     )
 }
 
-/// The device card's third line: what the card is running at. While the card
-/// plays, its real rate and period ("48 kHz · 256 smp · Internal"); idle, the
-/// sound server's rate; the USB backend sets the rate itself. With the kernel
-/// driver and no PipeWire there is no rate to report truthfully (the model's
-/// own field is a constant), so only the clock source shows.
+/// The device card's third line: clock source, sample rate and buffer.
+/// While a stream is open, use the card's own rate and period. Idle, fall
+/// back to the sound server's graph rate/quantum, then the model rate.
 pub(crate) fn clock_line(state: &TuxMix, clock_source: &str) -> String {
-    use crate::app::rate_label;
-    // The card's own playback stream wins while it plays: its period is the
-    // card's real buffer. With nothing playing there is no real period to
-    // show (the graph's quantum is not it: the card opens at what its
-    // clients ask, 256 by default), so the line gives the rate only.
-    if let Some(card) = state.card_stream {
-        return format!(
-            "{} \u{00b7} {} smp \u{00b7} {clock_source}",
-            rate_label(card.rate),
-            card.period
-        );
-    }
-    match state.engine {
-        Some(e) => format!("{} \u{00b7} {clock_source}", rate_label(e.effective_rate())),
-        None if state.device.rate_follows_sound_server() => clock_source.to_string(),
-        None => format!(
-            "{} \u{00b7} {clock_source}",
-            rate_label(state.device.settings().sample_rate)
-        ),
+    let rate = state
+        .card_stream
+        .map(|c| c.rate)
+        .or_else(|| state.engine.map(|e| e.effective_rate()))
+        .or_else(|| {
+            let r = state.device.settings().sample_rate;
+            (r > 0).then_some(r)
+        });
+    let buffer = state
+        .card_stream
+        .map(|c| c.period)
+        .or_else(|| state.engine.map(|e| e.effective_quantum()))
+        .filter(|q| *q > 0);
+    match (rate, buffer) {
+        (Some(rate), Some(buffer)) => {
+            format!("{clock_source}, {}, {buffer}", crate::app::rate_label(rate))
+        }
+        (Some(rate), None) => format!("{clock_source}, {}", crate::app::rate_label(rate)),
+        (None, Some(buffer)) => format!("{clock_source}, {buffer}"),
+        (None, None) => clock_source.to_string(),
     }
 }
 
@@ -603,7 +618,7 @@ fn msf_row(state: &TuxMix, scale: f32) -> Element<'_, Message> {
             .padding(theme::SPACE_SM * scale)
             .width(Length::Fill)
     };
-    let mut r = row![
+    let r = row![
         hint(
             cell("M")
                 .style(theme::armed_toggle_button(
@@ -644,19 +659,27 @@ fn msf_row(state: &TuxMix, scale: f32) -> Element<'_, Message> {
     ]
     .spacing(theme::SPACE_TIGHT * scale)
     .width(Length::Fill);
-    if state.device.protocol_features() {
-        r = r.push(hint(
-            cell("DIM")
-                .style(theme::toggle_button(
-                    state.device.settings().dim,
-                    theme::ACCENT,
-                ))
-                .on_press(Message::DimToggle),
-            "Dim the phones output (also the front-panel DIM button)",
-            scale,
-        ));
-    }
     r.into()
+}
+
+/// The FX switch on its own line under the masters, where TotalMix keeps
+/// it: the Reverb/Echo column slides out between the mixer and this panel,
+/// and the button lights while it is there.
+fn fx_row(state: &TuxMix, scale: f32) -> Element<'_, Message> {
+    let open = state.show_fx_panel;
+    hint(
+        button(text("FX").size(theme::TEXT_SM * scale).center())
+            .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
+            .style(theme::toggle_button(open, theme::ACCENT))
+            .on_press(Message::ToggleFxPanel),
+        if open {
+            "Hide the Reverb and Echo panel"
+        } else {
+            "Show the Reverb and Echo panel"
+        },
+        scale,
+    )
+    .into()
 }
 
 /// A short tooltip under a sidebar control, in the same chip as the panel
@@ -937,11 +960,7 @@ fn options_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
         // a 210 px column "3 rows" / "2 rows" wrapped onto two lines.
         Some("mixer rows"),
         segmented(
-            &[
-                ("auto", RowMode::Auto),
-                ("3", RowMode::Three),
-                ("2", RowMode::Two),
-            ]
+            &[("3", RowMode::Three), ("2", RowMode::Two)]
             .map(|(label, mode)| {
                 (
                     label,

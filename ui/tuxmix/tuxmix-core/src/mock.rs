@@ -7,13 +7,19 @@
 //! ```bash
 //! cargo run -p tuxmix-gui -- --mock
 //! ```
+//! `--mock-ucx` simulates a Fireface UCX instead: same in-memory device, but
+//! with the UCX's topology and capability set, so the EQ, dynamics, FX bus
+//! and Control Room are all present without the hardware.
 
 use rand::Rng;
 
 use crate::channel::*;
 use crate::device::{DeviceSettings, RmeDevice};
 use crate::error::Error;
+use crate::capabilities::DeviceCapabilities;
 use crate::profiles::babyface_pro::PROFILE;
+use crate::profiles::uc::PROFILE as UC_PROFILE;
+use crate::profiles::ucx::PROFILE as UCX_PROFILE;
 use crate::scene::Scene;
 
 // ── Main struct ─────────────────────────────────────────────────
@@ -27,6 +33,12 @@ use crate::scene::Scene;
 /// the way the old hand-duplicated const tables did.
 pub struct MockBabyfacePro {
     model_name: String,
+    /// Topology this mock was built from: the Babyface Pro FS by default,
+    /// or the Fireface UCX for `--mock-ucx`.
+    profile: &'static crate::profile::DeviceProfile,
+    /// The unit's capability set, so the gated UI (EQ, dynamics, FX, the
+    /// Control Room) can be exercised without the hardware.
+    capabilities: DeviceCapabilities,
     inputs: Vec<InputChannel>,
     playbacks: Vec<PlaybackChannel>,
     outputs: Vec<OutputChannel>,
@@ -46,7 +58,177 @@ pub struct MockBabyfacePro {
     connected: bool,
 }
 
+/// The UCX's own capability set, taken from the model spec the real
+/// device uses so the two cannot drift.
+fn ucx_capabilities() -> DeviceCapabilities {
+    crate::fireface::models::UCX.capabilities
+}
+
+/// The Fireface UC's own capability set, from the model spec.
+fn uc_capabilities() -> DeviceCapabilities {
+    crate::fireface::models::UC.capabilities
+}
+
+/// The Babyface Pro FS set: what the trait's derived `capabilities()`
+/// produced for this mock before it took a model argument.
+fn babyface_capabilities() -> DeviceCapabilities {
+    DeviceCapabilities {
+        protocol_features: true,
+        eq: true,
+        low_cut: true,
+        loopback: true,
+        phase: true,
+        phase_without_eq: false,
+        output_balance: false,
+        stereo_split: true,
+        matrix_cells: false,
+        class_compliant: false,
+        input_phantom: true,
+        input_pad: true,
+        input_level: false,
+        input_autoset: false,
+        dynamics: false,
+        fx: false,
+        pitch: true,
+        width: true,
+        ms_proc: true,
+        an12: true,
+        input_link: true,
+        eq_for_record: true,
+        optical_out: true,
+    }
+}
+
 impl MockBabyfacePro {
+    /// Whether this in-memory device is the UCX rather than the Babyface.
+    pub fn is_ucx(&self) -> bool {
+        std::ptr::eq(self.profile, &UCX_PROFILE)
+    }
+
+    /// Whether this in-memory device is the Fireface UC.
+    pub fn is_uc(&self) -> bool {
+        std::ptr::eq(self.profile, &UC_PROFILE)
+    }
+
+    /// The Fireface UCX: same in-memory device, UCX topology and
+    /// capabilities, so the FX panel, the Control Room and the UCX-only
+    /// Settings rows can be used without the hardware.
+    pub fn open_ucx() -> Result<Self, Error> {
+        Self::open_with(&UCX_PROFILE, "Fireface UCX", ucx_capabilities())
+    }
+
+    /// The Fireface UC: the same in-memory device with the UC's topology and
+    /// gated feature set (no EQ, dynamics or FX; the UC's Settings group).
+    pub fn open_uc() -> Result<Self, Error> {
+        Self::open_with(&UC_PROFILE, "Fireface UC", uc_capabilities())
+    }
+
+    fn open_with(
+        profile: &'static crate::profile::DeviceProfile,
+        model_name: &str,
+        capabilities: DeviceCapabilities,
+    ) -> Result<Self, Error> {
+        // Same topology as the real device, plus a mock-only demo
+        // default: the first two (Mic) inputs start with phantom power
+        // on, so the UI has something interesting to show immediately.
+        let mut inputs = profile.build_inputs();
+        for (i, ch) in inputs.iter_mut().enumerate() {
+            ch.phantom = i < 2;
+            // Ranges matching the kernel driver's controls (2026-08-26:
+            // AN1/2 mic gain 0-65 dB, AN3/4 instrument 0-9 dB — the
+            // instrument raw is dB×2 = 0-18, cap_gain34.pcap).
+            ch.gain_max = match ch.channel_type {
+                ChannelType::Mic => Some(65),
+                ChannelType::Instrument => Some(9),
+                _ => None,
+            };
+            ch.gain = ch.gain_max.map(|_| 0);
+            // The 4 analog inputs have a hardware EQ strip (see
+            // `InputChannel::eq`'s doc comment and `babyface.rs`'s
+            // `eq_strip_name`, same `idx < 4` gate) — every other input
+            // type stays `None`.
+            ch.eq = (i < 4).then(InputEq::default);
+        }
+
+        // A unit with the DSP (the UCX) carries EQ/low cut and dynamics on
+        // every hardware input and output, matching `Fireface::open`.
+        if capabilities.dynamics {
+            for ch in inputs.iter_mut() {
+                ch.eq = Some(InputEq::default());
+                ch.dynamics = Some(Dynamics::default());
+            }
+        }
+        let mut outputs = profile.build_outputs();
+        if capabilities.dynamics {
+            for ch in outputs.iter_mut() {
+                ch.eq = Some(InputEq::default());
+                ch.dynamics = Some(Dynamics::default());
+            }
+        }
+
+        let fx = capabilities.fx;
+        Ok(Self {
+            model_name: format!("{model_name} (mock)"),
+            profile,
+            capabilities,
+            inputs,
+            playbacks: profile.build_playbacks(),
+            outputs,
+            settings: DeviceSettings {
+                clock_source: "Internal".into(),
+                // Mocked from the real Babyface Pro FS's own enum items
+                // (see `babyface.rs::attach_mixer_elements`), so the
+                // Quick Control clock picker has something real to show
+                // in --mock too.
+                clock_sources: vec!["Internal".into(), "AutoSync".into()],
+                spdif_optical: false,
+                spdif_emphasis: false,
+                spdif_professional: false,
+                spdif_enabled: false,
+                pitch_percent: 0.0,
+                ms_proc: false,
+                an12: false,
+                eq_for_record: false,
+                optical_out_spdif: false,
+                dim: false,
+                speaker_b: false,
+                main_out: None,
+                main_b_out: None,
+                mono: false,
+                mute_fx: false,
+                fx_send_db: None,
+                // A unit with an FX bus starts with both effects in the
+                // block's default state, the way the real one does.
+                reverb: fx.then(crate::channel::Reverb::default),
+                echo: fx.then(crate::channel::Echo::default),
+                width: 0.0,
+                sample_rate: 48_000,
+                line_in_ref: 0,
+                line_in_ref_58: 0,
+                line_out_ref: 2,
+                phones_ref: 1,
+                word_clock_single_speed: false,
+                word_clock_termination: false,
+                input_link: true,
+                output_link: Vec::new(),
+                input_pair_link: Vec::new(),
+            },
+            input_meters: vec![0.0; profile.input_count()],
+            playback_meters: vec![0.0; profile.output_pair_count() * 2],
+            tick: 0,
+            // `TUXMIX_MOCK_CC=1` (or any value) turns the mock into the
+            // class-compliant personality's feature set, which is how the
+            // gated UI is screenshotted without unplugging anything.
+            // A model without the protocol-only feature set (the UC) keeps
+            // answering that way; `TUXMIX_MOCK_CC` only narrows the others.
+            protocol_features: capabilities.protocol_features
+                && std::env::var_os("TUXMIX_MOCK_CC").is_none(),
+            // `TUXMIX_MOCK_DISCONNECT=1` (or any value) is how the
+            // disconnected chip is screenshotted without unplugging
+            // anything.
+            connected: std::env::var_os("TUXMIX_MOCK_DISCONNECT").is_none(),
+        })
+    }
     /// Point this mock at the class-compliant personality's feature set, or
     /// back at the full one. See the field's own comment.
     pub fn set_protocol_features(&mut self, on: bool) {
@@ -138,11 +320,31 @@ impl RmeDevice for MockBabyfacePro {
     }
 
     fn output_pair_count(&self) -> usize {
-        PROFILE.output_pair_count()
+        self.profile.output_pair_count()
     }
 
     fn protocol_features(&self) -> bool {
         self.protocol_features
+    }
+
+    fn capabilities(&self) -> crate::capabilities::DeviceCapabilities {
+        let mut caps = self.capabilities;
+        // The class-compliant switch overrides the model's own answer, so
+        // `TUXMIX_MOCK_CC` still hides the protocol-only controls.
+        caps.protocol_features = self.protocol_features;
+        caps.class_compliant = !self.protocol_features;
+        if !self.protocol_features {
+            caps.eq = false;
+            caps.low_cut = false;
+            caps.loopback = false;
+            caps.phase = false;
+            caps.stereo_split = false;
+        }
+        caps
+    }
+
+    fn low_cut_supported(&self) -> bool {
+        true
     }
 
     fn is_connected(&self) -> bool {
@@ -150,70 +352,9 @@ impl RmeDevice for MockBabyfacePro {
     }
 
     fn open() -> Result<Self, Error> {
-        // Same topology as the real device, plus a mock-only demo
-        // default: the first two (Mic) inputs start with phantom power
-        // on, so the UI has something interesting to show immediately.
-        let mut inputs = PROFILE.build_inputs();
-        for (i, ch) in inputs.iter_mut().enumerate() {
-            ch.phantom = i < 2;
-            // Ranges matching the kernel driver's controls (2026-08-26:
-            // AN1/2 mic gain 0-65 dB, AN3/4 instrument 0-9 dB — the
-            // instrument raw is dB×2 = 0-18, cap_gain34.pcap).
-            ch.gain_max = match ch.channel_type {
-                ChannelType::Mic => Some(65),
-                ChannelType::Instrument => Some(9),
-                _ => None,
-            };
-            ch.gain = ch.gain_max.map(|_| 0);
-            // The 4 analog inputs have a hardware EQ strip (see
-            // `InputChannel::eq`'s doc comment and `babyface.rs`'s
-            // `eq_strip_name`, same `idx < 4` gate) — every other input
-            // type stays `None`.
-            ch.eq = (i < 4).then(InputEq::default);
-        }
-
-        Ok(Self {
-            model_name: format!("{} (mock)", PROFILE.model_name),
-            inputs,
-            playbacks: PROFILE.build_playbacks(),
-            outputs: PROFILE.build_outputs(),
-            settings: DeviceSettings {
-                clock_source: "Internal".into(),
-                // Mocked from the real Babyface Pro FS's own enum items
-                // (see `babyface.rs::attach_mixer_elements`), so the
-                // Quick Control clock picker has something real to show
-                // in --mock too.
-                clock_sources: vec!["Internal".into(), "AutoSync".into()],
-                spdif_optical: false,
-                spdif_emphasis: false,
-                spdif_professional: false,
-                spdif_enabled: false,
-                pitch_percent: 0.0,
-                ms_proc: false,
-                an12: false,
-                eq_for_record: false,
-                optical_out_spdif: false,
-                dim: false,
-                fx_send_db: None,
-                width: 0.0,
-                sample_rate: 48_000,
-                input_link: true,
-                output_link: Vec::new(),
-                input_pair_link: Vec::new(),
-            },
-            input_meters: vec![0.0; PROFILE.input_count()],
-            playback_meters: vec![0.0; PROFILE.output_pair_count() * 2],
-            tick: 0,
-            // `TUXMIX_MOCK_CC=1` (or any value) turns the mock into the
-            // class-compliant personality's feature set, which is how the
-            // gated UI is screenshotted without unplugging anything.
-            protocol_features: std::env::var_os("TUXMIX_MOCK_CC").is_none(),
-            // `TUXMIX_MOCK_DISCONNECT=1` (or any value) is how the
-            // disconnected chip is screenshotted without unplugging
-            // anything.
-            connected: std::env::var_os("TUXMIX_MOCK_DISCONNECT").is_none(),
-        })
+        Self::open_with(&PROFILE, PROFILE.model_name, babyface_capabilities())
     }
+
 
     fn inputs(&self) -> &[InputChannel] {
         &self.inputs
@@ -525,6 +666,31 @@ impl RmeDevice for MockBabyfacePro {
         Ok(())
     }
 
+    fn set_fx_return(&mut self, output: usize, db: f32) -> Result<(), Error> {
+        if let Some(ch) = self.outputs.get_mut(output) {
+            ch.fx_return_db = db.clamp(-65.0, 6.0);
+        }
+        Ok(())
+    }
+
+    fn set_channel_fx_send(&mut self, channel: ChannelId, db: f32) -> Result<(), Error> {
+        let db = db.clamp(-65.0, 0.0);
+        match channel {
+            ChannelId::Input(idx) => {
+                if let Some(ch) = self.inputs.get_mut(idx) {
+                    ch.fx_send_db = db;
+                }
+            }
+            ChannelId::Playback(idx) => {
+                if let Some(ch) = self.playbacks.get_mut(idx) {
+                    ch.fx_send_db = db;
+                }
+            }
+            ChannelId::Output(_) => {}
+        }
+        Ok(())
+    }
+
     fn set_stereo_split(&mut self, pb: usize, split: bool) -> Result<(), Error> {
         if pb >= self.playbacks.len() {
             return Err(Error::InvalidChannel(format!("Playback {pb}")));
@@ -636,6 +802,18 @@ impl RmeDevice for MockBabyfacePro {
         Ok(())
     }
 
+    fn set_eq_low_cut_enabled(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        if idx >= 4 {
+            return Err(Error::InvalidChannel(format!("Input {idx} has no EQ")));
+        }
+        let inp = self
+            .inputs
+            .get_mut(idx)
+            .ok_or_else(|| Error::InvalidChannel(format!("Input {idx}")))?;
+        inp.eq.get_or_insert_with(InputEq::default).low_cut_enabled = on;
+        Ok(())
+    }
+
     fn set_eq_low_cut_freq(&mut self, idx: usize, freq_hz: u16) -> Result<(), Error> {
         if idx >= 4 {
             return Err(Error::InvalidChannel(format!("Input {idx} has no EQ")));
@@ -680,6 +858,7 @@ impl RmeDevice for MockBabyfacePro {
         Scene {
             name: "Untitled".into(),
             model: self.model_name.clone(),
+            matrix_overrides: Vec::new(),
             inputs: self.inputs.clone(),
             playbacks: self.playbacks.clone(),
             outputs: self.outputs.clone(),
@@ -713,6 +892,35 @@ mod tests {
         let dev = MockBabyfacePro::open().unwrap();
         assert_eq!(dev.inputs().len(), 12);
         assert_eq!(dev.playbacks().len(), 12);
+    }
+
+    #[test]
+    fn the_ucx_mock_carries_eq_and_dynamics_on_every_channel() {
+        let dev = MockBabyfacePro::open_ucx().unwrap();
+        assert_eq!(dev.inputs().len(), 18);
+        assert!(dev.inputs().iter().all(|c| c.dynamics.is_some()));
+        assert!(dev.inputs().iter().all(|c| c.eq.is_some()));
+        assert!(dev.outputs().iter().all(|c| c.dynamics.is_some()));
+        assert!(dev.outputs().iter().all(|c| c.eq.is_some()));
+        assert!(dev.capabilities().fx);
+        assert!(dev.capabilities().dynamics);
+        // The Babyface mock keeps its four analog EQ strips and no dynamics.
+        let bf = MockBabyfacePro::open().unwrap();
+        assert!(bf.inputs().iter().all(|c| c.dynamics.is_none()));
+        assert_eq!(bf.inputs().iter().filter(|c| c.eq.is_some()).count(), 4);
+
+        // The UC mock answers with the UC's gated feature set, so the UI it
+        // shows is the one the real UC gets.
+        let uc = MockBabyfacePro::open_uc().unwrap();
+        assert!(uc.is_uc() && !uc.is_ucx());
+        assert!(!uc.capabilities().protocol_features);
+        assert!(!uc.capabilities().eq);
+        assert!(!uc.capabilities().low_cut);
+        assert!(!uc.capabilities().dynamics);
+        assert!(!uc.capabilities().fx);
+        assert!(uc.inputs().iter().all(|c| c.dynamics.is_none()));
+        assert!(uc.outputs().iter().all(|c| c.dynamics.is_none()));
+        assert_eq!(uc.inputs().len(), 18);
     }
 
     #[test]
@@ -927,6 +1135,52 @@ mod tests {
         dev.set_input_volume(0, 1, 0, 0.25).unwrap();
         assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.5).abs() < 1e-6);
         assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_input_link_centers_pan_and_split_uses_hard_sides() {
+        let mut dev = MockBabyfacePro::open().unwrap();
+        dev.set_input_pair_linked(0, false).unwrap();
+        assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), -100);
+        assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), 100);
+
+        dev.set_pan(ChannelId::Input(0), 0, -35).unwrap();
+        dev.set_pan(ChannelId::Input(1), 0, 40).unwrap();
+        dev.set_input_volume(0, 0, 0, 0.3).unwrap();
+        dev.set_input_volume(0, 1, 0, 0.7).unwrap();
+        dev.set_mute(ChannelId::Input(0), true).unwrap();
+        dev.set_mute(ChannelId::Input(1), false).unwrap();
+
+        dev.set_input_pair_linked(0, true).unwrap();
+        assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), 0);
+        assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), 0);
+        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.3).abs() < 1e-6);
+        assert!(dev.mute(ChannelId::Input(1)).unwrap());
+    }
+
+    #[test]
+    fn test_input_link_keeps_phase_l_and_phase_r_independent() {
+        let mut dev = MockBabyfacePro::open().unwrap();
+        dev.set_input_pair_linked(0, false).unwrap();
+        dev.set_phase(0, true).unwrap();
+        dev.set_phase(1, false).unwrap();
+        dev.set_input_pair_linked(0, true).unwrap();
+        assert!(dev.inputs()[0].phase);
+        assert!(!dev.inputs()[1].phase);
+    }
+
+    #[test]
+    fn test_playback_link_centers_pan_and_uses_the_left_channel_as_reference() {
+        let mut dev = MockBabyfacePro::open().unwrap();
+        dev.set_playback_linked(0, false).unwrap();
+        dev.set_pan(ChannelId::Playback(0), 0, -40).unwrap();
+        dev.set_pan(ChannelId::Playback(1), 0, 60).unwrap();
+        dev.set_playback_volume(0, 0, 0, 0.3).unwrap();
+        dev.set_playback_volume(0, 1, 0, 0.7).unwrap();
+        dev.set_playback_linked(0, true).unwrap();
+        assert_eq!(dev.pan(ChannelId::Playback(0), 0).unwrap(), 0);
+        assert_eq!(dev.pan(ChannelId::Playback(1), 0).unwrap(), 0);
+        assert!((dev.volume(ChannelId::Playback(1), 0).unwrap() - 0.3).abs() < 1e-6);
     }
 
     #[test]

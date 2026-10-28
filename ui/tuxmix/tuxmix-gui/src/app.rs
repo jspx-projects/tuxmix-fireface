@@ -5,31 +5,34 @@ use iced::widget::{
     text,
 };
 use iced::{window, Color, Element, Length, Subscription, Task};
+use rosc::OscType;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use tuxmix_core::channel::EqBandType;
 #[cfg(feature = "alsa")]
-use tuxmix_core::BabyfacePro;
+use tuxmix_core::{BabyfacePro, Fireface, FirefaceModel, UcxAlsa};
 use tuxmix_core::{
-    BabyfaceProUsb, ChannelId, ChannelType, MockBabyfacePro, RmeDevice, Scene, Sensitivity,
+    BabyfaceProUsb, ChannelId, ChannelType, Dynamics, Echo, InputLevel, MockBabyfacePro, RmeDevice,
+    Reverb, Scene, Sensitivity,
 };
 
 use crate::about;
 use crate::matrix;
 use crate::osc::{self, OscCommand, OscConfig, OscOutbound};
+use crate::prefs::SyncDirection;
 use tuxmix_core::pw_clock::{self, CardStream, PwClock};
 use tuxmix_core::pw_meter;
 use crate::scenes::{load_scene_file, save_scene_file};
 use crate::sidebar::{self, Group};
+use crate::sync_dialog;
 use crate::theme;
+use crate::widgets::dynamics_plot::dynamics_plot;
 use crate::widgets::eq_plot::{eq_plot, EqPlotActions};
 use crate::widgets::fader;
 use crate::widgets::knob::{knob, Knob};
 use crate::widgets::strip::{self, hint};
-
-pub const OUT_LABELS: [&str; 6] = ["AN1/2", "PH3/4", "AS1/2", "A3/A4", "A5/A6", "A7/A8"];
 
 /// Strips redundant prefixes baked into a channel's stored name before it's
 /// shown in a strip header — "PCM " for playback channels, "OUT " for
@@ -52,6 +55,11 @@ pub fn short_label(name: &str) -> &str {
 /// `"{left}/{right}"` unmodified if `right` doesn't end in digits (not
 /// expected for this device's own channel names, but harmless).
 pub(crate) fn pair_bus_label(left: &str, right: &str) -> String {
+    // A digital pair has one RME name, not L/R suffixes: both channels are
+    // called "SPDIF", so show that once rather than "SPDIF/SPDIF".
+    if left == right {
+        return left.to_string();
+    }
     let right_num: String = right.chars().skip_while(|c| !c.is_ascii_digit()).collect();
     if right_num.is_empty() {
         format!("{left}/{right}")
@@ -79,7 +87,6 @@ pub fn type_tag(t: ChannelType) -> (&'static str, iced::Color) {
 /// `type_tag`) — kept distinct from the input-type palette above so PB/OUT
 /// don't just blend into the secondary-text gray everything else uses.
 pub const PB_TAG: iced::Color = iced::Color::from_rgb8(0x5f, 0xb3, 0xa8);
-pub const OUT_TAG: iced::Color = iced::Color::from_rgb8(0x7f, 0xbf, 0x8a);
 
 pub fn parse_db_input(s: &str) -> Option<f32> {
     let raw = s.trim().to_lowercase();
@@ -100,11 +107,183 @@ pub fn db_text(vol: f32) -> String {
     }
 }
 
+/// Compact frequency label for knob faces: 1000 -> "1k",
+/// 1500 -> "1.5k", 120 -> "120".  The row label already says Hz.
+fn freq_text(hz: u16) -> String {
+    if hz >= 1_000 {
+        let k = hz as f32 / 1_000.0;
+        if (k - k.round()).abs() < 0.05 {
+            format!("{}k", k.round() as u32)
+        } else {
+            format!("{k:.1}k")
+        }
+    } else {
+        hz.to_string()
+    }
+}
+
 // ── Device enum ──────────────────────────────────────────────────
+
+
+/// A user-selectable mixer backend/device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceKind {
+    /// First Fireface visible through the kernel hwdep ABI (UC or UCX).
+    Fireface,
+    Ucx,
+    Uc,
+    Babyface,
+    /// The in-memory device, as a Babyface Pro FS.
+    Mock,
+    /// The in-memory device, as a Fireface UCX: EQ, dynamics, FX and the
+    /// Control Room, all without hardware.
+    MockUcx,
+    /// The in-memory device, as a Fireface UC: the UC's gated feature set.
+    MockUc,
+}
+
+/// Choose the startup backend from the devices that are actually present.
+///
+/// Policy:
+/// - an explicitly preferred device wins while it is present;
+/// - otherwise, if exactly one real device is present, select it — even when
+///   the saved preference names a different model;
+/// - with several devices and no matching preference, keep the auto entry;
+/// - an explicit Simulation preference is never overridden.
+#[cfg(test)]
+fn choose_startup_kind(
+    available: &[DeviceKind],
+    preferred: Option<DeviceKind>,
+) -> Option<DeviceKind> {
+    if matches!(
+        preferred,
+        Some(DeviceKind::Mock) | Some(DeviceKind::MockUcx) | Some(DeviceKind::MockUc)
+    ) {
+        return preferred;
+    }
+    if let Some(p) = preferred {
+        if available.is_empty() || available.contains(&p) {
+            return Some(p);
+        }
+    }
+    if available.len() == 1 {
+        return available.first().copied();
+    }
+    if preferred == Some(DeviceKind::Fireface) {
+        return Some(DeviceKind::Fireface);
+    }
+    available.first().copied().or(preferred)
+}
+
+/// One selectable physical device: a model plus the serial of the unit.
+/// The serial is what survives a card-index change or a USB reconnect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceTarget {
+    pub kind: DeviceKind,
+    pub serial: Option<String>,
+}
+
+impl DeviceTarget {
+    pub fn kind_only(kind: DeviceKind) -> Self {
+        Self { kind, serial: None }
+    }
+
+    pub fn from_identity(identity: tuxmix_core::FirefaceIdentity) -> Self {
+        let kind = match identity.model {
+            tuxmix_core::FirefaceModel::Uc => DeviceKind::Uc,
+            tuxmix_core::FirefaceModel::Ucx => DeviceKind::Ucx,
+        };
+        Self {
+            kind,
+            serial: (!identity.serial.is_empty()).then_some(identity.serial),
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match &self.serial {
+            Some(serial) => format!("{} ({serial})", self.kind.label()),
+            None => self.kind.label().to_string(),
+        }
+    }
+}
+
+/// Choose a physical unit, preferring the remembered serial over the
+/// model-wide kind.  A serial survives a card-index change and a USB
+/// reconnect; the kind is only a fallback for an old preference file.
+fn choose_startup_target(
+    available: &[DeviceTarget],
+    preferred: Option<DeviceKind>,
+    preferred_serial: Option<&str>,
+) -> Option<DeviceTarget> {
+    if let Some(serial) = preferred_serial {
+        if let Some(target) = available.iter().find(|t| t.serial.as_deref() == Some(serial)) {
+            return Some(target.clone());
+        }
+    }
+    if let Some(kind) = preferred {
+        if !matches!(
+            kind,
+            DeviceKind::Mock | DeviceKind::MockUcx | DeviceKind::MockUc
+        ) {
+            if let Some(target) = available.iter().find(|t| t.kind == kind) {
+                return Some(target.clone());
+            }
+        }
+    }
+    if available.len() == 1 {
+        return available.first().cloned();
+    }
+    if preferred == Some(DeviceKind::Fireface) {
+        return available
+            .iter()
+            .find(|t| t.kind == DeviceKind::Fireface)
+            .cloned()
+            .or_else(|| available.first().cloned());
+    }
+    available.first().cloned().or_else(|| preferred.map(DeviceTarget::kind_only))
+}
+
+impl DeviceKind {
+    pub const ALL: [DeviceKind; 7] = [
+        DeviceKind::Fireface,
+        DeviceKind::Ucx,
+        DeviceKind::Uc,
+        DeviceKind::Babyface,
+        DeviceKind::Mock,
+        DeviceKind::MockUcx,
+        DeviceKind::MockUc,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DeviceKind::Fireface => "Fireface (auto)",
+            DeviceKind::Ucx => "Fireface UCX",
+            DeviceKind::Uc => "Fireface UC",
+            DeviceKind::Babyface => "Babyface Pro FS",
+            DeviceKind::Mock => "Babyface Pro FS (simulated)",
+            DeviceKind::MockUcx => "Fireface UCX (simulated)",
+            DeviceKind::MockUc => "Fireface UC (simulated)",
+        }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.label() == label)
+    }
+}
 
 pub enum DeviceHandle {
     #[cfg(feature = "alsa")]
     Real(BabyfacePro),
+    #[cfg(feature = "alsa")]
+    Ucx(UcxAlsa),
+    /// The Fireface UC: same ALSA control surface as the UCX, ISO/IF5
+    /// streaming, no EQ/FX.
+    #[cfg(feature = "alsa")]
+    Uc(UcxAlsa),
+    /// Fireface UC/UCX through the kernel hwdep transport.  This is the
+    /// refactored path: the kernel owns USB/PCM, TuxMix owns the model.
+    #[cfg(feature = "alsa")]
+    Fireface(Fireface),
     Mock(MockBabyfacePro),
     /// The proprietary USB backend (the TotalMix protocol). On Linux
     /// with the device in proprietary mode this is the path that
@@ -132,6 +311,17 @@ impl DeviceHandle {
             dev.set_connected(on);
         }
     }
+
+    /// Ignore queued/early UC front-panel output events during the connect
+    /// window.  Only the hwdep Fireface path needs this; the USB backend has
+    /// no such event stream.
+    pub fn suppress_front_panel_for(&mut self, duration: Duration) {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(dev) = self {
+            dev.suppress_front_panel_for(duration);
+        }
+        let _ = duration;
+    }
 }
 
 macro_rules! delegate {
@@ -140,12 +330,24 @@ macro_rules! delegate {
         DeviceHandle::Usb(d) => d.$method($($arg),*),
         #[cfg(feature = "alsa")]
         DeviceHandle::Real(d) => d.$method($($arg),*),
+        #[cfg(feature = "alsa")]
+        DeviceHandle::Ucx(d) => d.$method($($arg),*),
+        #[cfg(feature = "alsa")]
+        DeviceHandle::Uc(d) => d.$method($($arg),*),
+        #[cfg(feature = "alsa")]
+        DeviceHandle::Fireface(d) => d.$method($($arg),*),
     } };
     ($self:expr, $method:ident) => { match $self {
         DeviceHandle::Mock(d) => d.$method(),
         DeviceHandle::Usb(d) => d.$method(),
         #[cfg(feature = "alsa")]
         DeviceHandle::Real(d) => d.$method(),
+        #[cfg(feature = "alsa")]
+        DeviceHandle::Ucx(d) => d.$method(),
+        #[cfg(feature = "alsa")]
+        DeviceHandle::Uc(d) => d.$method(),
+        #[cfg(feature = "alsa")]
+        DeviceHandle::Fireface(d) => d.$method(),
     } };
 }
 
@@ -153,14 +355,38 @@ impl RmeDevice for DeviceHandle {
     fn model_name(&self) -> &str {
         delegate!(self, model_name)
     }
+    fn capabilities(&self) -> tuxmix_core::DeviceCapabilities {
+        delegate!(self, capabilities)
+    }
     fn protocol_features(&self) -> bool {
         delegate!(self, protocol_features)
+    }
+    fn loopback_supported(&self) -> bool {
+        delegate!(self, loopback_supported)
+    }
+    fn phase_supported(&self) -> bool {
+        delegate!(self, phase_supported)
+    }
+    fn output_balance_supported(&self) -> bool {
+        delegate!(self, output_balance_supported)
+    }
+    fn stereo_split_supported(&self) -> bool {
+        delegate!(self, stereo_split_supported)
+    }
+    fn class_compliant(&self) -> bool {
+        delegate!(self, class_compliant)
     }
     fn is_connected(&self) -> bool {
         delegate!(self, is_connected)
     }
     fn output_pair_count(&self) -> usize {
         delegate!(self, output_pair_count)
+    }
+    fn output_display_order(&self) -> Vec<usize> {
+        delegate!(self, output_display_order)
+    }
+    fn matrix_uses_display_order(&self) -> bool {
+        delegate!(self, matrix_uses_display_order)
     }
     fn open() -> Result<Self, tuxmix_core::Error> {
         unreachable!()
@@ -188,6 +414,13 @@ impl RmeDevice for DeviceHandle {
     }
     fn settings_mut(&mut self) -> &mut tuxmix_core::DeviceSettings {
         delegate!(self, settings_mut)
+    }
+    /// The UC defers its input meter tap until the startup scene is latched
+    /// (`TUXMIX_DEFER_METER_TAP`).  The trait default is a no-op, so without
+    /// this forward the Fireface backend's tap is never started and the AN5
+    /// meter stays flat even though the hardware capture is live.
+    fn begin_metering(&mut self) {
+        delegate!(self, begin_metering)
     }
     fn set_volume(&mut self, ch: ChannelId, out: usize, v: f32) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_volume(ch, out, v))
@@ -219,8 +452,51 @@ impl RmeDevice for DeviceHandle {
     fn set_pad(&mut self, idx: usize, on: bool) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_pad(idx, on))
     }
+    fn set_instrument(&mut self, idx: usize, on: bool) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_instrument(idx, on))
+    }
     fn set_gain(&mut self, idx: usize, gain: u32) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_gain(idx, gain))
+    }
+    fn set_input_level(
+        &mut self,
+        idx: usize,
+        level: tuxmix_core::InputLevel,
+    ) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_input_level(idx, level))
+    }
+    fn set_autoset(&mut self, idx: usize, on: bool) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_autoset(idx, on))
+    }
+    fn set_dynamics(
+        &mut self,
+        ch: ChannelId,
+        dynamics: &tuxmix_core::Dynamics,
+    ) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_dynamics(ch, dynamics))
+    }
+    fn set_reverb(&mut self, reverb: &tuxmix_core::Reverb) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_reverb(reverb))
+    }
+    fn set_echo(&mut self, echo: &tuxmix_core::Echo) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_echo(echo))
+    }
+    fn set_fx_return(&mut self, output: usize, db: f32) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_fx_return(output, db))
+    }
+    fn set_input_pair_linked(
+        &mut self,
+        pair: usize,
+        linked: bool,
+    ) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_input_pair_linked(pair, linked))
+    }
+    fn set_output_linked(
+        &mut self,
+        pair: usize,
+        linked: bool,
+    ) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_output_linked(pair, linked))
     }
     fn set_pitch(&mut self, pitch_percent: f32) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_pitch(pitch_percent))
@@ -249,6 +525,22 @@ impl RmeDevice for DeviceHandle {
     }
     fn set_dim(&mut self, on: bool) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_dim(on))
+    }
+    fn set_speaker_b(&mut self, on: bool) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_speaker_b(on))
+    }
+    fn set_main_out(&mut self, pair: Option<usize>) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_main_out(pair))
+    }
+    fn set_mute_fx(&mut self, on: bool) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_mute_fx(on))
+    }
+    fn set_channel_fx_send(
+        &mut self,
+        channel: ChannelId,
+        db: f32,
+    ) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_channel_fx_send(channel, db))
     }
     fn set_eq_for_record(&mut self, on: bool) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_eq_for_record(on))
@@ -310,6 +602,9 @@ impl RmeDevice for DeviceHandle {
     ) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_eq_band_gain(idx, band, gain_db))
     }
+    fn set_eq_low_cut_enabled(&mut self, idx: usize, on: bool) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_eq_low_cut_enabled(idx, on))
+    }
     fn set_eq_low_cut_freq(&mut self, idx: usize, freq_hz: u16) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_eq_low_cut_freq(idx, freq_hz))
     }
@@ -319,6 +614,13 @@ impl RmeDevice for DeviceHandle {
         slope_db_oct: u8,
     ) -> Result<(), tuxmix_core::Error> {
         delegate!(self, set_eq_low_cut_slope(idx, slope_db_oct))
+    }
+    fn set_output_eq(
+        &mut self,
+        idx: usize,
+        eq: &tuxmix_core::channel::InputEq,
+    ) -> Result<(), tuxmix_core::Error> {
+        delegate!(self, set_output_eq(idx, eq))
     }
     fn capture_scene(&self) -> Scene {
         delegate!(self, capture_scene)
@@ -347,7 +649,45 @@ impl DeviceHandle {
         let want_usb = !matches!(backend, Some("alsa"));
 
         #[cfg(feature = "alsa")]
+        for c in tuxmix_core::fireface::class_compliant_cards() {
+            log::warn!(
+                "{} (card {}) is in Class Compliant mode: the RME mixer is not \
+                 available. Use the stock ALSA/PipeWire device; switch the unit \
+                 back to normal RME mode to use TuxMix's matrix.",
+                c.name, c.card
+            );
+        }
+
+        #[cfg(feature = "alsa")]
         if want_alsa {
+            // Refactored path first: the kernel module exposes one hwdep
+            // control node per card and PCM only.  This works for UC and
+            // UCX and for several units at once; `open()` picks the first.
+            match Fireface::open() {
+                Ok(d) => {
+                    log::info!(
+                        "Device backend: hwdep ({} on card {})",
+                        d.model_name(),
+                        d.info().card
+                    );
+                    return Some(DeviceHandle::Fireface(d));
+                }
+                Err(e) => log::debug!("Fireface hwdep open not available: {e:?}"),
+            }
+            match UcxAlsa::open() {
+                Ok(d) => {
+                    log::info!("Device backend: ALSA (Fireface UCX)");
+                    return Some(DeviceHandle::Ucx(d));
+                }
+                Err(e) => log::debug!("Fireface UCX ALSA open not available: {e:?}"),
+            }
+            match UcxAlsa::open_uc() {
+                Ok(d) => {
+                    log::info!("Device backend: ALSA (Fireface UC)");
+                    return Some(DeviceHandle::Uc(d));
+                }
+                Err(e) => log::debug!("Fireface UC ALSA open not available: {e:?}"),
+            }
             match BabyfacePro::open() {
                 Ok(d) => {
                     log::info!("Device backend: ALSA (kernel driver)");
@@ -387,9 +727,165 @@ impl DeviceHandle {
         }
         None
     }
-    pub fn open_mock() -> Self {
-        DeviceHandle::Mock(MockBabyfacePro::open().expect("mock opens"))
+    /// The UCX simulation, same in-memory device with the UCX's topology and
+    /// capability set.
+    pub fn open_mock_ucx() -> Self {
+        DeviceHandle::Mock(MockBabyfacePro::open_ucx().expect("mock opens"))
     }
+
+    /// The UC simulation: the UC's topology and gated feature set.
+    pub fn open_mock_uc() -> Self {
+        DeviceHandle::Mock(MockBabyfacePro::open_uc().expect("mock opens"))
+    }
+
+    pub fn open_mock() -> Self {
+        let device = match std::env::var("TUXMIX_MOCK_MODEL").ok().as_deref() {
+            Some("ucx") => MockBabyfacePro::open_ucx(),
+            Some("uc") => MockBabyfacePro::open_uc(),
+            _ => MockBabyfacePro::open(),
+        };
+        DeviceHandle::Mock(device.expect("mock opens"))
+    }
+
+    pub fn kind(&self) -> DeviceKind {
+        match self {
+            DeviceHandle::Mock(d) => {
+                if d.is_ucx() {
+                    DeviceKind::MockUcx
+                } else if d.is_uc() {
+                    DeviceKind::MockUc
+                } else {
+                    DeviceKind::Mock
+                }
+            }
+            DeviceHandle::Usb(_) => DeviceKind::Babyface,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Real(_) => DeviceKind::Babyface,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Ucx(_) => DeviceKind::Ucx,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(_) => DeviceKind::Uc,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => match d.model() {
+                FirefaceModel::Ucx => DeviceKind::Ucx,
+                FirefaceModel::Uc => DeviceKind::Uc,
+            },
+        }
+    }
+
+    /// ALSA card id used by `/proc/asound/card*/id`; must match the
+    /// kernel driver's `snd_card_set_id`, not the display name.
+    pub fn card_id(&self) -> &'static str {
+        match self {
+            DeviceHandle::Mock(_) | DeviceHandle::Usb(_) => "BabyfacePro",
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Real(_) => "BabyfacePro",
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Ucx(_) => "FirefaceUCX",
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(_) => "FirefaceUC",
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => d.spec().card_id,
+        }
+    }
+
+    pub fn open_kind(kind: DeviceKind) -> Option<Self> {
+        match kind {
+            DeviceKind::Mock => Some(Self::open_mock()),
+            DeviceKind::MockUcx => Some(Self::open_mock_ucx()),
+            DeviceKind::MockUc => Some(Self::open_mock_uc()),
+            #[cfg(feature = "alsa")]
+            DeviceKind::Fireface => Fireface::open().ok().map(DeviceHandle::Fireface),
+            #[cfg(not(feature = "alsa"))]
+            DeviceKind::Fireface => None,
+            #[cfg(feature = "alsa")]
+            DeviceKind::Ucx => Fireface::open_ucx()
+                .ok()
+                .map(DeviceHandle::Fireface)
+                .or_else(|| UcxAlsa::open().ok().map(DeviceHandle::Ucx)),
+            #[cfg(feature = "alsa")]
+            DeviceKind::Uc => Fireface::open_uc()
+                .ok()
+                .map(DeviceHandle::Fireface)
+                .or_else(|| UcxAlsa::open_uc().ok().map(DeviceHandle::Uc)),
+            #[cfg(feature = "alsa")]
+            DeviceKind::Babyface => BabyfacePro::open()
+                .ok()
+                .map(DeviceHandle::Real)
+                .or_else(|| BabyfaceProUsb::open().ok().map(DeviceHandle::Usb)),
+            #[cfg(not(feature = "alsa"))]
+            DeviceKind::Babyface => BabyfaceProUsb::open().ok().map(DeviceHandle::Usb),
+            #[cfg(not(feature = "alsa"))]
+            _ => None,
+        }
+    }
+    /// All physical hwdep devices, one entry per unit, with stable serial.
+    pub fn available_targets() -> Vec<DeviceTarget> {
+        #[cfg(feature = "alsa")]
+        {
+            let mut out = Vec::new();
+            for info in Fireface::enumerate() {
+                let target = DeviceTarget::from_identity(info.identity());
+                if !out.contains(&target) {
+                    out.push(target);
+                }
+            }
+            // Both simulations are always offered, so the interface can be
+            // explored (or a GUI change checked) without the hardware.
+            out.push(DeviceTarget::kind_only(DeviceKind::Mock));
+            out.push(DeviceTarget::kind_only(DeviceKind::MockUcx));
+            out.push(DeviceTarget::kind_only(DeviceKind::MockUc));
+            out
+        }
+        #[cfg(not(feature = "alsa"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// Stable target for the currently open device.
+    pub fn target(&self) -> DeviceTarget {
+        match self {
+            DeviceHandle::Mock(d) => DeviceTarget::kind_only(if d.is_ucx() {
+                DeviceKind::MockUcx
+            } else if d.is_uc() {
+                DeviceKind::MockUc
+            } else {
+                DeviceKind::Mock
+            }),
+            DeviceHandle::Usb(_) | DeviceHandle::Real(_) => {
+                DeviceTarget::kind_only(DeviceKind::Babyface)
+            }
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Ucx(_) => DeviceTarget::kind_only(DeviceKind::Ucx),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(_) => DeviceTarget::kind_only(DeviceKind::Uc),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => DeviceTarget::from_identity(d.identity()),
+        }
+    }
+
+    /// Open a specific unit, preferring its stable serial when present.
+    pub fn open_target(target: &DeviceTarget) -> Option<Self> {
+        #[cfg(feature = "alsa")]
+        if let Some(serial) = &target.serial {
+            let model = match target.kind {
+                DeviceKind::Uc => Some(tuxmix_core::FirefaceModel::Uc),
+                DeviceKind::Ucx => Some(tuxmix_core::FirefaceModel::Ucx),
+                _ => None,
+            };
+            if let Some(model) = model {
+                if let Ok(d) = Fireface::open_identity(&tuxmix_core::FirefaceIdentity {
+                    model,
+                    serial: serial.clone(),
+                }) {
+                    return Some(DeviceHandle::Fireface(d));
+                }
+            }
+        }
+        Self::open_kind(target.kind)
+    }
+
     /// All input meter levels in one call (the USB backend's
     /// `meters()` is draining — call once per tick, not per channel).
     pub fn input_meters(&self) -> Vec<f32> {
@@ -399,6 +895,12 @@ impl DeviceHandle {
             DeviceHandle::Usb(d) => d.meters().unwrap_or_else(|| vec![0.0; n]),
             #[cfg(feature = "alsa")]
             DeviceHandle::Real(d) => d.meters().unwrap_or_else(|| vec![0.0; n]),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Ucx(d) => d.meters().unwrap_or_else(|| vec![0.0; n]),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(d) => d.meters().unwrap_or_else(|| vec![0.0; n]),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => d.meters().unwrap_or_else(|| vec![0.0; n]),
         }
     }
     pub fn playback_meters(&self) -> Vec<f32> {
@@ -408,9 +910,72 @@ impl DeviceHandle {
             // Playback meters come from the OUT stream — not wired yet.
             #[cfg(feature = "alsa")]
             DeviceHandle::Real(_) => vec![0.0; n],
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Ucx(_) => vec![0.0; n],
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(_) => vec![0.0; n],
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => d
+                .playback_meters()
+                .unwrap_or_else(|| vec![0.0; n]),
             DeviceHandle::Usb(_) => vec![0.0; n],
         }
     }
+
+    /// Device-side SW-playback meters (UCX IF1 0x85), if available.
+    pub fn device_playback_meters(&self) -> Option<Vec<f32>> {
+        match self {
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Ucx(d) => d.device_playback_meters(),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(d) => d.device_playback_meters(),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => d.playback_meters(),
+            _ => None,
+        }
+    }
+
+    /// Device-supplied hardware-output meters, already mapped to TuxMix's
+    /// internal Phones-first output order.  `None` means the backend has
+    /// no output meter stream and the GUI must compute them host-side.
+    pub fn device_output_meters(&self) -> Option<Vec<f32>> {
+        match self {
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => d.output_meters_internal(true),
+            _ => None,
+        }
+    }
+
+    /// Release/reopen the input capture meter at a new rate.  Needed
+    /// because capture and playback share the device clock.
+    pub fn set_meter_rate(&mut self, rate: u32) {
+        #[cfg(feature = "alsa")]
+        match self {
+            DeviceHandle::Ucx(d) | DeviceHandle::Uc(d) => d.set_meter_rate(rate),
+            DeviceHandle::Fireface(d) => {
+                let _ = d;
+                // UCX meters come from the driver's 0x85 events; the UC
+                // capture fallback reopens on demand.
+            }
+            _ => {}
+        }
+        #[cfg(not(feature = "alsa"))]
+        let _ = rate;
+    }
+
+    /// True when the backend has its own playback meter source, so the
+    /// PipeWire sink tap is unnecessary.
+    pub fn has_device_playback_meters(&self) -> bool {
+        #[cfg(feature = "alsa")]
+        if matches!(self, DeviceHandle::Ucx(_) | DeviceHandle::Uc(_)) {
+            return true;
+        }
+        if matches!(self, DeviceHandle::Fireface(d) if d.model() == FirefaceModel::Ucx) {
+            return true;
+        }
+        false
+    }
+
     /// Per-channel availability for the input strips. Mock is real
     /// everywhere; the USB backend's ISO IN stream meters AN1-4 only
     /// (`tuxmix-usb`'s `input_peaks()` returns four channels); the
@@ -422,12 +987,23 @@ impl DeviceHandle {
     /// Each capture pair is also the matching
     /// output pair's record bus, so enabling that output's loopback
     /// makes the input meter read the output bus too.
+    ///
+    /// The UCX backend uses the same capture-meter path with all 18
+    /// inputs (AN1-8, SPDIF, ADAT) and an identity channel map. These
+    /// are the raw pre-fader input words, so the meter stays live while
+    /// the channel is faded down or muted.
     pub fn has_input_meter(&self, idx: usize) -> bool {
         match self {
             DeviceHandle::Mock(_) => true,
             DeviceHandle::Usb(_) => idx < 4,
             #[cfg(feature = "alsa")]
             DeviceHandle::Real(d) => idx < d.inputs().len() && d.meters_available(),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Ucx(d) => idx < d.inputs().len() && d.meters_available(),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(d) => idx < d.inputs().len() && d.meters_available(),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => idx < d.inputs().len(),
         }
     }
     /// Whether `playback_meters()` is real — true only for Mock. The USB
@@ -437,7 +1013,12 @@ impl DeviceHandle {
     /// stream at a time (see `tools/alsa/README.md`'s "Known limits"), so
     /// real playback audio from another app never reaches it either.
     pub fn has_playback_meters(&self) -> bool {
-        matches!(self, DeviceHandle::Mock(_))
+        match self {
+            DeviceHandle::Mock(_) => true,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => d.model() == FirefaceModel::Ucx,
+            _ => false,
+        }
     }
     /// Output meters, computed host-side like TotalMix from levels the
     /// caller already drained this tick: each output's level is the
@@ -448,23 +1029,179 @@ impl DeviceHandle {
     /// the sum was computed from the near-empty second drain. See
     /// `power_sum_output_meters`'s own doc comment for the math.
     pub fn output_meters_from(&self, input_meters: &[f32], playback_meters: &[f32]) -> Vec<f32> {
-        power_sum_output_meters(
-            &self.inputs().iter().map(|c| c.volumes.clone()).collect::<Vec<_>>(),
+        let mut input_vols: Vec<Vec<f32>> =
+            self.inputs().iter().map(|c| c.volumes.clone()).collect();
+        let mut playback_vols: Vec<Vec<f32>> =
+            self.playbacks().iter().map(|c| c.volumes.clone()).collect();
+        if self.matrix_uses_display_order() {
+            let order = self.output_display_order();
+            reorder_pair_volumes(&mut input_vols, &order);
+            reorder_pair_volumes(&mut playback_vols, &order);
+        }
+        let mut out = power_sum_output_meters(
+            &input_vols,
             input_meters,
-            &self.playbacks().iter().map(|c| c.volumes.clone()).collect::<Vec<_>>(),
+            &playback_vols,
             playback_meters,
             self.outputs().len(),
-        )
+        );
+        // TotalMix's hardware-output meters are post-fader: the bottom-row
+        // fader ("total level of the output") must move its own VU too.
+        for (i, level) in out.iter_mut().enumerate() {
+            if let Some(ch) = self.outputs().get(i) {
+                *level = if ch.mute {
+                    0.0
+                } else {
+                    *level * ch.volume.clamp(0.0, 1.0)
+                };
+            }
+        }
+        out
     }
     pub fn is_mock(&self) -> bool {
         matches!(self, DeviceHandle::Mock(_))
+    }
+    /// UC parameters that can be read back at connect.  `None` for
+    /// backends without this readback path.
+    pub fn readable_state(&self) -> Option<tuxmix_core::fireface::ReadableState> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.readable_state();
+        }
+        None
+    }
+
+    pub fn firmware(&self) -> Option<u32> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return Some(d.firmware());
+        }
+        None
+    }
+
+    pub fn serial(&self) -> Option<&str> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return Some(d.serial());
+        }
+        None
+    }
+
+    pub fn set_line_in_ref(&mut self, code: u16) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_line_in_ref(code);
+        }
+        Ok(())
+    }
+
+    pub fn set_line_out_ref(&mut self, code: u16) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_line_out_ref(code);
+        }
+        Ok(())
+    }
+
+    pub fn set_phones_ref(&mut self, code: u16) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_phones_ref(code);
+        }
+        Ok(())
+    }
+
+    pub fn set_line_in_ref_58(&mut self, code: u16) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_line_in_ref_58(code);
+        }
+        let _ = code;
+        Ok(())
+    }
+
+    pub fn set_spdif_professional(&mut self, on: bool) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_spdif_professional(on);
+        }
+        Ok(())
+    }
+
+    pub fn set_word_clock_single_speed(&mut self, on: bool) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_word_clock_single_speed(on);
+        }
+        Ok(())
+    }
+
+    /// Apply the readable/queued device values after the user chooses
+    /// "Device -> TuxMix".  Unreadable state stays on the TuxMix scene.
+    pub fn restore_readable(
+        &mut self,
+        state: &tuxmix_core::fireface::ReadableState,
+    ) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.restore_readable(state);
+        }
+        let _ = state;
+        Ok(())
+    }
+
+    /// Physical Phones hardware volume (linear 0..1), if the backend has a
+    /// real front-panel readback.  Only the UCX IF1 reader provides it.
+    pub fn hardware_volume(&self) -> Option<f32> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Ucx(d) | DeviceHandle::Uc(d) = self {
+            return d.hardware_volume();
+        }
+        if let DeviceHandle::Fireface(d) = self {
+            return d.hardware_volume();
+        }
+        None
+    }
+    /// Convert an internal output-pair index to its display/submix index.
+    pub fn display_pair_index(&self, internal: usize) -> usize {
+        self.output_display_order()
+            .iter()
+            .position(|&p| p == internal)
+            .unwrap_or(internal)
+    }
+
+    /// The hwdep Fireface path has no on-demand mixer readback.  Like
+    /// TotalMix, TuxMix restores its saved model at startup and writes it
+    /// to the unit, so the unit and the displayed state start identical.
+    /// The older ALSA/USB backends read the live matrix on open and do not
+    /// need this.
+    pub fn needs_scene_restore(&self) -> bool {
+        match self {
+            DeviceHandle::Usb(_) => true,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(_) => true,
+            _ => false,
+        }
+    }
+    /// The hwdep Fireface path treats TuxMix's saved state as the source
+    /// of truth because most of the UC mixer is write-only.  Live
+    /// front-panel gain/volume events are still applied on top (see
+    /// `Fireface::uc_status_event`).
+    pub fn device_state_is_authoritative(&self) -> bool {
+        false
     }
     /// Whether the sound server, not this app, sets the card's sample rate
     /// and buffer size: true for the kernel driver (PipeWire opens the
     /// card), false for the USB backend, which streams the device itself.
     pub fn rate_follows_sound_server(&self) -> bool {
         #[cfg(feature = "alsa")]
-        if matches!(self, DeviceHandle::Real(_)) {
+        if matches!(
+            self,
+            DeviceHandle::Real(_)
+                | DeviceHandle::Ucx(_)
+                | DeviceHandle::Uc(_)
+                | DeviceHandle::Fireface(_)
+        ) {
             return true;
         }
         false
@@ -481,6 +1218,12 @@ impl DeviceHandle {
             DeviceHandle::Mock(_) | DeviceHandle::Usb(_) => true,
             #[cfg(feature = "alsa")]
             DeviceHandle::Real(_) => true,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Ucx(_) => false,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(_) => false,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(_) => false,
         }
     }
     /// True when the backend lays out outputs as ONE channel per submix
@@ -499,7 +1242,51 @@ impl DeviceHandle {
             DeviceHandle::Usb(d) => Some(d.panel_selection()),
             #[cfg(feature = "alsa")]
             DeviceHandle::Real(d) => d.panel_selection(),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Ucx(_) => None,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(_) => None,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(_) => None,
         }
+    }
+
+    /// True for a Fireface UC model regardless of which backend drives it.
+    pub fn is_uc_model(&self) -> bool {
+        match self {
+            DeviceHandle::Mock(d) => d.is_uc(),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(_) => true,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => d.model() == FirefaceModel::Uc,
+            _ => false,
+        }
+    }
+
+    /// True for the UC/UCX family (the shared 18-channel Fireface node),
+    /// as opposed to a Babyface Pro.
+    pub fn is_uc_family(&self) -> bool {
+        match self {
+            DeviceHandle::Mock(d) => d.is_uc() || d.is_ucx(),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Uc(_) | DeviceHandle::Ucx(_) | DeviceHandle::Fireface(_) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Re-index every channel's per-output-pair volumes from matrix/display
+/// order into internal output order.  The channel list itself stays put:
+/// it is the software-playback source order, not an output dimension.
+fn reorder_pair_volumes(channels: &mut [Vec<f32>], order: &[usize]) {
+    for vols in channels.iter_mut() {
+        let mut by_internal = vec![0.0f32; order.len()];
+        for (display, &internal) in order.iter().enumerate() {
+            if let Some(v) = vols.get(display) {
+                by_internal[internal] = *v;
+            }
+        }
+        *vols = by_internal;
     }
 }
 
@@ -562,6 +1349,62 @@ pub enum View {
 
 // ── Messages ─────────────────────────────────────────────────────
 
+/// Options > Reset Mix entries (manual 25.10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetMix {
+    StraightToMain,
+    StraightPlayback,
+    ClearSubmixes,
+    ClearEffects,
+    SetOutputVolumes,
+    ResetNames,
+    AllMono,
+    AllStereo,
+    InputsMonoOutputsStereo,
+    TotalReset,
+}
+
+pub const RESET_MIX: [(&str, ResetMix); 10] = [
+    ("Straight playback with all to Main Out", ResetMix::StraightToMain),
+    ("Straight playback", ResetMix::StraightPlayback),
+    ("Clear all submixes", ResetMix::ClearSubmixes),
+    ("Clear channel effects", ResetMix::ClearEffects),
+    ("Set output volumes", ResetMix::SetOutputVolumes),
+    ("Reset channel names", ResetMix::ResetNames),
+    ("Set all channels mono", ResetMix::AllMono),
+    ("Set all channels stereo", ResetMix::AllStereo),
+    ("Set inputs mono, outputs stereo", ResetMix::InputsMonoOutputsStereo),
+    ("Total reset", ResetMix::TotalReset),
+];
+
+/// Which half of the global FX bus an FX-panel control belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FxBus {
+    Reverb,
+    Echo,
+}
+
+/// Which level of the Assign menu is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignMenu {
+    Closed,
+    Destinations,
+    Outputs(usize),
+}
+
+/// Control Room Assign destinations, in TotalMix's menu order.
+pub const ASSIGN_DESTS: [&str; 7] = [
+    "Main Out",
+    "Main Out B",
+    "Phones 1",
+    "Phones 2",
+    "Phones 3",
+    "Phones 4",
+    "Cue/PFL to",
+];
+
+
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Tick,
@@ -570,6 +1413,8 @@ pub enum Message {
     /// `Input`/`Playback` id, never `Output` (see `quick_channel_options`,
     /// the only place that builds the pick-list this feeds).
     QuickChannelSelected(ChannelId),
+    /// Switch to another detected mixer backend/device.
+    SelectDevice(DeviceTarget),
     SelectOutput(usize),
     ModifiersChanged(keyboard::Modifiers),
     /// F11: toggle the window between windowed and fullscreen. The id
@@ -608,6 +1453,15 @@ pub enum Message {
     SetKeepInTray(bool),
     /// "Start with the session" (an autostart entry, hidden in the tray).
     SetAutostart(bool),
+    /// Startup mismatch: use the saved TuxMix scene (already applied).
+    MismatchUseTuxmix,
+    /// Startup mismatch: re-apply the readable/queued device values.
+    MismatchUseDevice,
+    /// Startup mismatch: use TuxMix now and suppress future prompts.
+    MismatchAlwaysTuxmix,
+    /// Settings toggle for RME's "Always init DSP devices with TotalMix FX
+    /// settings".
+    SetAlwaysInitDevice(bool),
 
     Mute(ChannelId, bool),
     Solo(ChannelId, bool),
@@ -631,6 +1485,11 @@ pub enum Message {
     GlobalSoloToggle,
     Phantom(usize, bool),
     Pad(usize, bool),
+    Instrument(usize, bool),
+    /// UCX three-value input Level (`-10 dBV` / `+4 dBu` / `LoGain`).
+    LevelChanged(usize, InputLevel),
+    /// UCX AutoSet on inputs 1/2.
+    Autoset(usize, bool),
     /// Raw preamp gain units (0..=`InputChannel::gain_max`), not dB —
     /// the hardware's own scale isn't a fixed dB curve we can label.
     Gain(usize, u32),
@@ -645,18 +1504,40 @@ pub enum Message {
     /// Hardware 3-band + low-cut EQ (analog inputs only) — `usize` is
     /// always the input index; the `Eq*Band*` variants carry the band
     /// index (0-2) as their second field. See `tuxmix_core::channel::InputEq`.
-    EqEnabled(usize, bool),
-    EqBandType(usize, usize, EqBandType),
-    EqBandFreq(usize, usize, u16),
-    EqBandQ(usize, usize, f32),
-    EqBandGain(usize, usize, f32),
+    EqEnabled(ChannelId, bool),
+    EqBandType(ChannelId, usize, EqBandType),
+    EqBandFreq(ChannelId, usize, u16),
+    EqBandQ(ChannelId, usize, f32),
+    EqBandGain(ChannelId, usize, f32),
     /// A drag in the EQ plot: frequency and gain move together, so the
     /// device gets one update instead of two.
-    EqBandPoint(usize, usize, u16, f32),
-    /// Double-click on a band handle: back to 1 kHz, Q 0.7, 0 dB.
-    EqBandReset(usize, usize),
-    EqLowCutFreq(usize, u16),
-    EqLowCutSlope(usize, u8),
+    EqBandPoint(ChannelId, usize, u16, f32),
+    /// Double-click on a band handle: back to the configured reset point.
+    EqBandReset(ChannelId, usize),
+    EqLowCutEnabled(ChannelId, bool),
+    EqLowCutFreq(ChannelId, u16),
+    EqLowCutSlope(ChannelId, u8),
+
+    /// Dynamics panel: the shared on/off button and the complete state
+    /// (each knob sends the full struct so the backend writes one block).
+    DynamicsEnabled(ChannelId, bool),
+    DynamicsChanged(ChannelId, Dynamics),
+    /// Global FX panel.
+    ReverbChanged(Reverb),
+    EchoChanged(Echo),
+    /// The FX column's own volume faders. The strip fader messages are
+    /// channel-scoped and the FX buses have no channel slot, so they get
+    /// their own pair: `value` is a linear fader position (0..2, the
+    /// `Fader` widget's own units), converted to dB in the handler.
+    FxVolume(FxBus, f32),
+    /// Ends an FX fader gesture, the way `RangeCleared` ends a strip drag.
+    FxVolumeReleased(FxBus),
+    /// Per-output FX Return level in dB.
+    FxReturnChanged(usize, f32),
+    /// Per-channel FX send level in dB.
+    FxSendChanged(ChannelId, f32),
+    /// Options > Reset Mix.
+    ResetMix(ResetMix),
 
     /// Output-channel index (not the submix pair — converted in the
     /// handler via `DeviceHandle::outputs_one_per_pair`).
@@ -665,7 +1546,7 @@ pub enum Message {
     /// to `set_input_pair_linked`/`set_playback_linked`/
     /// `set_output_linked` depending on which kind `cid` is.
     StereoLinkChanged(ChannelId, bool),
-    /// Global device settings, all in the `device_panel` drawer.
+    /// Settings panel content, all in the `device_panel` drawer.
     PitchChanged(f32),
     WidthChanged(f32),
     MsProcChanged(bool),
@@ -673,6 +1554,13 @@ pub enum Message {
     InputLinkChanged(bool),
     EqForRecordChanged(bool),
     OpticalOutFormatChanged(bool),
+    LineInRefSelected(u16),
+    /// Line In 5-8 reference (one shared group on the UCX).
+    LineInRef58Selected(u16),
+    LineOutRefSelected(u16),
+    PhonesRefSelected(u16),
+    SpdifProfessionalChanged(bool),
+    WordClockSingleSpeedChanged(bool),
     /// The CUE button on an Output strip — exclusive across every
     /// output (see `RmeDevice::set_cue`'s own doc comment), so this
     /// always carries the *target* state, not a relative toggle.
@@ -681,6 +1569,14 @@ pub enum Message {
     PhaseChanged(ChannelId, bool),
 
     VolumeChanged(ChannelId, usize, f32),
+    /// One Matrix cell: source channel and physical output block (0-17).
+    /// Unlike `VolumeChanged`, this carries the exact column so Mono Mode
+    /// can write one cell instead of the stereo pair.
+    MatrixCellChanged(ChannelId, usize, f32),
+    /// Toggle Matrix Mono Mode (one mono cell vs the stereo pair).
+    ToggleMatrixMono,
+    /// Cursor-key fader nudge, in dB (+ = louder).
+    NudgeVolume(f32),
     FaderPressed(ChannelId, usize, f32, Option<(f32, f32)>),
     RangeCleared(ChannelId),
     Reset(ChannelId, usize, f32),
@@ -738,9 +1634,20 @@ pub enum Message {
     /// `--osc` is active).
     ToggleOscLog,
     ClearOscLog,
-    /// Toggles the global device settings drawer (clock source, SPDIF,
+    /// `/meters` query: reply with the current input/playback/output values.
+    OscMeters,
+    /// Toggles the Settings panel (clock source, SPDIF,
     /// sample rate).
     ToggleDevicePanel,
+    /// Shows or hides the FX column beside the mixer.
+    ToggleFxPanel,
+    /// Opens the Assign menu at its first level, or closes it.
+    ToggleAssign,
+    /// First level: open that destination's output list.
+    AssignDestinations(usize),
+    /// Second level: assign an output to a destination, `None` clears it.
+    AssignOutput(usize, Option<usize>),
+    CloseAssign,
     /// Toggles the About modal (version, icon, links; see `about`).
     ToggleAbout,
     /// The TuxMix settings popover (the app's own, not the device's).
@@ -772,13 +1679,27 @@ pub enum Message {
     /// The Options panel's mixer layout (TotalMix's "2 Row"), see
     /// `RowMode`. UI-only.
     SetRowMode(RowMode),
+    /// First-connect direction; see `SyncDirection`.
+    SetSyncDirection(SyncDirection),
     /// Flips the hardware Dim (`RmeDevice::set_dim`), the same switch the
     /// front-panel DIM button toggles.
     DimToggle,
+    /// Target-state dim (OSC); `DimToggle` remains the UI's relative toggle.
+    Dim(bool),
+    /// Control-room Speaker B switch.
+    SpeakerB(bool),
+    /// Restore the pre-Dim Phones level.
+    ControlRoomRecall,
+    /// Control-room Mono monitoring option (host-side).
+    ControlRoomMono(bool),
+    /// Control-room Mute FX option (host-side).
+    ControlRoomMuteFx(bool),
     /// Recalls "Mix `u8`" (1-8) and marks it as the slot `SnapshotStore`
     /// will save into.
     SnapshotClicked(u8),
     SnapshotStore,
+    /// Store the current mix into slot `u8` (1-8) without recalling first.
+    SnapshotStoreTo(u8),
     /// Enters/exits group-assignment mode — while active, clicking a
     /// group's mute/solo/fader cell assigns the current multi-selection
     /// (`state.selected`) as that group's membership.
@@ -824,10 +1745,6 @@ pub enum Message {
     EngineRead(Option<PwClock>, Option<CardStream>),
 }
 
-/// The ALSA card id the kernel driver registers, for reading the card's
-/// own stream parameters (`pw_clock::card_stream`).
-const CARD_ID: &str = "BabyfacePro";
-
 /// The two inline text fields a strip can open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditField {
@@ -835,16 +1752,16 @@ pub enum EditField {
     Db,
 }
 
-/// How the Mixer lays its three sections out. `Two` is TotalMix's "2 Row":
-/// Hardware Inputs and Software Playback side by side, outputs underneath.
-/// `Auto` (the default) takes two rows when the two blocks fit side by
-/// side and three otherwise: on a 1920 px window that shows the whole
-/// mixer without scrolling, where three rows used half the width and
-/// pushed the outputs below the fold.
+/// How the Mixer lays its three sections out.  TotalMix offers the
+/// default 3-row inline layout and the optional "2 Row" layout (Hardware
+/// Inputs and Software Playback side by side, Hardware Outputs underneath).
+/// `Auto` is a retired TuxMix-only width-dependent mode kept only so old
+/// preference files deserialize; it is treated as `Three` and is no longer
+/// offered in the UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RowMode {
-    #[default]
     Auto,
+    #[default]
     Three,
     Two,
 }
@@ -856,8 +1773,20 @@ pub(crate) const DB_INPUT_ID: &str = "strip-db";
 
 // ── App state ────────────────────────────────────────────────────
 
+/// A startup difference between the values the UC can read back and the
+/// saved TuxMix scene.  Only the readable/queued subset is listed; see
+/// `docs/UC-PARAMETER-SYNC.md`.
+#[derive(Clone)]
+pub struct StartupMismatch {
+    pub items: Vec<String>,
+    pub device_state: tuxmix_core::fireface::ReadableState,
+}
+
 pub struct TuxMix {
     pub device: DeviceHandle,
+    /// Stable identity of the selected unit, when the backend exposes one.
+    /// The card index is deliberately not part of this.
+    pub device_target: Option<DeviceTarget>,
     pub sel_out: usize,
     /// Last front-panel OUT selection seen by `Message::Tick` — when it
     /// changes, `sel_out` follows (TotalMix highlights the panel's
@@ -909,11 +1838,26 @@ pub struct TuxMix {
     /// was clicked). **Exception**: `Route` stays exclusive with itself
     /// (opening a new one still closes any other Route flyout) — its
     /// Stack-based overlay (`with_flyout`) only ever positions/renders
-    /// one popover at a time, a real rendering constraint, not a design
-    /// choice; Settings/Eq/Trim have no such limit, they push the row's
-    /// own layout instead of overlaying it. Opens/closes instantly, no
-    /// width tween — unlike `collapse_anim`, this isn't animated.
+    /// one popover at a time, but both the old and new overlay now have
+    /// their own width tween.  Switching Settings/EQ/Trim on the same
+    /// strip queues the new panel until the old shrink finishes, so both
+    /// directions always animate.
     pub flyout_open: HashSet<(ChannelId, strip::FlyoutKind)>,
+    /// Width tween for the inline Settings/EQ/Trim panels, keyed like
+    /// `flyout_open`.  Opening grows the panel from 0 to its natural width,
+    /// pushing the following strips right; closing shrinks it again.  The
+    /// animation is kept after `flyout_open` is cleared so the shrink can
+    /// finish, then pruned by `CollapseTick`.
+    pub flyout_anim: HashMap<(ChannelId, strip::FlyoutKind), strip::CollapseAnim>,
+    /// Width tween for the second half of a stereo pair when Stereo is
+    /// toggled.  Keyed by the pair's left `ChannelId`; the animated value
+    /// is the right strip's width (0 when linked, full when split), so the
+    /// whole rest of the row shifts at the fold-out speed.
+    pub stereo_anim: HashMap<ChannelId, strip::CollapseAnim>,
+    /// A different inline panel requested on the same strip while the old
+    /// one is still sliding out.  It opens after that shrink finishes, so
+    /// switching Settings ↔ EQ ↔ Trim never snaps the old panel away.
+    pending_flyout: Option<(ChannelId, strip::FlyoutKind)>,
     /// Manual UI zoom for the mixer/matrix views — every text size and
     /// widget dimension there is multiplied by this. Changed only by
     /// `ZoomIn`/`ZoomOut`/`ZoomReset`/Ctrl+molette (`zoom`); it is NOT tied
@@ -942,6 +1886,35 @@ pub struct TuxMix {
     /// `TICK_IDLE` (see `tick_interval`). An idle mixer used to redraw 20
     /// times a second for nothing: ~12 ms a frame, a quarter of a core.
     pub last_activity: Instant,
+    /// Last hardware Phones volume read from the driver; a change switches
+    /// the UI to the fast tick for a moment, so an idle mixer doesn't redraw
+    /// at 30 Hz just to poll the physical knob.
+    pub last_hw_volume: Option<f32>,
+    /// A requested UC rate waiting for the card's ALSA stream to confirm
+    /// it; lets the UI report a rate the unit actually accepted.
+    pub pending_device_rate: Option<(u32, Instant)>,
+    /// One-shot reapply of the startup scene after the UC meter taps have
+    /// opened the card.  The UC can reload its stored mixer state on stream
+    /// start, so the initial scene write can be lost.
+    pub startup_scene_due: Option<Instant>,
+    /// The host-owned scene used for autosave/save/exit and snapshot
+    /// persistence.  Front-panel changes update the live device model but
+    /// not this scene, matching Windows TotalMix: the saved host mix wins at
+    /// the next connect.
+    pub host_scene: Option<Scene>,
+    /// The host scene to reapply after the UC meter tap has opened the
+    /// card.  Reapplying `capture_scene()` here was wrong: a stale
+    /// front-panel `0x8b` event could already have replaced the output
+    /// fader in the model, and the reapply then persisted the device value
+    /// instead of the host scene.
+    pub startup_scene: Option<Scene>,
+    /// Previous RME sink running state, for the IDLE -> RUNNING reapply.
+    pub last_sink_running: bool,
+    /// Last non-idle card rate seen, kept across a brief stream close during
+    /// a rate switch.  A rate change can happen while the sink never stops
+    /// reporting RUNNING, so the sink transition alone is not enough to
+    /// detect it.
+    pub last_card_rate: Option<u32>,
     /// The notification-area icon is up (`tray::start` found a service):
     /// only then may the window be hidden, there is a way back.
     pub tray_active: bool,
@@ -958,9 +1931,6 @@ pub struct TuxMix {
     pub autostart: bool,
     /// The first launch has no saved zoom: pick one from the monitor.
     pub initial_zoom_pending: bool,
-    /// The sidebar was folded by a narrow window (not by the user), so it
-    /// reopens when the window widens again.
-    pub auto_folded: bool,
     /// When the last resize was actually applied to `window_width`/
     /// `ui_scale` (`None` = never) — the resize coalescing throttle (see
     /// `RESIZE_THROTTLE`) compares against this so a stream of `Resized`
@@ -976,6 +1946,11 @@ pub struct TuxMix {
     /// Mute/solo/collapse/volume/pan applied to any selected strip apply
     /// to the whole selection at once.
     pub selected: HashSet<ChannelId>,
+    /// The strip a plain click last focused.  Cursor Up/Down nudge this
+    /// channel (or all of `selected` when a multi-selection exists), the
+    /// way TotalMix's keyboard control works.  Kept separate from
+    /// `selected` so a plain click does not turn into a multi-selection.
+    pub focus_channel: Option<ChannelId>,
     /// The strip a future Shift+click's range is measured from — the
     /// most recent strip explicitly Ctrl- or Shift-clicked. Not moved by
     /// Shift+click itself, so repeated Shift+clicks pivot around the same
@@ -1002,13 +1977,26 @@ pub struct TuxMix {
     /// opening the panel after a burst of activity isn't a blank page.
     pub osc_log: VecDeque<String>,
     pub show_osc_log: bool,
-    /// Docked drawer for global device settings (clock source, SPDIF
+    /// Docked Settings panel (device group, clock source, SPDIF
     /// flags) — same pattern as `show_osc_log`, see `device_panel`.
     pub show_device_panel: bool,
+    /// The FX column beside the mixer: Reverb and Echo, in TotalMix's own
+    /// place for them. Only meaningful when the backend reports `fx`.
+    pub show_fx_panel: bool,
+    /// Control Room Assign: the output pair chosen for each destination,
+    /// in `ASSIGN_DESTS` order. An assigned pair leaves the hardware-output
+    /// row and shows up in the Control Room section instead.
+    pub assign: [Option<usize>; 7],
+    /// Which level of the Assign menu is open.
+    pub assign_menu: AssignMenu,
     /// Whether the About modal is open: the version, the icon and the
     /// links, layered above the whole window (see `about::about_modal`).
     pub show_about: bool,
     pub show_settings: bool,
+    /// RME-style startup mismatch dialog.  `None` = no prompt.
+    pub startup_mismatch: Option<StartupMismatch>,
+    /// Suppress future mismatch prompts and write the saved TuxMix scene.
+    pub always_init_device: bool,
     /// Whether the device this handle was opened on is still there, as of
     /// the last `Message::Tick` probe (`RmeDevice::is_connected`): the
     /// handle keeps answering for a card that is long gone, so the chip
@@ -1070,6 +2058,10 @@ pub struct TuxMix {
     pub snapshot_dirty: bool,
     /// See `RowMode`.
     pub row_mode: RowMode,
+    /// First-connect direction, persisted in the GUI prefs.  The default
+    /// is device -> GUI, so launching never writes a stale GUI state over
+    /// the live device.
+    pub sync_direction: SyncDirection,
     pub sidebar_panels_open: sidebar::PanelsOpen,
     /// Whether the whole right sidebar is expanded — distinct from
     /// `sidebar_panels_open`, which collapses individual panels *within*
@@ -1098,6 +2090,9 @@ pub struct TuxMix {
     pub prefs_dirty: bool,
     /// The Matrix cell under the pointer (see `Message::MatrixHover`).
     pub matrix_hover: Option<(ChannelId, usize)>,
+    /// Matrix Mono Mode: on = a crosspoint edit writes one mono cell;
+    /// off = the cell edit follows the stereo pair (TotalMix's default).
+    pub matrix_mono: bool,
     /// The continuous edit the last undo step was opened for, and when it
     /// last moved (see `undo_gesture`).
     pub undo_gesture: Option<(UndoGesture, Instant)>,
@@ -1118,10 +2113,49 @@ pub struct TuxMix {
     /// its rate and hardware period, which the sound server may pin
     /// regardless of the quantum. `None` while the card is idle.
     pub card_stream: Option<CardStream>,
-    /// The kernel driver's period floor (`urb_frames_min`), read at
+    /// The kernel driver's period floor (`urb_frames` for the UC), read at
     /// launch: which buffer sizes the card can actually run. `None` when
     /// unknown (no kernel driver), taken as the default 32.
     pub driver_floor: Option<u32>,
+    /// The UC USB queue: `(frames per URB, URBs in flight)`, for the
+    /// actual latency readout.
+    pub driver_queue: Option<(u32, u32)>,
+}
+
+impl TuxMix {
+    /// Bus labels for the current device, in internal pair order.
+    ///
+    /// The Babyface profile has six pairs; the UCX has nine.  `sel_out`
+    /// and the matrix use these internal indices; the output strips use
+    /// `display_pair_labels()` instead.
+    pub fn pair_labels(&self) -> Vec<String> {
+        let outs = self.device.outputs();
+        (0..self.device.output_pair_count())
+            .map(|p| {
+                let left = outs
+                    .get(p * 2)
+                    .map(|o| short_label(o.name.as_str()))
+                    .unwrap_or("");
+                let right = outs
+                    .get(p * 2 + 1)
+                    .map(|o| short_label(o.name.as_str()))
+                    .unwrap_or("");
+                pair_bus_label(left, right)
+            })
+            .collect()
+    }
+
+    /// Labels in TotalMix's hardware-output display order.  The returned
+    /// positions are display positions, not the internal pair indices used
+    /// by the matrix and `sel_out`.
+    pub fn display_pair_labels(&self) -> Vec<String> {
+        let labels = self.pair_labels();
+        self.device
+            .output_display_order()
+            .into_iter()
+            .map(|pair| labels.get(pair).cloned().unwrap_or_default())
+            .collect()
+    }
 }
 
 /// The mock's stand-in for PipeWire's clock: what the real card runs with
@@ -1146,8 +2180,11 @@ pub enum UndoGesture {
     Pan(ChannelId, usize),
     Gain(usize),
     Trim(usize),
-    EqBand(usize, usize),
-    LowCut(usize),
+    EqBand(ChannelId, usize),
+    LowCut(ChannelId),
+    Dynamics(ChannelId),
+    Reverb,
+    Echo,
     Pitch,
     Width,
 }
@@ -1164,11 +2201,19 @@ fn undo_gesture(message: &Message) -> Option<UndoGesture> {
         Message::PanChanged(cid, out, _) => UndoGesture::Pan(*cid, *out),
         Message::Gain(idx, _) => UndoGesture::Gain(*idx),
         Message::TrimChanged(idx, _) => UndoGesture::Trim(*idx),
-        Message::EqBandFreq(idx, band, _)
-        | Message::EqBandQ(idx, band, _)
-        | Message::EqBandGain(idx, band, _)
-        | Message::EqBandPoint(idx, band, ..) => UndoGesture::EqBand(*idx, *band),
-        Message::EqLowCutFreq(idx, _) => UndoGesture::LowCut(*idx),
+        Message::EqBandFreq(cid, band, _)
+        | Message::EqBandQ(cid, band, _)
+        | Message::EqBandGain(cid, band, _)
+        | Message::EqBandPoint(cid, band, ..) => UndoGesture::EqBand(*cid, *band),
+        Message::EqLowCutFreq(cid, _) => UndoGesture::LowCut(*cid),
+        Message::EqLowCutEnabled(cid, _) => UndoGesture::LowCut(*cid),
+        Message::DynamicsChanged(cid, _) | Message::DynamicsEnabled(cid, _) => {
+            UndoGesture::Dynamics(*cid)
+        }
+        Message::ReverbChanged(_) => UndoGesture::Reverb,
+        Message::EchoChanged(_) => UndoGesture::Echo,
+        Message::FxVolume(FxBus::Reverb, _) => UndoGesture::Reverb,
+        Message::FxVolume(FxBus::Echo, _) => UndoGesture::Echo,
         Message::PitchChanged(_) => UndoGesture::Pitch,
         Message::WidthChanged(_) => UndoGesture::Width,
         _ => return None,
@@ -1187,16 +2232,16 @@ const METER_TICK_MS: f32 = 50.0;
 /// Fast rise — a meter should jump to a new peak almost instantly so
 /// transients don't feel muted.
 const METER_ATTACK: f32 = 0.7;
-/// Release rate right after a peak: falls quickly at first...
-const METER_RELEASE_START: f32 = 0.22;
-/// ...decelerating to a gentle final approach as it settles, instead of
-/// falling at one constant rate the whole way down. This ease-out shape
-/// (fast-then-gentle) is the same curve easyeffects animates its meters
-/// with (a 300ms cubic ease-out) — it's what reads as a real analog needle
-/// settling rather than a value sliding down at a fixed speed.
-const METER_RELEASE_END: f32 = 0.04;
-/// Time to go from `METER_RELEASE_START` to `METER_RELEASE_END` after a peak.
-const METER_RELEASE_MS: f32 = 300.0;
+/// Fast fall: more than four times quicker than the old 300 ms ease-out.
+const METER_RELEASE: f32 = 0.9;
+/// TotalMix's default peak-hold time.  The visible peak marker stays put
+/// for this long after the last peak, then falls with a short ease-out
+/// (the bar itself falls fast).  The 260 ms tail is deliberately a little
+/// quicker than the original 300 ms so held peaks do not linger.
+const METER_PEAK_HOLD_MS: f32 = 2000.0;
+const PEAK_RELEASE_START: f32 = 0.26;
+const PEAK_RELEASE_END: f32 = 0.06;
+const PEAK_RELEASE_MS: f32 = 260.0;
 
 /// Per-channel VU ballistics state.
 #[derive(Clone, Copy, Debug)]
@@ -1205,14 +2250,16 @@ pub struct MeterAnim {
     /// keyframe transition `MeterFrame` interpolates from.
     prev_value: f32,
     value: f32,
+    /// Held peak, drawn as a separate marker.
+    peak: f32,
+    /// Time since the peak last rose, for the 2 s hold.
+    peak_hold_ms: f32,
+    /// Time since the held peak started falling (after the hold).
+    peak_release_ms: f32,
     /// When `value` was last computed — the display layer (`MeterFrame`)
     /// uses this to interpolate a smooth in-between value at full display
     /// refresh rate instead of jumping once per `Tick`.
     last_step_at: Instant,
-    /// Time since the level last rose (i.e. since the last peak) — drives
-    /// the release ease-out curve. Clamped at `METER_RELEASE_MS`, meaning
-    /// "fully settled into the tail rate".
-    release_elapsed_ms: f32,
 }
 
 impl MeterAnim {
@@ -1220,8 +2267,10 @@ impl MeterAnim {
         Self {
             prev_value: 0.0,
             value: 0.0,
+            peak: 0.0,
+            peak_hold_ms: 0.0,
+            peak_release_ms: 0.0,
             last_step_at: Instant::now(),
-            release_elapsed_ms: METER_RELEASE_MS,
         }
     }
 
@@ -1229,6 +2278,7 @@ impl MeterAnim {
         fader::MeterFrame {
             prev: self.prev_value,
             value: self.value,
+            peak: self.peak,
             since: self.last_step_at,
         }
     }
@@ -1256,39 +2306,91 @@ impl MeterAnim {
         let eff = |alpha: f32| 1.0 - (1.0 - alpha).powf(ratio);
         if target >= self.value {
             self.value += (target - self.value) * eff(METER_ATTACK);
-            self.release_elapsed_ms = 0.0;
         } else {
-            self.release_elapsed_ms = (self.release_elapsed_ms + dt_ms).min(METER_RELEASE_MS);
-            let t = self.release_elapsed_ms / METER_RELEASE_MS;
-            let alpha = METER_RELEASE_END
-                + (METER_RELEASE_START - METER_RELEASE_END) * (1.0 - t) * (1.0 - t);
-            self.value += (target - self.value) * eff(alpha);
+            self.value += (target - self.value) * eff(METER_RELEASE);
+        }
+
+        if target >= self.peak {
+            self.peak = target;
+            self.peak_hold_ms = 0.0;
+            self.peak_release_ms = 0.0;
+        } else {
+            self.peak_hold_ms += dt_ms;
+            if self.peak_hold_ms >= METER_PEAK_HOLD_MS {
+                // The old ease-out is deliberately kept for the peak
+                // marker: the bar snaps down fast, while the little peak
+                // line glides down like an analog peak-hold.
+                self.peak_release_ms =
+                    (self.peak_release_ms + dt_ms).min(PEAK_RELEASE_MS);
+                let t = self.peak_release_ms / PEAK_RELEASE_MS;
+                let alpha = PEAK_RELEASE_END
+                    + (PEAK_RELEASE_START - PEAK_RELEASE_END) * (1.0 - t) * (1.0 - t);
+                self.peak += (target - self.peak) * eff(alpha);
+                if self.peak < target + 0.001 {
+                    self.peak = target;
+                }
+            }
         }
         self.last_step_at = Instant::now();
     }
 }
 
+#[cfg(test)]
 pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -> TuxMix {
-    let mut device = if mock {
+    new_with_device(mock, osc_config, backend, None, None)
+}
+
+/// Like [`new`], but honours the device selected in the UI/prefs at
+/// startup.  Falls back to auto-detection when that device is not present.
+pub fn new_with_device(
+    mock: bool,
+    osc_config: Option<OscConfig>,
+    backend: Option<String>,
+    preferred: Option<DeviceKind>,
+    preferred_serial: Option<String>,
+) -> TuxMix {
+    let device = if mock {
         DeviceHandle::open_mock()
     } else {
-        DeviceHandle::open_real(backend.as_deref()).unwrap_or_else(|| {
-            eprintln!("No device found. Use --mock for simulation.");
-            DeviceHandle::open_mock()
-        })
-    };
-    // Restore the last mixer state so the UI starts in sync with the
-    // hardware — the USB backend has NO gain/volume readback (only the
-    // 48V/PAD byte is readable), so like TotalMix we re-apply our own
-    // saved state (auto-saved in `Message::Tick`). The file is SHARED
-    // with the TUI, so whichever UI ran last wins.
-    if !mock {
-        if let Some(scene) = tuxmix_core::scene::load_auto_scene() {
-            if let Err(e) = device.apply_scene(&scene) {
-                eprintln!("auto scene load failed: {e:?}");
+        let available = DeviceHandle::available_targets();
+        let selected = choose_startup_target(
+            &available,
+            preferred,
+            preferred_serial.as_deref(),
+        );
+        if available.len() == 1 && selected.as_ref().map(|t| t.kind) != preferred {
+            log::info!(
+                "Auto-selected {}: it is the only Fireface visible",
+                selected.as_ref().map(DeviceTarget::label).unwrap_or_else(|| "device".into())
+            );
+        }
+        let preferred = selected.as_ref().and_then(DeviceHandle::open_target);
+        match preferred.or_else(|| DeviceHandle::open_real(backend.as_deref())) {
+            Some(device) => device,
+            None if backend.is_some() => {
+                eprintln!(
+                    "No device found for --backend {}; refusing to start in simulation mode. \
+                     Use --mock explicitly for the simulation.",
+                    backend.as_deref().unwrap_or("")
+                );
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("No device found. Use --mock for simulation.");
+                DeviceHandle::open_mock()
             }
         }
-    }
+    };
+    // The saved scene is loaded in `apply_startup_sync`, after the
+    // preferences are known, so the UC mismatch prompt and the
+    // "Always init DSP devices" preference can run first.
+    // USB has no readback: its only meaningful direction is GUI -> device.
+    // ALSA/UCX starts in the safe Device -> GUI direction.
+    let sync_direction = if device.needs_scene_restore() {
+        SyncDirection::GuiToDevice
+    } else {
+        SyncDirection::DeviceToGui
+    };
     let n_inputs = device.inputs().len();
     let n_playbacks = device.playbacks().len();
     let n_outputs = device.outputs().len();
@@ -1296,9 +2398,21 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
     // cannot be asked afterwards.
     let connected = device.is_connected();
     let simulated = device.is_mock();
-    // Mock generates its own playback levels; a real backend gets them
-    // from PipeWire's sink monitor (see `pw_meter`).
-    let playback_tap = if device.is_mock() {
+    // A fallback mock is only a placeholder while no hardware is present;
+    // leave its target empty so the reconnect probe searches for a real
+    // unit instead of reopening the mock.
+    let device_target = if simulated && !mock {
+        None
+    } else {
+        Some(device.target())
+    };
+    let persist_target = device_target
+        .as_ref()
+        .is_some_and(|target| target.serial.is_some());
+    // Mock generates its own playback levels; the UCX has the driver's
+    // IF5 OUT peaks.  The other real backends still need the PipeWire
+    // sink monitor (see `pw_meter`).
+    let playback_tap = if device.is_mock() || device.has_device_playback_meters() {
         pw_meter::PlaybackTap::disabled()
     } else {
         pw_meter::PlaybackTap::start()
@@ -1306,6 +2420,7 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
 
     TuxMix {
         device,
+        device_target,
         connected,
         sel_out: 0,
         last_panel_out: None,
@@ -1323,12 +2438,22 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
         collapsed: HashSet::new(),
         collapse_anim: HashMap::new(),
         flyout_open: HashSet::new(),
+        flyout_anim: HashMap::new(),
+        stereo_anim: HashMap::new(),
+        pending_flyout: None,
         ui_scale: theme::SCALE_DEFAULT,
         fullscreen: false,
         // Matches `window::Settings::size` in main.rs — updated for real
         // as soon as the first `Opened`/`Resized` event arrives.
         window_size: None,
         last_activity: Instant::now(),
+        last_hw_volume: None,
+        pending_device_rate: None,
+        startup_scene_due: None,
+        startup_scene: None,
+        host_scene: None,
+        last_sink_running: false,
+        last_card_rate: None,
         tray_active: false,
         keep_in_tray: true,
         window_hidden: false,
@@ -1336,11 +2461,11 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
         window_id: None,
         autostart: crate::tray::autostart_enabled(),
         initial_zoom_pending: false,
-        auto_folded: false,
         window_width: 1280.0,
         last_resize_applied: None,
         pending_resize_width: None,
         selected: HashSet::new(),
+        focus_channel: None,
         select_anchor: None,
         hovered_strip: None,
         osc_config,
@@ -1348,8 +2473,13 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
         osc_log: VecDeque::new(),
         show_osc_log: false,
         show_device_panel: false,
+        show_fx_panel: true,
+        assign: [None; 7],
+        assign_menu: AssignMenu::Closed,
         show_about: false,
         show_settings: false,
+        startup_mismatch: None,
+        always_init_device: false,
         backend,
         explicit_mock: mock,
         last_conn_check: None,
@@ -1374,7 +2504,8 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
         last_cleared_solos: Vec::new(),
         last_cleared_mutes: Vec::new(),
         snapshot_dirty: false,
-        row_mode: RowMode::Auto,
+        row_mode: RowMode::Three,
+        sync_direction,
         sidebar_panels_open: sidebar::PanelsOpen::default(),
         sidebar_open: true,
         sidebar_width: sidebar::DEFAULT_WIDTH,
@@ -1383,8 +2514,11 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
         renaming: None,
         rename_buf: String::new(),
         prefs_path: None,
-        prefs_dirty: false,
+        // Persist a resolved hardware serial even on a first launch: the
+        // old preference file may only have the model-level label.
+        prefs_dirty: persist_target,
         matrix_hover: None,
+        matrix_mono: false,
         undo_gesture: None,
         field_opening: false,
         engine: simulated.then_some(SIMULATED_ENGINE),
@@ -1393,6 +2527,7 @@ pub fn new(mock: bool, osc_config: Option<OscConfig>, backend: Option<String>) -
         card_stream: None,
         // The mock stands for the stock driver.
         driver_floor: simulated.then_some(32),
+        driver_queue: simulated.then_some((48, 2)),
     }
 }
 
@@ -1403,9 +2538,23 @@ pub fn prefs_of(state: &TuxMix) -> crate::prefs::Prefs {
         state.labels.iter().map(|(c, l)| (*c, l.clone())).collect();
     // Stable order, so an unchanged state writes an unchanged file.
     labels.sort_by_key(|(c, _)| format!("{c:?}"));
+    let mut collapsed: Vec<ChannelId> = state.collapsed.iter().copied().collect();
+    collapsed.sort_by_key(|c| format!("{c:?}"));
+    // Route is a transient bus picker, not a channel control panel; do not
+    // reopen it on the next launch.
+    // Channel panels are transient; reopening them on the next launch
+    // would widen a strip row without the user asking for it.
+    let flyouts: Vec<(ChannelId, strip::FlyoutKind)> = Vec::new();
     crate::prefs::Prefs {
         view: Some(state.view),
+        device: Some(state.device.kind().label().to_string()),
+        device_serial: state
+            .device_target
+            .as_ref()
+            .and_then(|target| target.serial.clone()),
         sidebar_open: Some(state.sidebar_open),
+        fx_panel: Some(state.show_fx_panel),
+        assign: state.assign,
         sidebar_width: Some(state.sidebar_width),
         panels_open: Some([p.options, p.snapshots, p.groups, p.layout]),
         two_row: None,
@@ -1418,6 +2567,13 @@ pub fn prefs_of(state: &TuxMix) -> crate::prefs::Prefs {
         keep_in_tray: (!state.keep_in_tray).then_some(false),
         engine_force_rate: Some(state.engine_force_rate),
         engine_force_quantum: Some(state.engine_force_quantum),
+        collapsed,
+        flyouts,
+        sel_out: Some(state.sel_out),
+        sync_direction: Some(state.sync_direction),
+        always_init_device: state.always_init_device,
+        input_pair_link: state.device.settings().input_pair_link.clone(),
+        output_link: state.device.settings().output_link.clone(),
     }
 }
 
@@ -1431,7 +2587,18 @@ pub fn apply_prefs(state: &mut TuxMix, prefs: crate::prefs::Prefs) {
     if let Some(open) = prefs.sidebar_open {
         state.sidebar_open = open;
     }
+    if let Some(open) = prefs.fx_panel {
+        state.show_fx_panel = open;
+    }
+    state.assign = prefs.assign;
     if let Some(w) = prefs.sidebar_width {
+        // Move installs still on the old default to the new, slightly
+        // narrower default; an explicitly chosen width is left alone.
+        let w = if (w - sidebar::OLD_DEFAULT_WIDTH).abs() < 0.5 {
+            sidebar::DEFAULT_WIDTH
+        } else {
+            w
+        };
         state.sidebar_width = w.clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH);
     }
     if let Some([options, snapshots, groups, layout]) = prefs.panels_open {
@@ -1442,12 +2609,14 @@ pub fn apply_prefs(state: &mut TuxMix, prefs: crate::prefs::Prefs) {
             layout,
         };
     }
-    // `two_row` is the older boolean key: a saved `true` still means two
-    // rows; `false` was merely the old default, so it maps to `Auto`.
+    // TotalMix has two supported layouts: 3 rows (default) and 2 rows.
+    // `Auto` was a TuxMix-only width-dependent mode and is deliberately
+    // retired: an old preference containing it opens as the 3-row default.
     state.row_mode = match (prefs.row_mode, prefs.two_row) {
+        (Some(RowMode::Auto), _) => RowMode::Three,
         (Some(mode), _) => mode,
         (None, Some(true)) => RowMode::Two,
-        _ => RowMode::Auto,
+        _ => RowMode::Three,
     };
     if let Some(z) = prefs.ui_scale {
         state.ui_scale = z.clamp(theme::SCALE_MIN, theme::SCALE_MAX);
@@ -1465,6 +2634,267 @@ pub fn apply_prefs(state: &mut TuxMix, prefs: crate::prefs::Prefs) {
     state.keep_in_tray = prefs.keep_in_tray.unwrap_or(true);
     state.engine_force_rate = prefs.engine_force_rate.unwrap_or(0);
     state.engine_force_quantum = prefs.engine_force_quantum.unwrap_or(0);
+    state.always_init_device = prefs.always_init_device;
+
+    // Apply the link groupings before the per-channel UI state, so a saved
+    // flyout/collapse on a now-linked right channel is moved to the one
+    // strip the row actually shows.
+    if !prefs.input_pair_link.is_empty() {
+        state.device.settings_mut().input_pair_link = prefs.input_pair_link;
+    }
+    if !prefs.output_link.is_empty() {
+        state.device.settings_mut().output_link = prefs.output_link;
+    }
+
+    // Per-channel GUI state.  Filter out ids the current device does not
+    // have (a prefs file from another model) and the transient Route bus
+    // picker.  These are pure GUI state and never touch the device.
+    state.collapsed = prefs
+        .collapsed
+        .into_iter()
+        .map(|cid| normalize_channel(state, cid))
+        .filter(|&cid| channel_exists(state, cid))
+        .collect();
+    // Flyouts are transient UI state.  Keep old preference files readable,
+    // but start with every panel closed so a saved Settings panel cannot
+    // push a channel row past the window edge.
+    state.flyout_open.clear();
+    if let Some(out) = prefs.sel_out {
+        let pairs = state.device.output_pair_count().max(1);
+        state.sel_out = out.min(pairs - 1);
+    }
+
+    // USB has no readback; it must always restore GUI -> device.  The UCX
+    // honours the user's choice, defaulting to the safe Device -> GUI.
+    state.sync_direction = if state.device.needs_scene_restore() {
+        SyncDirection::GuiToDevice
+    } else if state.device.device_state_is_authoritative() {
+        SyncDirection::DeviceToGui
+    } else {
+        prefs.sync_direction.unwrap_or(SyncDirection::DeviceToGui)
+    };
+}
+
+/// A linked pair is represented by its left/even strip.  Move a saved
+/// per-channel UI entry on the hidden right channel to that representative
+/// so Settings/EQ/Trim panels and collapsed state cannot get stranded.
+fn normalize_channel(state: &TuxMix, cid: ChannelId) -> ChannelId {
+    match cid {
+        ChannelId::Input(i) if state.device.input_pair_linked(i / 2) => {
+            ChannelId::Input(i & !1)
+        }
+        ChannelId::Playback(i) if state.device.playback_linked(i / 2) => {
+            ChannelId::Playback(i & !1)
+        }
+        ChannelId::Output(i) if state.device.output_linked(i / 2) => {
+            ChannelId::Output(i & !1)
+        }
+        _ => cid,
+    }
+}
+
+/// Whether `cid` names a strip the currently open device actually has.
+fn channel_exists(state: &TuxMix, cid: ChannelId) -> bool {
+    match cid {
+        ChannelId::Input(i) => i < state.device.inputs().len(),
+        ChannelId::Playback(i) => i < state.device.playbacks().len(),
+        ChannelId::Output(i) => i < state.device.outputs().len(),
+    }
+}
+
+/// Scene key for the current physical unit.  The model keeps old files and
+/// the TUI fallback working; the serial separates two units of the same model.
+fn scene_key(state: &TuxMix) -> String {
+    let model = state.device.canonical_model();
+    match state.device_target.as_ref().and_then(|t| t.serial.as_deref()) {
+        Some(serial) => format!("{model}-{serial}"),
+        None => model.to_string(),
+    }
+}
+
+fn load_scene_for_current(state: &TuxMix) -> Option<Scene> {
+    // The hwdep Fireface backends use per-unit (UC/UCX with serial) or
+    // per-model (UC without a serial) files.  The older USB/ALSA backends
+    // and the TUI still share auto.json; preserve that path for them.
+    if state.device.is_uc_model()
+        || state
+            .device_target
+            .as_ref()
+            .is_some_and(|target| target.serial.is_some())
+    {
+        let key = scene_key(state);
+        let model = state.device.canonical_model();
+        tuxmix_core::scene::load_auto_scene_for(&key)
+            .or_else(|| {
+                if key != model {
+                    tuxmix_core::scene::load_auto_scene_for(model)
+                } else {
+                    None
+                }
+            })
+            // Migration from the pre-serial shared auto.json.  This is only
+            // used until the first per-unit save exists.
+            .or_else(tuxmix_core::scene::load_auto_scene)
+    } else {
+        tuxmix_core::scene::load_auto_scene()
+    }
+}
+
+fn save_scene_for_current(state: &TuxMix, scene: &Scene) -> Result<(), String> {
+    if state.device.is_uc_model()
+        || state
+            .device_target
+            .as_ref()
+            .is_some_and(|target| target.serial.is_some())
+    {
+        tuxmix_core::scene::save_auto_scene_for(&scene_key(state), scene)
+    } else {
+        tuxmix_core::scene::save_auto_scene(scene)
+    }
+}
+
+/// Legacy backends and single-unit UCX sessions without a serial still use
+/// the shared auto.json that the TUI also writes.
+fn uses_shared_auto_scene(state: &TuxMix) -> bool {
+    !state.device.is_uc_model()
+        && !state
+            .device_target
+            .as_ref()
+            .is_some_and(|target| target.serial.is_some())
+}
+
+/// First-connect sync, after the preferences are known.
+///
+/// Backends without a full mixer readback restore their saved scene.  For
+/// the UC, TuxMix compares the readable/queued device values first and
+/// raises the RME-style mismatch prompt unless "Always init DSP devices
+/// with TotalMix FX settings" is enabled.  The scene is still the default
+/// choice, so the unit and the model agree when the dialog is answered.
+pub fn apply_startup_sync(state: &mut TuxMix) {
+    if state.device.is_mock() {
+        return;
+    }
+    if state.host_scene.is_none() {
+        state.host_scene = Some(state.device.capture_scene());
+    }
+    if state.device.needs_scene_restore() {
+        let model = state.device.canonical_model().to_string();
+        let scene = load_scene_for_current(state);
+        let Some(scene) = scene else {
+            log::warn!("no auto scene found for {model}");
+            state.device.begin_metering();
+            return;
+        };
+        log::info!(
+            "loaded startup scene for {model}: pb1={:?} out4(vol/loop)={:?}/{:?}",
+            scene.playbacks.first().map(|p| p.volumes.clone()),
+            scene.outputs.get(4).map(|o| o.volume),
+            scene.outputs.get(4).map(|o| o.loopback),
+        );
+        state.host_scene = Some(scene.clone());
+        // RME's UC behavior is unconditional: on connect TotalMix writes
+        // its host state over the unit, with no mismatch dialog (verified
+        // on TotalMix FX 2.10 / driver 1.277).  Live front-panel changes
+        // are still observed through 0x8b after the connect.
+        if !state.device.is_uc_model() && !state.always_init_device {
+            if let Some(device_state) = state.device.readable_state() {
+                let items = device_state.differences(&scene);
+                if !items.is_empty() {
+                    state.startup_mismatch = Some(StartupMismatch {
+                        items,
+                        device_state,
+                    });
+                }
+            }
+        }
+        match state.device.apply_scene(&scene) {
+            Ok(()) => {
+                // `apply_scene` normalizes old scenes into the live channel
+                // topology.  Keep that normalized view as the host scene so
+                // the next auto-save cannot write stale names/order back.
+                state.host_scene = Some(state.device.capture_scene());
+                if state.device.is_uc_model() {
+                    // Reapply this exact host scene after the engine has
+                    // started.  Do not capture the model at that point: a
+                    // queued front-panel 0x8b can already have replaced the
+                    // output fader, and capturing it would persist the
+                    // device value instead of the host scene.
+                    state.startup_scene = Some(scene.clone());
+                    state.startup_scene_due =
+                        Some(Instant::now() + Duration::from_secs(1));
+                    // The UC can deliver a front-panel move made while the
+                    // app was not running after `begin_metering()` starts
+                    // the engine.  TotalMix's connect write is
+                    // authoritative, so ignore that stale output event
+                    // through the reapply.
+                    state
+                        .device
+                        .suppress_front_panel_for(Duration::from_secs(2));
+                }
+            }
+            Err(e) => eprintln!("auto scene load failed: {e:?}"),
+        }
+        // Only now may the meter tap open the capture PCM and start the
+        // engine; the scene above is latched at that point.
+        state.device.begin_metering();
+        return;
+    }
+    if state.device.device_state_is_authoritative() {
+        state.device.begin_metering();
+        return;
+    }
+    if state.sync_direction != SyncDirection::GuiToDevice {
+        state.device.begin_metering();
+        return;
+    }
+    if let Some(scene) = tuxmix_core::scene::load_auto_scene() {
+        state.host_scene = Some(scene.clone());
+        if let Err(e) = state.device.apply_scene(&scene) {
+            eprintln!("auto scene load failed: {e:?}");
+        } else {
+            state.host_scene = Some(state.device.capture_scene());
+        }
+    }
+    state.device.begin_metering();
+}
+
+/// Schedule a reapply of the **current model** after the UC has reloaded its
+/// stored mixer (playback start or a live sample-rate change).
+///
+/// The startup path has its own saved scene; if that reapply is still
+/// pending, keep it instead of overwriting it with a possibly device-updated
+/// model.
+fn schedule_mixer_reapply(state: &mut TuxMix, delay: Duration, reason: &str) {
+    if state.startup_scene.is_some() {
+        log::debug!("{reason}: a startup scene reapply is already pending");
+        return;
+    }
+    state.startup_scene = Some(state.device.capture_scene());
+    state.startup_scene_due = Some(Instant::now() + delay);
+    log::info!("{reason}; reapplying the Fireface mixer scene");
+}
+
+/// A change between two observed card rates.  `None` means "no open stream";
+/// keep the last known rate across that gap so a rate switch made while the
+/// stream was briefly closed is still detected when it reopens.
+fn card_rate_changed(last: Option<u32>, current: Option<u32>) -> bool {
+    matches!((last, current), (Some(old), Some(new)) if old != new)
+}
+
+/// Whether the first observed card rate differs from the rate the device
+/// reported when TuxMix opened it.  This is the common startup case: the
+/// scene is applied while the card is at its old rate, then PipeWire opens
+/// it at a different rate and the UC reloads its stored mixer.
+fn first_rate_needs_reapply(last: Option<u32>, current: Option<u32>, model_rate: u32) -> bool {
+    last.is_none() && current.is_some_and(|rate| rate != model_rate)
+}
+
+fn rate_needs_mixer_reapply(
+    last: Option<u32>,
+    current: Option<u32>,
+    model_rate: u32,
+) -> bool {
+    card_rate_changed(last, current) || first_rate_needs_reapply(last, current, model_rate)
 }
 
 /// Brings the audio engine in line with the preferences at launch: the
@@ -1481,10 +2911,28 @@ pub fn restore_engine(state: &mut TuxMix) {
     if !state.device.rate_follows_sound_server() {
         return;
     }
-    if state.engine_force_rate > 0 {
+    // The UC sample rate follows the host's stream, as it does on
+    // Windows: the device keeps its last rate while powered, but the host's
+    // remembered rate is what opens the next stream.  Restore the saved
+    // choice; "Auto" (0) releases the override so the graph/device rate is
+    // used instead.
+    if state.device.is_uc_model() {
+        state.pending_device_rate = None;
+        if state.engine_force_rate > 0 {
+            if let Err(e) = pw_clock::force_rate(state.engine_force_rate) {
+                log::warn!("Restoring the PipeWire rate failed: {e}");
+            }
+            state.device.set_meter_rate(state.engine_force_rate);
+        } else if let Err(e) = pw_clock::force_rate(0) {
+            log::warn!("Releasing the PipeWire rate override failed: {e}");
+        }
+    } else if state.engine_force_rate > 0 {
         if let Err(e) = pw_clock::force_rate(state.engine_force_rate) {
             log::warn!("Restoring the PipeWire rate failed: {e}");
         }
+        // The input capture PCM shares the device clock; release it so
+        // the kernel driver can move the card to the requested rate.
+        state.device.set_meter_rate(state.engine_force_rate);
     }
     if state.engine_force_quantum > 0 {
         if let Err(e) = pw_clock::force_quantum(state.engine_force_quantum) {
@@ -1492,8 +2940,9 @@ pub fn restore_engine(state: &mut TuxMix) {
         }
     }
     state.engine = pw_clock::read();
-    state.card_stream = pw_clock::card_stream(CARD_ID);
+    state.card_stream = pw_clock::card_stream(state.device.card_id());
     state.driver_floor = pw_clock::driver_period_floor();
+    state.driver_queue = pw_clock::driver_urb_queue();
 }
 
 /// Writes the preferences if something changed (and a path is set).
@@ -1516,9 +2965,16 @@ fn changes_prefs(message: &Message) -> bool {
         Message::SetView(_)
             | Message::TabPressed
             | Message::ToggleSidebar
+            | Message::ToggleFxPanel
+            | Message::AssignOutput(..)
             | Message::SidebarResize(_)
             | Message::ToggleSidebarPanel(_)
             | Message::SetRowMode(_)
+            | Message::SetSyncDirection(_)
+            | Message::ToggleCollapse(_)
+            | Message::ToggleFlyout(..)
+            | Message::StripClicked(_)
+            | Message::StereoLinkChanged(..)
             | Message::WheelZoom(_)
             | Message::ZoomIn
             | Message::ZoomOut
@@ -1529,6 +2985,7 @@ fn changes_prefs(message: &Message) -> bool {
             | Message::SetShowOriginalNames(_)
             | Message::EngineRate(_)
             | Message::EngineQuantum(_)
+            | Message::SelectDevice(_)
     )
 }
 
@@ -1550,6 +3007,7 @@ pub(crate) fn user_label(state: &TuxMix, cid: ChannelId) -> Option<&str> {
 fn finish_params<'a>(state: &'a TuxMix, mut p: strip::StripParams<'a>) -> strip::StripParams<'a> {
     if let Some(label) = user_label(state, p.cid) {
         p.name = label.to_string();
+        p.name_custom = true;
     }
     p.renaming = state.renaming == Some(p.cid);
     p.mute_armed = mute_armed(state, p.cid);
@@ -1791,13 +3249,429 @@ fn apply_grouped_pan(state: &mut TuxMix, cid: ChannelId, out: usize, pan: i8) {
     }
 }
 
-/// Pushes a state change out to any connected OSC client — a no-op if
-/// `--osc` wasn't passed (`osc_tx` is `None`), and silently dropped rather
-/// than blocking the update loop if the outgoing channel is momentarily
-/// full (a lagging/absent UDP consumer should never stall the GUI).
+/// Apply one field of an output EQ by reading the live output model,
+/// mutating it, and writing the whole DSP block in one UCX transaction.
+fn update_output_eq(
+    state: &mut TuxMix,
+    idx: usize,
+    change: impl FnOnce(&mut tuxmix_core::channel::InputEq),
+) -> Result<(), tuxmix_core::Error> {
+    let mut eq = state
+        .device
+        .outputs()
+        .get(idx)
+        .and_then(|o| o.eq)
+        .unwrap_or_default();
+    change(&mut eq);
+    state.device.set_output_eq(idx, &eq)
+}
+
+/// Shared EQ action dispatch for input and output channels.
+fn set_eq_enabled_for(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    on: bool,
+) -> Result<(), tuxmix_core::Error> {
+    match cid {
+        ChannelId::Input(idx) => state.device.set_eq_enabled(idx, on),
+        ChannelId::Output(idx) => update_output_eq(state, idx, |e| e.enabled = on),
+        ChannelId::Playback(_) => Ok(()),
+    }
+}
+
+fn set_eq_band_type_for(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    band: usize,
+    t: EqBandType,
+) -> Result<(), tuxmix_core::Error> {
+    match cid {
+        ChannelId::Input(idx) => state.device.set_eq_band_type(idx, band, t),
+        ChannelId::Output(idx) => update_output_eq(state, idx, |e| e.bands[band].band_type = t),
+        ChannelId::Playback(_) => Ok(()),
+    }
+}
+
+fn set_eq_band_freq_for(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    band: usize,
+    freq: u16,
+) -> Result<(), tuxmix_core::Error> {
+    match cid {
+        ChannelId::Input(idx) => state.device.set_eq_band_freq(idx, band, freq),
+        ChannelId::Output(idx) => {
+            update_output_eq(state, idx, |e| e.bands[band].freq_hz = freq)
+        }
+        ChannelId::Playback(_) => Ok(()),
+    }
+}
+
+fn set_eq_band_q_for(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    band: usize,
+    q: f32,
+) -> Result<(), tuxmix_core::Error> {
+    match cid {
+        ChannelId::Input(idx) => state.device.set_eq_band_q(idx, band, q),
+        ChannelId::Output(idx) => update_output_eq(state, idx, |e| e.bands[band].q = q),
+        ChannelId::Playback(_) => Ok(()),
+    }
+}
+
+fn set_eq_band_gain_for(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    band: usize,
+    gain: f32,
+) -> Result<(), tuxmix_core::Error> {
+    match cid {
+        ChannelId::Input(idx) => state.device.set_eq_band_gain(idx, band, gain),
+        ChannelId::Output(idx) => update_output_eq(state, idx, |e| e.bands[band].gain_db = gain),
+        ChannelId::Playback(_) => Ok(()),
+    }
+}
+
+fn set_low_cut_enabled_for(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    on: bool,
+) -> Result<(), tuxmix_core::Error> {
+    match cid {
+        ChannelId::Input(idx) => state.device.set_eq_low_cut_enabled(idx, on),
+        ChannelId::Output(idx) => update_output_eq(state, idx, |e| e.low_cut_enabled = on),
+        ChannelId::Playback(_) => Ok(()),
+    }
+}
+
+fn set_low_cut_freq_for(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    freq: u16,
+) -> Result<(), tuxmix_core::Error> {
+    match cid {
+        ChannelId::Input(idx) => state.device.set_eq_low_cut_freq(idx, freq),
+        ChannelId::Output(idx) => update_output_eq(state, idx, |e| e.low_cut_freq_hz = freq),
+        ChannelId::Playback(_) => Ok(()),
+    }
+}
+
+fn set_low_cut_slope_for(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    slope: u8,
+) -> Result<(), tuxmix_core::Error> {
+    match cid {
+        ChannelId::Input(idx) => state.device.set_eq_low_cut_slope(idx, slope),
+        ChannelId::Output(idx) => {
+            update_output_eq(state, idx, |e| e.low_cut_slope_db_oct = slope)
+        }
+        ChannelId::Playback(_) => Ok(()),
+    }
+}
+
+/// Current dynamics of one hardware input/output, or the defaults if the
+/// backend has no state yet.
+fn dynamics_for(state: &TuxMix, cid: ChannelId) -> Dynamics {
+    match cid {
+        ChannelId::Input(idx) => state
+            .device
+            .inputs()
+            .get(idx)
+            .and_then(|c| c.dynamics)
+            .unwrap_or_default(),
+        ChannelId::Output(idx) => state
+            .device
+            .outputs()
+            .get(idx)
+            .and_then(|c| c.dynamics)
+            .unwrap_or_default(),
+        ChannelId::Playback(_) => Dynamics::default(),
+    }
+}
 fn notify_osc(state: &mut TuxMix, msg: OscOutbound) {
     if let Some(tx) = state.osc_tx.as_mut() {
         let _ = tx.try_send(msg);
+    }
+}
+
+fn notify_osc_raw(state: &mut TuxMix, addr: impl Into<String>, args: Vec<OscType>) {
+    notify_osc(
+        state,
+        OscOutbound::Raw {
+            addr: addr.into(),
+            args,
+        },
+    );
+}
+
+fn osc_bool(on: bool) -> OscType {
+    OscType::Float(if on { 1.0 } else { 0.0 })
+}
+
+fn notify_osc_bool(state: &mut TuxMix, addr: impl Into<String>, on: bool) {
+    notify_osc_raw(state, addr, vec![osc_bool(on)]);
+}
+
+fn channel_slug(cid: ChannelId) -> (&'static str, usize) {
+    match cid {
+        ChannelId::Input(i) => ("input", i),
+        ChannelId::Playback(i) => ("playback", i),
+        ChannelId::Output(i) => ("output", i),
+    }
+}
+
+/// Push the whole control surface to a newly connected OSC client.  Sending
+/// every value once is simpler than making each controller discover the
+/// state through individual queries, and the queue is large enough for it.
+fn notify_osc_full_state(state: &mut TuxMix) {
+    let n_out = state.device.output_pair_count();
+    let inputs = state.device.inputs().to_vec();
+    let playbacks = state.device.playbacks().to_vec();
+    let outputs = state.device.outputs().to_vec();
+    let settings = state.device.settings().clone();
+    for ch in inputs {
+        let cid = ChannelId::Input(ch.id);
+        for out in 0..n_out {
+            if let Some(v) = ch.volumes.get(out) {
+                notify_osc(state, OscOutbound::Volume(cid, out, *v));
+            }
+            if let Some(p) = ch.pans.get(out) {
+                notify_osc(state, OscOutbound::Pan(cid, out, *p));
+            }
+        }
+        notify_osc(state, OscOutbound::Mute(cid, ch.mute));
+        notify_osc(state, OscOutbound::Solo(cid, ch.solo));
+        if let Some(g) = ch.gain {
+            notify_osc_raw(
+                state,
+                format!("/input/{}/gain", ch.id),
+                vec![OscType::Float(g as f32)],
+            );
+        }
+        notify_osc_bool(state, format!("/input/{}/phantom", ch.id), ch.phantom);
+        notify_osc_bool(state, format!("/input/{}/pad", ch.id), ch.pad);
+        notify_osc_bool(
+            state,
+            format!("/input/{}/instrument", ch.id),
+            ch.instrument,
+        );
+        notify_osc_bool(
+            state,
+            format!("/input/{}/sensitivity", ch.id),
+            ch.sensitivity == Some(Sensitivity::Plus4dBu),
+        );
+        notify_osc_bool(state, format!("/input/{}/phase", ch.id), ch.phase);
+        notify_osc_raw(
+            state,
+            format!("/input/{}/trim", ch.id),
+            vec![OscType::Float(ch.trim)],
+        );
+        if let Some(eq) = ch.eq {
+            notify_osc_bool(state, format!("/input/{}/eq", ch.id), eq.enabled);
+            notify_osc_bool(
+                state,
+                format!("/input/{}/lowcut", ch.id),
+                eq.low_cut_enabled,
+            );
+            notify_osc_raw(
+                state,
+                format!("/input/{}/lowcut/freq", ch.id),
+                vec![OscType::Float(eq.low_cut_freq_hz as f32)],
+            );
+            notify_osc_raw(
+                state,
+                format!("/input/{}/lowcut/slope", ch.id),
+                vec![OscType::Int(eq.low_cut_slope_db_oct as i32)],
+            );
+            for (b, band) in eq.bands.iter().enumerate() {
+                let code = match band.band_type {
+                    EqBandType::Off => 0,
+                    EqBandType::Bell => 1,
+                    EqBandType::LowShelf => 2,
+                    EqBandType::HighShelf => 3,
+                                EqBandType::LowPass => 4,
+};
+                notify_osc_raw(
+                    state,
+                    format!("/input/{}/eq/{b}/type", ch.id),
+                    vec![OscType::Int(code)],
+                );
+                notify_osc_raw(
+                    state,
+                    format!("/input/{}/eq/{b}/freq", ch.id),
+                    vec![OscType::Float(band.freq_hz as f32)],
+                );
+                notify_osc_raw(
+                    state,
+                    format!("/input/{}/eq/{b}/q", ch.id),
+                    vec![OscType::Float(band.q)],
+                );
+                notify_osc_raw(
+                    state,
+                    format!("/input/{}/eq/{b}/gain", ch.id),
+                    vec![OscType::Float(band.gain_db)],
+                );
+            }
+        }
+        notify_osc_bool(
+            state,
+            format!("/input/{}/stereo", ch.id),
+            state.device.input_pair_linked(ch.id / 2),
+        );
+    }
+    for ch in playbacks {
+        let cid = ChannelId::Playback(ch.id);
+        for out in 0..n_out {
+            if let Some(v) = ch.volumes.get(out) {
+                notify_osc(state, OscOutbound::Volume(cid, out, *v));
+            }
+            if let Some(p) = ch.pans.get(out) {
+                notify_osc(state, OscOutbound::Pan(cid, out, *p));
+            }
+        }
+        notify_osc(state, OscOutbound::Mute(cid, ch.mute));
+        notify_osc(state, OscOutbound::Solo(cid, ch.solo));
+        notify_osc_bool(
+            state,
+            format!("/playback/{}/stereo", ch.id),
+            state.device.playback_linked(ch.id / 2),
+        );
+    }
+    for ch in outputs {
+        let cid = ChannelId::Output(ch.id);
+        notify_osc(state, OscOutbound::OutputVolume(ch.id, ch.volume));
+        notify_osc(state, OscOutbound::Mute(cid, ch.mute));
+        notify_osc(state, OscOutbound::Solo(cid, ch.solo));
+        notify_osc_bool(state, format!("/output/{}/loopback", ch.id), ch.loopback);
+        notify_osc_bool(state, format!("/output/{}/cue", ch.id), ch.cue);
+        if let Some(eq) = ch.eq {
+            notify_osc_bool(state, format!("/output/{}/eq", ch.id), eq.enabled);
+            notify_osc_bool(
+                state,
+                format!("/output/{}/lowcut", ch.id),
+                eq.low_cut_enabled,
+            );
+            notify_osc_raw(
+                state,
+                format!("/output/{}/lowcut/freq", ch.id),
+                vec![OscType::Float(eq.low_cut_freq_hz as f32)],
+            );
+            notify_osc_raw(
+                state,
+                format!("/output/{}/lowcut/slope", ch.id),
+                vec![OscType::Int(eq.low_cut_slope_db_oct as i32)],
+            );
+            for (b, band) in eq.bands.iter().enumerate() {
+                let code = match band.band_type {
+                    EqBandType::Off => 0,
+                    EqBandType::Bell => 1,
+                    EqBandType::LowShelf => 2,
+                    EqBandType::HighShelf => 3,
+                                EqBandType::LowPass => 4,
+};
+                notify_osc_raw(
+                    state,
+                    format!("/output/{}/eq/{b}/type", ch.id),
+                    vec![OscType::Int(code)],
+                );
+                notify_osc_raw(
+                    state,
+                    format!("/output/{}/eq/{b}/freq", ch.id),
+                    vec![OscType::Float(band.freq_hz as f32)],
+                );
+                notify_osc_raw(
+                    state,
+                    format!("/output/{}/eq/{b}/q", ch.id),
+                    vec![OscType::Float(band.q)],
+                );
+                notify_osc_raw(
+                    state,
+                    format!("/output/{}/eq/{b}/gain", ch.id),
+                    vec![OscType::Float(band.gain_db)],
+                );
+            }
+        }
+        notify_osc_bool(
+            state,
+            format!("/output/{}/stereo", ch.id),
+            state.device.output_linked(ch.id / 2),
+        );
+    }
+    notify_osc_bool(state, "/dim", settings.dim);
+    notify_osc_bool(state, "/input_link", settings.input_link);
+    notify_osc_bool(state, "/eq_for_record", settings.eq_for_record);
+    notify_osc_bool(state, "/optical_out_spdif", settings.optical_out_spdif);
+    notify_osc_bool(state, "/spdif_professional", settings.spdif_professional);
+    notify_osc_bool(
+        state,
+        "/word_clock_single_speed",
+        settings.word_clock_single_speed,
+    );
+    notify_osc_bool(state, "/ms_proc", settings.ms_proc);
+    notify_osc_bool(state, "/an12", settings.an12);
+    notify_osc_raw(state, "/pitch", vec![OscType::Float(settings.pitch_percent)]);
+    notify_osc_raw(state, "/width", vec![OscType::Float(settings.width)]);
+    notify_osc_raw(
+        state,
+        "/clock_source",
+        vec![OscType::String(settings.clock_source.clone())],
+    );
+    notify_osc_raw(
+        state,
+        "/sample_rate",
+        vec![OscType::Int(settings.sample_rate as i32)],
+    );
+    notify_osc_raw(
+        state,
+        "/line_in_ref",
+        vec![OscType::Int(settings.line_in_ref as i32)],
+    );
+    notify_osc_raw(
+        state,
+        "/line_out_ref",
+        vec![OscType::Int(settings.line_out_ref as i32)],
+    );
+    notify_osc_raw(
+        state,
+        "/phones_ref",
+        vec![OscType::Int(settings.phones_ref as i32)],
+    );
+    notify_osc_raw(
+        state,
+        "/submix",
+        vec![OscType::Int(state.sel_out as i32)],
+    );
+    if let Some(n) = state.active_snapshot {
+        notify_osc_raw(state, "/snapshot/active", vec![OscType::Int(n as i32)]);
+    }
+}
+
+fn notify_osc_meters(state: &mut TuxMix) {
+    for i in 0..state.input_meters.len() {
+        let value = state.input_meters[i].frame().value;
+        notify_osc_raw(
+            state,
+            format!("/meter/input/{i}"),
+            vec![OscType::Float(value)],
+        );
+    }
+    for i in 0..state.playback_meters.len() {
+        let value = state.playback_meters[i].frame().value;
+        notify_osc_raw(
+            state,
+            format!("/meter/playback/{i}"),
+            vec![OscType::Float(value)],
+        );
+    }
+    for i in 0..state.output_meters.len() {
+        let value = state.output_meters[i].frame().value;
+        notify_osc_raw(
+            state,
+            format!("/meter/output/{i}"),
+            vec![OscType::Float(value)],
+        );
     }
 }
 
@@ -1848,15 +3722,126 @@ fn set_collapsed(state: &mut TuxMix, cid: ChannelId, target: bool) {
 ///   the SAME `cid` first — the inline-push render loop only handles one
 ///   panel per strip (an `if`/`else if` chain), a second entry for the
 ///   same strip would just sit in the set unrendered.
-fn open_flyout(state: &mut TuxMix, cid: ChannelId, kind: strip::FlyoutKind) {
-    if kind == strip::FlyoutKind::Route {
-        state.flyout_open.retain(|&(_, k)| k != strip::FlyoutKind::Route);
-    } else {
-        state
-            .flyout_open
-            .retain(|&(c, k)| !(c == cid && k != strip::FlyoutKind::Route));
+fn begin_flyout_close(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    kind: strip::FlyoutKind,
+    now: Instant,
+) {
+    if !state.flyout_open.remove(&(cid, kind)) {
+        return;
     }
+    let from = state
+        .flyout_anim
+        .get(&(cid, kind))
+        .map(|a| a.at(now))
+        .unwrap_or_else(|| flyout_width(state, cid, kind));
+    state.flyout_anim.insert(
+        (cid, kind),
+        strip::CollapseAnim {
+            prev: from,
+            value: 0.0,
+            since: now,
+        },
+    );
+}
+
+fn open_flyout_now(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    kind: strip::FlyoutKind,
+    now: Instant,
+) {
     state.flyout_open.insert((cid, kind));
+    let target = flyout_width(state, cid, kind);
+    let from = state
+        .flyout_anim
+        .get(&(cid, kind))
+        .map(|a| a.at(now))
+        .unwrap_or(0.0);
+    state.flyout_anim.insert(
+        (cid, kind),
+        strip::CollapseAnim {
+            prev: from,
+            value: target,
+            since: now,
+        },
+    );
+}
+
+/// Opens `(cid, kind)`; returns false when the request was queued until an
+/// existing same-strip panel has finished its shrink.
+fn open_flyout(
+    state: &mut TuxMix,
+    cid: ChannelId,
+    kind: strip::FlyoutKind,
+    now: Instant,
+) -> bool {
+    if kind == strip::FlyoutKind::Route {
+        let old_routes: Vec<_> = state
+            .flyout_open
+            .iter()
+            .filter(|&&(_, k)| k == strip::FlyoutKind::Route)
+            .copied()
+            .collect();
+        for (c, k) in old_routes {
+            begin_flyout_close(state, c, k, now);
+        }
+        open_flyout_now(state, cid, kind, now);
+        return true;
+    }
+
+    let other_open: Vec<_> = state
+        .flyout_open
+        .iter()
+        .filter(|&&(c, k)| c == cid && k != strip::FlyoutKind::Route)
+        .copied()
+        .collect();
+    // A different inline panel on the same strip morphs the current width
+    // straight to the new panel's width.  Do not run the old panel down to
+    // zero first: that full slide-out/in is visually disturbing and wastes
+    // the animation time when only the difference between the two panel
+    // widths is needed.
+    let closing_width = state
+        .flyout_anim
+        .iter()
+        .filter(|(&(c, k), _)| c == cid && k != strip::FlyoutKind::Route)
+        .map(|(_, a)| a.at(now))
+        .fold(0.0f32, f32::max);
+    if !other_open.is_empty() || closing_width > 0.0 {
+        let from = other_open
+            .iter()
+            .map(|&(c, k)| {
+                state
+                    .flyout_anim
+                    .get(&(c, k))
+                    .map(|a| a.at(now))
+                    .unwrap_or_else(|| flyout_width(state, c, k))
+            })
+            .fold(closing_width, f32::max);
+        for (c, k) in other_open {
+            state.flyout_open.remove(&(c, k));
+        }
+        state.flyout_anim.retain(|&(c, k), _| {
+            c != cid || k == strip::FlyoutKind::Route
+        });
+        let target = flyout_width(state, cid, kind);
+        state.flyout_open.insert((cid, kind));
+        state.flyout_anim.insert(
+            (cid, kind),
+            strip::CollapseAnim {
+                prev: from.max(0.0),
+                value: target,
+                since: now,
+            },
+        );
+        state.pending_flyout = None;
+        return true;
+    }
+
+    open_flyout_now(state, cid, kind, now);
+    state.pending_flyout = None;
+    true
 }
 
 /// Closes every currently-open `Route` flyout — the only kind
@@ -1865,7 +3850,16 @@ fn open_flyout(state: &mut TuxMix, cid: ChannelId, kind: strip::FlyoutKind) {
 /// such catcher, they're plain inline layout with their own explicit
 /// close (re-pressing the same gear/EQ/T icon).
 fn close_route_flyout(state: &mut TuxMix) {
-    state.flyout_open.retain(|&(_, k)| k != strip::FlyoutKind::Route);
+    let now = Instant::now();
+    let routes: Vec<_> = state
+        .flyout_open
+        .iter()
+        .filter(|&&(_, k)| k == strip::FlyoutKind::Route)
+        .copied()
+        .collect();
+    for (cid, kind) in routes {
+        begin_flyout_close(state, cid, kind, now);
+    }
 }
 
 /// Cap on `TuxMix::undo_stack`/`redo_stack` — unbounded growth over a
@@ -1902,6 +3896,7 @@ fn is_undoable(message: &Message) -> bool {
         message,
         Message::Tick
             | Message::SetView(_)
+            | Message::ToggleMatrixMono
             | Message::QuickChannelSelected(_)
             | Message::SelectOutput(_)
             | Message::ModifiersChanged(_)
@@ -1919,7 +3914,17 @@ fn is_undoable(message: &Message) -> bool {
             | Message::Tray(_)
             | Message::SetKeepInTray(_)
             | Message::SetAutostart(_)
+            | Message::MismatchUseTuxmix
+            | Message::MismatchUseDevice
+            | Message::MismatchAlwaysTuxmix
+            | Message::SetAlwaysInitDevice(_)
             | Message::RangeCleared(_)
+            | Message::FxVolumeReleased(_)
+            | Message::ToggleFxPanel
+            | Message::ToggleAssign
+            | Message::AssignDestinations(_)
+            | Message::AssignOutput(..)
+            | Message::CloseAssign
             | Message::ToggleCollapse(_)
             | Message::ToggleFlyout(..)
             | Message::CloseFlyout
@@ -1935,9 +3940,16 @@ fn is_undoable(message: &Message) -> bool {
             | Message::OscLog(_)
             | Message::ToggleOscLog
             | Message::ClearOscLog
+            | Message::OscMeters
             | Message::ToggleDevicePanel
             | Message::ToggleAbout
             | Message::ToggleSettings
+            | Message::LineInRefSelected(_)
+            | Message::LineInRef58Selected(_)
+            | Message::LineOutRefSelected(_)
+            | Message::PhonesRefSelected(_)
+            | Message::SpdifProfessionalChanged(_)
+            | Message::WordClockSingleSpeedChanged(_)
             | Message::OpenRepoUrl
             | Message::Undo
             | Message::Redo
@@ -1946,6 +3958,7 @@ fn is_undoable(message: &Message) -> bool {
             | Message::SidebarResize(_)
             | Message::SetRowMode(_)
             | Message::DimToggle
+            | Message::Dim(_)
             | Message::MatrixHover(..)
             | Message::PointerPressed
             | Message::FieldFocus(..)
@@ -1958,6 +3971,7 @@ fn is_undoable(message: &Message) -> bool {
             | Message::RenameCommit
             | Message::SetShowOriginalNames(_)
             | Message::SnapshotStore
+            | Message::SnapshotStoreTo(_)
             | Message::GroupEditToggle
             | Message::GroupLinkToggle(..)
             | Message::GroupClear
@@ -1974,7 +3988,7 @@ fn is_undoable(message: &Message) -> bool {
 fn changes_mix(message: &Message) -> bool {
     match message {
         Message::SnapshotClicked(_) => false,
-        Message::VolumeChanged(..) | Message::Undo | Message::Redo => true,
+        Message::VolumeChanged(..) | Message::MatrixCellChanged(..) | Message::Undo | Message::Redo => true,
         other => is_undoable(other),
     }
 }
@@ -1993,8 +4007,18 @@ fn needs_protocol_features(message: &Message) -> bool {
         message,
         Message::TrimChanged(..)
             | Message::TrimReset(_)
+            | Message::LevelChanged(..)
+            | Message::Autoset(..)
+            | Message::DynamicsEnabled(..)
+            | Message::DynamicsChanged(..)
+            | Message::SpeakerB(..)
+            | Message::ReverbChanged(..)
+            | Message::EchoChanged(..)
+            | Message::FxVolume(..)
+            | Message::FxReturnChanged(..)
+            | Message::FxSendChanged(..)
+            | Message::ResetMix(_)
             | Message::PhaseChanged(..)
-            | Message::LoopbackChanged(..)
             | Message::PitchChanged(_)
             | Message::WidthChanged(_)
             | Message::MsProcChanged(_)
@@ -2009,12 +4033,60 @@ fn needs_protocol_features(message: &Message) -> bool {
             | Message::EqBandGain(..)
             | Message::EqBandPoint(..)
             | Message::EqBandReset(..)
+            | Message::EqLowCutEnabled(..)
             | Message::EqLowCutFreq(..)
             | Message::EqLowCutSlope(..)
     )
 }
 
 pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
+    // The Assign cards close as soon as the user does anything else: a
+    // click outside them, a strip, a fader, a sidebar control — all arrive
+    // here as some other message. Periodic messages are exempt so the menu
+    // does not vanish on its own.
+    if !matches!(state.assign_menu, AssignMenu::Closed)
+        && !matches!(
+            message,
+            Message::ToggleAssign
+                | Message::AssignDestinations(_)
+                | Message::AssignOutput(..)
+                | Message::CloseAssign
+                | Message::Tick
+                | Message::ModifiersChanged(_)
+        )
+    {
+        state.assign_menu = AssignMenu::Closed;
+    }
+
+    // OSC is an input path, not a separate control implementation: decode
+    // it to the same Message the GUI produces, then run the normal update
+    // loop.  That gives OSC the same clamps, undo, host-scene merge and
+    // autosave behaviour as a click.
+    if let Message::OscCommand(cmd) = &message {
+        return match cmd.clone().into_message() {
+            Some(inner) => update(state, inner),
+            None => Task::none(),
+        };
+    }
+    // UC startup: the first scene write happens before the meter taps open
+    // the card, and the unit can reload its stored mixer on stream start.
+    // Reapply the (possibly user-edited) model once the card has settled.
+    if let Some(due) = state.startup_scene_due {
+        if Instant::now() >= due {
+            state.startup_scene_due = None;
+            // Reapply the scene that was loaded from disk, not the current
+            // model.  The UC may have delivered a stale front-panel event
+            // after the first write; capturing the model here would make
+            // the device value permanent.
+            if let Some(scene) = state.startup_scene.take() {
+                if let Err(e) = state.device.apply_scene(&scene) {
+                    log::warn!("scene reapply failed: {e:?}");
+                } else {
+                    log::info!("reapplied the Fireface mixer scene");
+                }
+            }
+        }
+    }
     // Anything but the background polls is the user doing something, or
     // something the user must see: keep the tick fast for a while.
     if !matches!(
@@ -2028,12 +4100,25 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
     // hides the controls; this is the other half of that, so nothing built
     // by hand reaches a setter that can only fail.
     if needs_protocol_features(&message) && !state.device.protocol_features() {
-        log::debug!("ignored {message:?}: this connection has no RME-protocol features");
-        return Task::none();
+        // Phase is the one exception: the UC has no EQ/FX DSP, so the
+        // coarse protocol_features flag is false there, but it does store
+        // phase in the matrix sign bits.
+        let phase_allowed =
+            matches!(&message, Message::PhaseChanged(..)) && state.device.phase_supported();
+        if !phase_allowed {
+            log::debug!("ignored {message:?}: this connection has no RME-protocol features");
+            return Task::none();
+        }
     }
-    if changes_mix(&message) {
+    let mix_changed = changes_mix(&message);
+    if mix_changed {
         state.snapshot_dirty = true;
     }
+    // Capture the live model before a host-originated mix change.  At the
+    // end of this update only the fields that actually changed are merged
+    // into the saved host scene; an earlier front-panel change is present
+    // in both captures and is therefore not persisted.
+    let host_before = mix_changed.then(|| state.device.capture_scene());
     if changes_prefs(&message) {
         state.prefs_dirty = true;
     }
@@ -2047,7 +4132,10 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         );
         state.undo_gesture = gesture.map(|g| (g, now));
         if !continues {
-            let scene = state.device.capture_scene();
+            let scene = state
+                .host_scene
+                .clone()
+                .unwrap_or_else(|| state.device.capture_scene());
             state.undo_stack.push(scene);
             if state.undo_stack.len() > UNDO_STACK_CAP {
                 state.undo_stack.remove(0);
@@ -2095,16 +4183,67 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             if conn_due {
                 state.last_conn_check = Some(Instant::now());
                 state.connected = state.device.is_connected();
-                if !state.connected && !state.explicit_mock {
-                    if let Some(fresh) = DeviceHandle::open_real(state.backend.as_deref()) {
-                        log::info!("Device reconnected");
+                if !state.connected {
+                    state.show_device_panel = false;
+                }
+                // A fallback mock (no device found at launch) must keep
+                // probing for the real card.  Its `is_connected()` is true,
+                // so the old `!connected` gate would leave the Babyface mock
+                // on screen even after the UC appeared.
+                let fallback_mock = state.device.is_mock() && !state.explicit_mock;
+                if (!state.connected || fallback_mock) && !state.explicit_mock {
+                    let fresh = state
+                        .device_target
+                        .as_ref()
+                        .and_then(DeviceHandle::open_target)
+                        .or_else(|| DeviceHandle::open_real(state.backend.as_deref()));
+                    if let Some(fresh) = fresh {
+                        log::info!("Device connected: {}", fresh.target().label());
+                        state.device_target = Some(fresh.target());
+                        state.prefs_dirty = true;
                         state.device = fresh;
                         state.connected = true;
-                        if let Some(scene) = tuxmix_core::scene::load_auto_scene() {
-                            if let Err(e) = state.device.apply_scene(&scene) {
-                                fail(state, "apply_scene", &e);
+                        state.show_device_panel = false;
+                        if state.device.needs_scene_restore()
+                            || state.sync_direction == SyncDirection::GuiToDevice
+                        {
+                            let scene = load_scene_for_current(state);
+                            if let Some(scene) = scene {
+                                state.host_scene = Some(scene.clone());
+                                if let Err(e) = state.device.apply_scene(&scene) {
+                                    fail(state, "apply_scene", &e);
+                                } else {
+                                    state.host_scene = Some(state.device.capture_scene());
+                                }
+                                if state.device.is_uc_model() {
+                                    // The reconnect scene is written while
+                                    // the new stream may still be closed.
+                                    // Reapply it once the stream and the
+                                    // UC's reloaded mixer have settled.
+                                    state.startup_scene = Some(scene);
+                                    state.startup_scene_due =
+                                        Some(Instant::now() + Duration::from_secs(1));
+                                    state
+                                        .device
+                                        .suppress_front_panel_for(Duration::from_secs(2));
+                                }
                             }
                         }
+                        if state.host_scene.is_none() {
+                            state.host_scene = Some(state.device.capture_scene());
+                        }
+                        restore_engine(state);
+                        // `fresh` starts with the deferred meter tap (the
+                        // global TUXMIX_DEFER_METER_TAP), exactly like the
+                        // first launch.  Start it now that the scene and the
+                        // remembered rate are in place; otherwise the input
+                        // meters stay dead after a reconnect.
+                        state.device.begin_metering();
+                        // Force the next poll to treat the reopened card as
+                        // a fresh stream: schedule the post-start reapply
+                        // even if the previous state already said RUNNING.
+                        state.last_sink_running = false;
+                        state.last_card_rate = None;
                     }
                 }
             }
@@ -2113,6 +4252,15 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             if panel_fingerprint(state) != before {
                 // The front panel moved a level, a mute or the dim: show
                 // it at the fast rate while it keeps moving.
+                state.last_activity = Instant::now();
+            }
+            // The physical UCX encoder changes the IF1-derived Phones
+            // hardware volume.  Detect that at the 100 ms idle poll and
+            // switch to the 33 ms tick only while it is moving; polling it
+            // at 30 Hz forever costs ~45% of a core in iced redraws.
+            let hw = state.device.hardware_volume();
+            if hw != state.last_hw_volume {
+                state.last_hw_volume = hw;
                 state.last_activity = Instant::now();
             }
             // Follow the front panel's OUT selection (TotalMix
@@ -2129,26 +4277,45 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 };
                 if state.last_panel_out != Some(out_sel) {
                     state.last_panel_out = Some(out_sel);
-                    state.sel_out = out;
+                    state.sel_out = state.device.display_pair_index(out);
                 }
             }
             let in_levels = state.device.input_meters();
             for (i, m) in state.input_meters.iter_mut().enumerate() {
                 m.step_elapsed(in_levels.get(i).copied().unwrap_or(0.0));
             }
-            // Mock owns its playback levels; every real backend reads
-            // the host mixer's sink monitor through `pw_meter`.
-            let (tap_levels, tap_channels) = state.playback_tap.drain();
-            state.playback_tap_channels = tap_channels;
-            let pb_levels = if state.device.is_mock() {
-                state.device.playback_meters()
-            } else {
-                tap_levels.to_vec()
-            };
+            // UCX: use the device's own 0x85 meter words for inputs and
+            // playback.  Hardware-output post-fader meters come from the
+            // device too when it supplies them; otherwise fall back to the
+            // host-side matrix sum used by the ALSA/mock backends.
+            let (pb_levels, device_output) =
+                if let Some(pb) = state.device.device_playback_meters() {
+                    state.playback_tap_channels = state.device.playbacks().len();
+                    (pb, state.device.device_output_meters())
+                } else {
+                    let (tap_levels, tap_channels) = state.playback_tap.drain();
+                    state.playback_tap_channels = tap_channels;
+                    let pb = if state.device.is_mock() {
+                        state.device.playback_meters()
+                    } else {
+                        tap_levels.to_vec()
+                    };
+                    (pb, state.device.device_output_meters())
+                };
+            let mut out_levels = device_output
+                .unwrap_or_else(|| state.device.output_meters_from(&in_levels, &pb_levels));
+            // A muted output must read zero even if a backend's post-fader
+            // packet is taken before its mute stage.
+            for (i, ch) in state.device.outputs().iter().enumerate() {
+                if ch.mute {
+                    if let Some(level) = out_levels.get_mut(i) {
+                        *level = 0.0;
+                    }
+                }
+            }
             for (i, m) in state.playback_meters.iter_mut().enumerate() {
                 m.step_elapsed(pb_levels.get(i).copied().unwrap_or(0.0));
             }
-            let out_levels = state.device.output_meters_from(&in_levels, &pb_levels);
             for (i, m) in state.output_meters.iter_mut().enumerate() {
                 m.step_elapsed(out_levels.get(i).copied().unwrap_or(0.0));
             }
@@ -2163,10 +4330,13 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             {
                 state.last_activity = Instant::now();
             }
-            // Persist the mixer state (debounced 3 s) — no hardware
-            // readback for gains/volumes, so this is the restore source
-            // for the next open (loaded in `new()`). Shared with the TUI.
-            if state.last_auto_save.elapsed() >= Duration::from_secs(3) {
+            // Persist the mixer state (debounced 3 s) for the backend that
+            // has no gain/volume readback (USB); this is its restore source
+            // for the next open (loaded in `new()`). ALSA backends read the
+            // live matrix and skip this path entirely. Shared with the TUI.
+            if state.last_auto_save.elapsed() >= Duration::from_secs(3)
+                && state.startup_scene.is_none()
+            {
                 state.last_auto_save = Instant::now();
                 // The mock has no hardware and its state would pollute
                 // the SHARED auto.json with a "(mock)" model (making the
@@ -2175,21 +4345,36 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                     state.last_saved_json = None;
                     return Task::none();
                 }
-                // GUI/TUI sync: if the OTHER UI wrote auto.json since our
-                // last save, re-apply its state first so we don't clobber
-                // it with our own (possibly stale) copy — then save ours.
-                if let Some(their) = tuxmix_core::scene::auto_scene_written_by_other(
-                    state.last_saved_json.as_deref(),
-                ) {
-                    if let Err(e) = state.device.apply_scene(&their) {
-                        fail(state, "apply_scene", &e);
+                // USB always needs the shared auto scene.  An ALSA/UCX
+                // session in GUI -> device mode also saves its state so the
+                // next launch can apply it; Device -> GUI never writes the
+                // stale scene over the live device.
+                let auto_save = state.device.needs_scene_restore()
+                    || state.sync_direction == SyncDirection::GuiToDevice;
+                if auto_save {
+                    if uses_shared_auto_scene(state) {
+                        // GUI/TUI sync: if the OTHER UI wrote auto.json since
+                        // our last save, re-apply its state first so we don't
+                        // clobber it with our own (possibly stale) copy.
+                        if let Some(their) = tuxmix_core::scene::auto_scene_written_by_other(
+                            state.last_saved_json.as_deref(),
+                        ) {
+                            state.host_scene = Some(their.clone());
+                            if let Err(e) = state.device.apply_scene(&their) {
+                                fail(state, "apply_scene", &e);
+                            }
+                        }
                     }
-                }
-                let scene = state.device.capture_scene();
-                if let Ok(json) = scene.to_json() {
-                    if state.last_saved_json.as_deref() != Some(json.as_str()) {
-                        if tuxmix_core::scene::save_auto_scene(&scene).is_ok() {
-                            state.last_saved_json = Some(json);
+                    let scene = state
+                        .host_scene
+                        .clone()
+                        .unwrap_or_else(|| state.device.capture_scene());
+                    if let Ok(json) = scene.to_json() {
+                        if state.last_saved_json.as_deref() != Some(json.as_str()) {
+                            let saved = save_scene_for_current(state, &scene);
+                            if saved.is_ok() {
+                                state.last_saved_json = Some(json);
+                            }
                         }
                     }
                 }
@@ -2245,6 +4430,28 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             Ok(()) => state.autostart = crate::tray::autostart_enabled(),
             Err(e) => log::warn!("Could not change the autostart entry: {e}"),
         },
+        Message::MismatchUseTuxmix => {
+            state.startup_mismatch = None;
+            state.sync_direction = SyncDirection::GuiToDevice;
+        }
+        Message::MismatchUseDevice => {
+            if let Some(mismatch) = state.startup_mismatch.take() {
+                if let Err(e) = state.device.restore_readable(&mismatch.device_state) {
+                    fail(state, "restore device settings", &e);
+                }
+            }
+            state.sync_direction = SyncDirection::GuiToDevice;
+        }
+        Message::MismatchAlwaysTuxmix => {
+            state.startup_mismatch = None;
+            state.always_init_device = true;
+            state.prefs_dirty = true;
+            state.sync_direction = SyncDirection::GuiToDevice;
+        }
+        Message::SetAlwaysInitDevice(on) => {
+            state.always_init_device = on;
+            state.prefs_dirty = true;
+        }
         // Immediate save (window close) — the debounce above would lose
         // the last few seconds of changes. Sync with the other UI first
         // (see the 3 s auto-save in `Message::Tick`). The mock never
@@ -2253,17 +4460,29 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             // Closing writes the window size, which no resize step does.
             state.prefs_dirty = true;
             flush_prefs(state);
-            if !state.device.is_mock() {
-                if let Some(their) = tuxmix_core::scene::auto_scene_written_by_other(
-                    state.last_saved_json.as_deref(),
-                ) {
-                    if let Err(e) = state.device.apply_scene(&their) {
-                        fail(state, "apply_scene", &e);
+            if !state.device.is_mock() && state.device.needs_scene_restore() {
+                if uses_shared_auto_scene(state) {
+                    if let Some(their) = tuxmix_core::scene::auto_scene_written_by_other(
+                        state.last_saved_json.as_deref(),
+                    ) {
+                        state.host_scene = Some(their.clone());
+                        if let Err(e) = state.device.apply_scene(&their) {
+                            fail(state, "apply_scene", &e);
+                        }
                     }
                 }
-                let scene = state.device.capture_scene();
+                // If the startup reapply is still pending, save the host
+                // scene that was loaded.  Otherwise save the host-owned
+                // scene, never the live model (front-panel changes must not
+                // become part of the saved mix).
+                let scene = state
+                    .startup_scene
+                    .clone()
+                    .or_else(|| state.host_scene.clone())
+                    .unwrap_or_else(|| state.device.capture_scene());
                 if let Ok(json) = scene.to_json() {
-                    if tuxmix_core::scene::save_auto_scene(&scene).is_ok() {
+                    let saved = save_scene_for_current(state, &scene);
+                    if saved.is_ok() {
                         state.last_saved_json = Some(json);
                     }
                 }
@@ -2282,6 +4501,11 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         Message::SetView(v) => {
             state.view = v;
             state.matrix_hover = None;
+        }
+        Message::SelectDevice(target) => {
+            if let Err(e) = switch_device(state, target) {
+                fail(state, "switch device", &e);
+            }
         }
         Message::WheelZoom(y) => {
             // Only zoom on Ctrl+wheel; plain wheel keeps scrolling the
@@ -2308,22 +4532,15 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             // job. Doesn't touch any other (Settings/Eq/Trim) flyout
             // that happens to be open elsewhere.
             close_route_flyout(state);
+            notify_osc_raw(state, "/submix", vec![OscType::Int(i as i32)]);
         }
         Message::ModifiersChanged(m) => state.modifiers = m,
         Message::WindowSize(w, h) => {
-            // A narrow window folds the sidebar, and a wider one brings it
-            // back (only if the window folded it: a user's own fold stays).
-            let was_narrow = state
-                .window_size
-                .is_some_and(|(pw, _)| sidebar_does_not_fit(state, pw));
-            let narrow = sidebar_does_not_fit(state, w);
-            if narrow && !was_narrow && state.sidebar_open {
-                state.sidebar_open = false;
-                state.auto_folded = true;
-            } else if !narrow && was_narrow && state.auto_folded {
-                state.sidebar_open = true;
-                state.auto_folded = false;
-            }
+            // The right-hand control strip is never folded by the window
+            // width.  A narrow window keeps it visible and the mixer rows
+            // scroll horizontally underneath their own slider, which sits
+            // immediately to the left of the panel.  Only the user's own
+            // ToggleSidebar may collapse it.
             state.window_size = Some((w, h));
             return update(state, Message::WindowResized(w));
         }
@@ -2406,16 +4623,51 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             if let Err(e) = state.device.set_input_phantom(idx, p) {
                 fail(state, "set_input_phantom", &e);
             }
+            notify_osc_bool(state, format!("/input/{idx}/phantom"), p);
         }
         Message::Pad(idx, p) => {
             if let Err(e) = state.device.set_input_pad(idx, p) {
                 fail(state, "set_input_pad", &e);
             }
+            notify_osc_bool(state, format!("/input/{idx}/pad"), p);
+        }
+        Message::Instrument(idx, p) => {
+            if let Err(e) = state.device.set_input_instrument(idx, p) {
+                fail(state, "set_input_instrument", &e);
+            }
+            notify_osc_bool(state, format!("/input/{idx}/instrument"), p);
+        }
+        Message::LevelChanged(idx, level) => {
+            if let Err(e) = state.device.set_input_level(idx, level) {
+                fail(state, "set_input_level", &e);
+            }
+            notify_osc_raw(
+                state,
+                format!("/input/{idx}/level"),
+                vec![OscType::Int(level.code() as i32)],
+            );
+        }
+        Message::Autoset(idx, on) => {
+            if let Err(e) = state.device.set_autoset(idx, on) {
+                fail(state, "set_autoset", &e);
+            }
+            notify_osc_bool(state, format!("/input/{idx}/autoset"), on);
         }
         Message::Gain(idx, g) => {
             if let Err(e) = state.device.set_input_gain(idx, g) {
                 fail(state, "set_input_gain", &e);
             }
+            let actual = state
+                .device
+                .inputs()
+                .get(idx)
+                .and_then(|c| c.gain)
+                .unwrap_or(g);
+            notify_osc_raw(
+                state,
+                format!("/input/{idx}/gain"),
+                vec![OscType::Float(actual as f32)],
+            );
         }
         Message::Sensitivity(idx, plus4) => {
             let s = if plus4 {
@@ -2426,80 +4678,316 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             if let Err(e) = state.device.set_sensitivity(idx, s) {
                 fail(state, "set_sensitivity", &e);
             }
+            notify_osc_bool(state, format!("/input/{idx}/sensitivity"), plus4);
         }
         Message::TrimChanged(idx, db) => {
             if let Err(e) = state.device.set_trim(idx, db) {
                 fail(state, "set_trim", &e);
             }
+            notify_osc_raw(state, format!("/input/{idx}/trim"), vec![OscType::Float(db)]);
         }
         Message::TrimReset(idx) => {
             if let Err(e) = state.device.set_trim(idx, 0.0) {
                 fail(state, "set_trim", &e);
             }
+            notify_osc_raw(state, format!("/input/{idx}/trim"), vec![OscType::Float(0.0)]);
         }
-        Message::EqEnabled(idx, on) => {
-            if let Err(e) = state.device.set_eq_enabled(idx, on) {
+        Message::EqEnabled(cid, on) => {
+            if let Err(e) = set_eq_enabled_for(state, cid, on) {
                 fail(state, "set_eq_enabled", &e);
             }
+            let (kind, id) = channel_slug(cid);
+            notify_osc_bool(state, format!("/{kind}/{id}/eq"), on);
         }
-        Message::EqBandType(idx, band, t) => {
-            if let Err(e) = state.device.set_eq_band_type(idx, band, t) {
+        Message::EqBandType(cid, band, t) => {
+            if let Err(e) = set_eq_band_type_for(state, cid, band, t) {
                 fail(state, "set_eq_band_type", &e);
             }
+            let code = match t {
+                EqBandType::Off => 0,
+                EqBandType::Bell => 1,
+                EqBandType::LowShelf => 2,
+                EqBandType::HighShelf => 3,
+                        EqBandType::LowPass => 4,
+};
+            let (kind, id) = channel_slug(cid);
+            notify_osc_raw(
+                state,
+                format!("/{kind}/{id}/eq/{band}/type"),
+                vec![OscType::Int(code)],
+            );
         }
-        Message::EqBandFreq(idx, band, freq) => {
-            if let Err(e) = state.device.set_eq_band_freq(idx, band, freq) {
+        Message::EqBandFreq(cid, band, freq) => {
+            if let Err(e) = set_eq_band_freq_for(state, cid, band, freq) {
                 fail(state, "set_eq_band_freq", &e);
             }
+            let (kind, id) = channel_slug(cid);
+            notify_osc_raw(
+                state,
+                format!("/{kind}/{id}/eq/{band}/freq"),
+                vec![OscType::Float(freq as f32)],
+            );
         }
-        Message::EqBandQ(idx, band, q) => {
-            if let Err(e) = state.device.set_eq_band_q(idx, band, q) {
+        Message::EqBandQ(cid, band, q) => {
+            if let Err(e) = set_eq_band_q_for(state, cid, band, q) {
                 fail(state, "set_eq_band_q", &e);
             }
+            let (kind, id) = channel_slug(cid);
+            notify_osc_raw(
+                state,
+                format!("/{kind}/{id}/eq/{band}/q"),
+                vec![OscType::Float(q)],
+            );
         }
-        Message::EqBandGain(idx, band, gain) => {
-            if let Err(e) = state.device.set_eq_band_gain(idx, band, gain) {
+        Message::EqBandGain(cid, band, gain) => {
+            if let Err(e) = set_eq_band_gain_for(state, cid, band, gain) {
                 fail(state, "set_eq_band_gain", &e);
             }
+            let (kind, id) = channel_slug(cid);
+            notify_osc_raw(
+                state,
+                format!("/{kind}/{id}/eq/{band}/gain"),
+                vec![OscType::Float(gain)],
+            );
         }
-        Message::EqBandPoint(idx, band, freq, gain) => {
-            if let Err(e) = state.device.set_eq_band_freq(idx, band, freq) {
+        Message::EqBandPoint(cid, band, freq, gain) => {
+            if let Err(e) = set_eq_band_freq_for(state, cid, band, freq) {
                 fail(state, "set_eq_band_freq", &e);
             }
-            if let Err(e) = state.device.set_eq_band_gain(idx, band, gain) {
+            if let Err(e) = set_eq_band_gain_for(state, cid, band, gain) {
                 fail(state, "set_eq_band_gain", &e);
             }
+            let (kind, id) = channel_slug(cid);
+            notify_osc_raw(
+                state,
+                format!("/{kind}/{id}/eq/{band}/freq"),
+                vec![OscType::Float(freq as f32)],
+            );
+            notify_osc_raw(
+                state,
+                format!("/{kind}/{id}/eq/{band}/gain"),
+                vec![OscType::Float(gain)],
+            );
         }
-        Message::EqBandReset(idx, band) => {
-            if let Err(e) = state.device.set_eq_band_freq(idx, band, 1000) {
-                fail(state, "set_eq_band_freq", &e);
+        Message::EqBandReset(cid, band) => {
+            let reset = match cid {
+                ChannelId::Input(idx) => {
+                    let mut result = state.device.set_eq_band_freq(idx, band, 1000);
+                    if result.is_ok() {
+                        result = state.device.set_eq_band_q(idx, band, 0.7);
+                    }
+                    if result.is_ok() {
+                        result = state.device.set_eq_band_gain(idx, band, 0.0);
+                    }
+                    result
+                }
+                ChannelId::Output(idx) => update_output_eq(state, idx, |e| {
+                    e.bands[band].freq_hz = 1000;
+                    e.bands[band].q = 0.7;
+                    e.bands[band].gain_db = 0.0;
+                }),
+                ChannelId::Playback(_) => Ok(()),
+            };
+            if let Err(e) = reset {
+                fail(state, "set_eq_band_reset", &e);
             }
-            if let Err(e) = state.device.set_eq_band_q(idx, band, 0.7) {
-                fail(state, "set_eq_band_q", &e);
-            }
-            if let Err(e) = state.device.set_eq_band_gain(idx, band, 0.0) {
-                fail(state, "set_eq_band_gain", &e);
+            let (kind, id) = channel_slug(cid);
+            for (suffix, value) in [("freq", 1000.0), ("q", 0.7), ("gain", 0.0)] {
+                notify_osc_raw(
+                    state,
+                    format!("/{kind}/{id}/eq/{band}/{suffix}"),
+                    vec![OscType::Float(value)],
+                );
             }
         }
-        Message::EqLowCutFreq(idx, freq) => {
-            if let Err(e) = state.device.set_eq_low_cut_freq(idx, freq) {
+        Message::EqLowCutEnabled(cid, on) => {
+            if let Err(e) = set_low_cut_enabled_for(state, cid, on) {
+                fail(state, "set_eq_low_cut_enabled", &e);
+            }
+            let (kind, id) = channel_slug(cid);
+            notify_osc_bool(state, format!("/{kind}/{id}/lowcut"), on);
+        }
+        Message::EqLowCutFreq(cid, freq) => {
+            if let Err(e) = set_low_cut_freq_for(state, cid, freq) {
                 fail(state, "set_eq_low_cut_freq", &e);
             }
+            let (kind, id) = channel_slug(cid);
+            notify_osc_raw(
+                state,
+                format!("/{kind}/{id}/lowcut/freq"),
+                vec![OscType::Float(freq as f32)],
+            );
         }
-        Message::EqLowCutSlope(idx, slope) => {
-            if let Err(e) = state.device.set_eq_low_cut_slope(idx, slope) {
+        Message::EqLowCutSlope(cid, slope) => {
+            if let Err(e) = set_low_cut_slope_for(state, cid, slope) {
                 fail(state, "set_eq_low_cut_slope", &e);
             }
+            let (kind, id) = channel_slug(cid);
+            notify_osc_raw(
+                state,
+                format!("/{kind}/{id}/lowcut/slope"),
+                vec![OscType::Int(slope as i32)],
+            );
+        }
+        Message::DynamicsEnabled(cid, on) => {
+            let mut d = dynamics_for(state, cid);
+            d.on = on;
+            if let Err(e) = state.device.set_dynamics(cid, &d) {
+                fail(state, "set_dynamics", &e);
+            }
+            let (kind, id) = channel_slug(cid);
+            notify_osc_bool(state, format!("/{kind}/{id}/dynamics"), on);
+        }
+        Message::DynamicsChanged(cid, d) => {
+            if let Err(e) = state.device.set_dynamics(cid, &d) {
+                fail(state, "set_dynamics", &e);
+            }
+            let (kind, id) = channel_slug(cid);
+            let base = format!("/{kind}/{id}/dynamics");
+            notify_osc_bool(state, format!("{base}/on"), d.on);
+            notify_osc_raw(state, format!("{base}/gain"), vec![OscType::Float(d.gain_db)]);
+            notify_osc_raw(
+                state,
+                format!("{base}/attack"),
+                vec![OscType::Int(d.attack_ms as i32)],
+            );
+            notify_osc_raw(
+                state,
+                format!("{base}/release"),
+                vec![OscType::Int(d.release_ms as i32)],
+            );
+            notify_osc_raw(
+                state,
+                format!("{base}/comp/threshold"),
+                vec![OscType::Float(d.comp_threshold_db)],
+            );
+            notify_osc_raw(
+                state,
+                format!("{base}/comp/ratio"),
+                vec![OscType::Float(d.comp_ratio)],
+            );
+            notify_osc_raw(
+                state,
+                format!("{base}/exp/threshold"),
+                vec![OscType::Float(d.exp_threshold_db)],
+            );
+            notify_osc_raw(
+                state,
+                format!("{base}/exp/ratio"),
+                vec![OscType::Float(d.exp_ratio)],
+            );
+            notify_osc_bool(state, format!("{base}/auto"), d.auto_level);
+            notify_osc_raw(
+                state,
+                format!("{base}/auto/max"),
+                vec![OscType::Float(d.auto_max_gain_db)],
+            );
+            notify_osc_raw(
+                state,
+                format!("{base}/auto/headroom"),
+                vec![OscType::Float(d.auto_headroom_db)],
+            );
+            notify_osc_raw(
+                state,
+                format!("{base}/auto/rise"),
+                vec![OscType::Float(d.auto_rise_s)],
+            );
+        }
+        Message::ReverbChanged(r) => {
+            if let Err(e) = state.device.set_reverb(&r) {
+                fail(state, "set_reverb", &e);
+            }
+            notify_osc_bool(state, "/fx/reverb/on", r.on);
+            notify_osc_raw(state, "/fx/reverb/type", vec![OscType::Int(r.kind as i32)]);
+            notify_osc_raw(
+                state,
+                "/fx/reverb/predelay",
+                vec![OscType::Int(r.pre_delay_ms as i32)],
+            );
+            notify_osc_raw(
+                state,
+                "/fx/reverb/lowcut",
+                vec![OscType::Int(r.low_cut_hz as i32)],
+            );
+            notify_osc_raw(
+                state,
+                "/fx/reverb/highcut",
+                vec![OscType::Int(r.high_cut_hz as i32)],
+            );
+            notify_osc_raw(
+                state,
+                "/fx/reverb/room",
+                vec![OscType::Float(r.room_scale)],
+            );
+            notify_osc_raw(
+                state,
+                "/fx/reverb/smooth",
+                vec![OscType::Int(r.smoothness as i32)],
+            );
+            notify_osc_raw(
+                state,
+                "/fx/reverb/volume",
+                vec![OscType::Float(r.volume_db)],
+            );
+            notify_osc_raw(
+                state,
+                "/fx/reverb/width",
+                vec![OscType::Float(r.width)],
+            );
+        }
+        Message::EchoChanged(echo) => {
+            if let Err(e) = state.device.set_echo(&echo) {
+                fail(state, "set_echo", &e);
+            }
+            notify_osc_bool(state, "/fx/echo/on", echo.on);
+            notify_osc_raw(state, "/fx/echo/type", vec![OscType::Int(echo.kind as i32)]);
+            notify_osc_raw(
+                state,
+                "/fx/echo/delay",
+                vec![OscType::Int(echo.delay_ms as i32)],
+            );
+            notify_osc_raw(
+                state,
+                "/fx/echo/feedback",
+                vec![OscType::Int(echo.feedback as i32)],
+            );
+            notify_osc_raw(
+                state,
+                "/fx/echo/highcut",
+                vec![OscType::Int(echo.high_cut as i32)],
+            );
+            notify_osc_raw(
+                state,
+                "/fx/echo/volume",
+                vec![OscType::Float(echo.volume_db)],
+            );
+            notify_osc_raw(state, "/fx/echo/width", vec![OscType::Float(echo.width)]);
+        }
+        Message::ResetMix(kind) => {
+            apply_reset_mix(state, kind);
+        }
+        Message::FxSendChanged(cid, db) => {
+            if let Err(e) = state.device.set_channel_fx_send(cid, db) {
+                fail(state, "set_channel_fx_send", &e);
+            }
+            let (kind, id) = channel_slug(cid);
+            notify_osc_raw(state, format!("/{kind}/{id}/fx_send"), vec![OscType::Float(db)]);
+        }
+        Message::FxReturnChanged(out, db) => {
+            if let Err(e) = state.device.set_fx_return(out, db) {
+                fail(state, "set_fx_return", &e);
+            }
+            notify_osc_raw(
+                state,
+                format!("/output/{out}/fxreturn"),
+                vec![OscType::Float(db)],
+            );
         }
         Message::LoopbackChanged(i, on) => {
-            let pair = if state.device.outputs_one_per_pair() {
-                i
-            } else {
-                i / 2
-            };
-            if let Err(e) = state.device.set_loopback(pair, on) {
+            if let Err(e) = state.device.set_loopback_channel(i, on) {
                 fail(state, "set_loopback", &e);
             }
+            notify_osc_bool(state, format!("/output/{i}/loopback"), on);
         }
         Message::StereoLinkChanged(cid, linked) => {
             let _ = match cid {
@@ -2507,47 +4995,94 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 ChannelId::Playback(i) => state.device.set_playback_linked(i / 2, linked),
                 ChannelId::Output(i) => state.device.set_output_linked(i / 2, linked),
             };
+            start_stereo_anim(state, cid, linked);
+            let (kind, id) = channel_slug(cid);
+            notify_osc_bool(state, format!("/{kind}/{id}/stereo"), linked);
         }
         Message::PitchChanged(v) => {
             if let Err(e) = state.device.set_pitch(v) {
                 fail(state, "set_pitch", &e);
             }
+            notify_osc_raw(state, "/pitch", vec![OscType::Float(v)]);
         }
         Message::WidthChanged(v) => {
             if let Err(e) = state.device.set_width(v) {
                 fail(state, "set_width", &e);
             }
+            notify_osc_raw(state, "/width", vec![OscType::Float(v)]);
         }
         Message::MsProcChanged(on) => {
             if let Err(e) = state.device.set_ms_proc(on) {
                 fail(state, "set_ms_proc", &e);
             }
+            notify_osc_bool(state, "/ms_proc", on);
         }
         Message::An12Changed(on) => {
             if let Err(e) = state.device.set_an12(on) {
                 fail(state, "set_an12", &e);
             }
+            notify_osc_bool(state, "/an12", on);
         }
         Message::InputLinkChanged(on) => {
             if let Err(e) = state.device.set_input_link(on) {
                 fail(state, "set_input_link", &e);
             }
+            notify_osc_bool(state, "/input_link", on);
         }
         Message::EqForRecordChanged(on) => {
             if let Err(e) = state.device.set_eq_for_record(on) {
                 fail(state, "set_eq_for_record", &e);
             }
+            notify_osc_bool(state, "/eq_for_record", on);
         }
         Message::OpticalOutFormatChanged(spdif) => {
             if let Err(e) = state.device.set_optical_out_format(spdif) {
                 fail(state, "set_optical_out_format", &e);
             }
+            notify_osc_bool(state, "/optical_out_spdif", spdif);
+        }
+        Message::LineInRefSelected(code) => {
+            if let Err(e) = state.device.set_line_in_ref(code) {
+                fail(state, "set_line_in_ref", &e);
+            }
+            notify_osc_raw(state, "/line_in_ref", vec![OscType::Int(code as i32)]);
+        }
+        Message::LineInRef58Selected(code) => {
+            if let Err(e) = state.device.set_line_in_ref_58(code) {
+                fail(state, "set_line_in_ref_58", &e);
+            }
+            notify_osc_raw(state, "/line_in_ref_58", vec![OscType::Int(code as i32)]);
+        }
+        Message::LineOutRefSelected(code) => {
+            if let Err(e) = state.device.set_line_out_ref(code) {
+                fail(state, "set_line_out_ref", &e);
+            }
+            notify_osc_raw(state, "/line_out_ref", vec![OscType::Int(code as i32)]);
+        }
+        Message::PhonesRefSelected(code) => {
+            if let Err(e) = state.device.set_phones_ref(code) {
+                fail(state, "set_phones_ref", &e);
+            }
+            notify_osc_raw(state, "/phones_ref", vec![OscType::Int(code as i32)]);
+        }
+        Message::SpdifProfessionalChanged(on) => {
+            if let Err(e) = state.device.set_spdif_professional(on) {
+                fail(state, "set_spdif_professional", &e);
+            }
+            notify_osc_bool(state, "/spdif_professional", on);
+        }
+        Message::WordClockSingleSpeedChanged(on) => {
+            if let Err(e) = state.device.set_word_clock_single_speed(on) {
+                fail(state, "set_word_clock_single_speed", &e);
+            }
+            notify_osc_bool(state, "/word_clock_single_speed", on);
         }
         Message::CueChanged(cid, on) => {
             if let ChannelId::Output(idx) = cid {
                 if let Err(e) = state.device.set_cue(idx / 2, on) {
                     fail(state, "set_cue", &e);
                 }
+                notify_osc_bool(state, format!("/output/{idx}/cue"), on);
             }
         }
         Message::PhaseChanged(cid, invert) => {
@@ -2555,10 +5090,44 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 if let Err(e) = state.device.set_phase(idx, invert) {
                     fail(state, "set_phase", &e);
                 }
+                notify_osc_bool(state, format!("/input/{idx}/phase"), invert);
             }
         }
         Message::VolumeChanged(cid, out, v) => {
             apply_grouped_volume(state, cid, out, v);
+        }
+        Message::MatrixCellChanged(cid, block, v) => {
+            if state.matrix_mono {
+                if let Err(e) = state.device.set_matrix_cell(cid, block, v) {
+                    fail(state, "set_matrix_cell", &e);
+                }
+            } else {
+                apply_grouped_volume(state, cid, block / 2, v);
+            }
+        }
+        Message::ToggleMatrixMono => {
+            state.matrix_mono = !state.matrix_mono;
+            state.last_activity = Instant::now();
+        }
+        Message::NudgeVolume(delta_db) => {
+            let targets: Vec<ChannelId> = if !state.selected.is_empty() {
+                state.selected.iter().copied().collect()
+            } else if let Some(cid) = state.focus_channel {
+                vec![cid]
+            } else {
+                Vec::new()
+            };
+            for cid in targets {
+                let out = match cid {
+                    ChannelId::Output(_) => 0,
+                    _ => state.sel_out,
+                };
+                let cur = state.device.volume(cid, out).unwrap_or(0.0);
+                let new_vol = db_to_vol(vol_to_db(cur) + delta_db).clamp(0.0, 2.0);
+                set_channel_volume(state, cid, out, new_vol);
+                notify_osc(state, OscOutbound::Volume(cid, out, new_vol));
+            }
+            state.last_activity = Instant::now();
         }
         Message::FaderPressed(cid, out, v, range) => {
             if let Some((lo, hi)) = range {
@@ -2623,10 +5192,12 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
         }
         Message::ToggleFlyout(cid, kind) => {
+            let now = Instant::now();
             if state.flyout_open.contains(&(cid, kind)) {
-                state.flyout_open.remove(&(cid, kind));
+                begin_flyout_close(state, cid, kind, now);
+                state.pending_flyout = None;
             } else {
-                open_flyout(state, cid, kind);
+                open_flyout(state, cid, kind, now);
             }
         }
         Message::CloseFlyout => {
@@ -2635,8 +5206,20 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         Message::CollapseTick => {
             let now = Instant::now();
             state.collapse_anim.retain(|_, a| a.is_settling(now));
+            state.flyout_anim.retain(|_, a| a.is_settling(now));
+            state.stereo_anim.retain(|_, a| a.is_settling(now));
+            if let Some((cid, kind)) = state.pending_flyout {
+                let still_closing = state.flyout_anim.iter().any(|(&(c, k), a)| {
+                    c == cid && k != strip::FlyoutKind::Route && a.is_settling(now)
+                });
+                if !still_closing {
+                    state.pending_flyout = None;
+                    open_flyout_now(state, cid, kind, now);
+                }
+            }
         }
         Message::StripClicked(cid) => {
+            state.focus_channel = Some(cid);
             if state.modifiers.control() {
                 // Toggle just this one strip, leaving the rest of the
                 // selection untouched — the standard Ctrl+click
@@ -2713,60 +5296,86 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             state.osc_tx = Some(tx);
             // A controller connecting after startup shouldn't stay blind
             // until the next manual change — snapshot everything once.
-            let n_out = state.device.output_pair_count();
-            for ch in state.device.inputs().to_vec() {
-                let cid = ChannelId::Input(ch.id);
-                for out in 0..n_out {
-                    notify_osc(state, OscOutbound::Volume(cid, out, ch.volumes[out]));
-                    notify_osc(state, OscOutbound::Pan(cid, out, ch.pans[out]));
-                }
-                notify_osc(state, OscOutbound::Mute(cid, ch.mute));
-                notify_osc(state, OscOutbound::Solo(cid, ch.solo));
-            }
-            for ch in state.device.playbacks().to_vec() {
-                let cid = ChannelId::Playback(ch.id);
-                for out in 0..n_out {
-                    notify_osc(state, OscOutbound::Volume(cid, out, ch.volumes[out]));
-                    notify_osc(state, OscOutbound::Pan(cid, out, ch.pans[out]));
-                }
-                notify_osc(state, OscOutbound::Mute(cid, ch.mute));
-                notify_osc(state, OscOutbound::Solo(cid, ch.solo));
-            }
-            for ch in state.device.outputs().to_vec() {
-                notify_osc(state, OscOutbound::OutputVolume(ch.id, ch.volume));
-                notify_osc(state, OscOutbound::Mute(ChannelId::Output(ch.id), ch.mute));
-                notify_osc(state, OscOutbound::Solo(ChannelId::Output(ch.id), ch.solo));
-            }
+            notify_osc_full_state(state);
         }
-        Message::OscCommand(cmd) => match cmd {
-            OscCommand::Volume(cid, out, v) => apply_grouped_volume(state, cid, out, v),
-            OscCommand::Pan(cid, out, p) => apply_grouped_pan(state, cid, out, p),
-            OscCommand::Mute(cid, m) => {
-                set_channel_mute(state, cid, m);
-                notify_osc(state, OscOutbound::Mute(cid, m));
-            }
-            OscCommand::Solo(cid, s) => {
-                set_channel_solo(state, cid, s);
-                notify_osc(state, OscOutbound::Solo(cid, s));
-            }
-            OscCommand::OutputVolume(id, v) => {
-                let cid = ChannelId::Output(id);
-                // `out` must equal the output channel index (see
-                // `strip_params`); `set_channel_volume` routes this
-                // through the output-pair link logic.
-                set_channel_volume(state, cid, id, v);
-                notify_osc(state, OscOutbound::OutputVolume(id, v));
-            }
-        },
         Message::OscLog(line) => {
             state.osc_log.push_front(line);
             state.osc_log.truncate(OSC_LOG_MAX);
         }
+        // Handled at the top of `update`, before this match.
+        Message::OscCommand(_) => {}
         Message::ToggleOscLog => state.show_osc_log = !state.show_osc_log,
         Message::ClearOscLog => state.osc_log.clear(),
+        Message::OscMeters => notify_osc_meters(state),
         Message::ToggleDevicePanel => {
+            if !state.connected || state.device.is_mock() {
+                state.show_device_panel = false;
+                state.notice = Some((
+                    "Connect a Fireface to open settings.".into(),
+                    Instant::now(),
+                ));
+                return Task::none();
+            }
             state.show_device_panel = !state.show_device_panel;
             state.show_settings = false;
+        }
+        Message::ToggleFxPanel => {
+            state.show_fx_panel = !state.show_fx_panel;
+        }
+        Message::ToggleAssign => {
+            state.assign_menu = match state.assign_menu {
+                AssignMenu::Closed => AssignMenu::Destinations,
+                _ => AssignMenu::Closed,
+            };
+        }
+        Message::AssignDestinations(dest) => {
+            if dest < ASSIGN_DESTS.len() {
+                state.assign_menu = AssignMenu::Outputs(dest);
+            }
+        }
+        Message::CloseAssign => {
+            state.assign_menu = AssignMenu::Closed;
+        }
+        Message::AssignOutput(dest, pair) => {
+            // Choosing an output ends the menu, like TotalMix's.
+            state.assign_menu = AssignMenu::Closed;
+            if dest >= state.assign.len() {
+                return Task::none();
+            }
+            state.assign[dest] = pair;
+            let result = match dest {
+                0 => state.device.set_main_out(pair),
+                1 => state.device.set_main_out_b(pair),
+                _ => Ok(()),
+            };
+            if let Err(e) = result {
+                fail(state, "assign", &e);
+            }
+        }
+        Message::FxVolume(bus, position) => {
+            // The fader speaks in linear position (0..2); the FX volumes are
+            // dB fields with their own limits.
+            let db = vol_to_db(position).clamp(-30.0, 6.0);
+            let next = match bus {
+                FxBus::Reverb => Message::ReverbChanged(Reverb {
+                    volume_db: db,
+                    ..state.device.settings().reverb.unwrap_or_default()
+                }),
+                FxBus::Echo => Message::EchoChanged(Echo {
+                    volume_db: db,
+                    ..state.device.settings().echo.unwrap_or_default()
+                }),
+            };
+            return update(state, next);
+        }
+        Message::FxVolumeReleased(bus) => {
+            let gesture = match bus {
+                FxBus::Reverb => UndoGesture::Reverb,
+                FxBus::Echo => UndoGesture::Echo,
+            };
+            if matches!(state.undo_gesture, Some((open, _)) if open == gesture) {
+                state.undo_gesture = None;
+            }
         }
         Message::ToggleSettings => {
             state.show_settings = !state.show_settings;
@@ -2790,42 +5399,77 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             if let Err(e) = state.device.set_clock_source(&source) {
                 fail(state, "set_clock_source", &e);
             }
+            notify_osc_raw(state, "/clock_source", vec![OscType::String(source)]);
         }
         Message::SampleRateSelected(rate) => {
+            // The UC's kernel PCM rate is the PipeWire graph rate.  Reuse
+            // the engine-rate path so this settings-sheet picker actually
+            // changes the card instead of only recording the model value.
+            // Whenever the sound server owns the card rate (UCX included),
+            // use the engine-rate path so the OSC/selector rate is real.
+            if state.device.rate_follows_sound_server() {
+                return update(state, Message::EngineRate(rate));
+            }
             if let Err(e) = state.device.set_sample_rate(rate) {
                 fail(state, "set_sample_rate", &e);
             }
+            notify_osc_raw(state, "/sample_rate", vec![OscType::Int(rate as i32)]);
+            // On a backend where this setter reaches the card, the UC can
+            // reload its stored mixer at the new speed.  Reapply the host
+            // scene once the new stream has settled.
+            schedule_mixer_reapply(
+                state,
+                Duration::from_millis(1_500),
+                "device sample-rate change",
+            );
         }
-
         // ── Right sidebar ────────────────────────────────────────────
         Message::Undo => {
             state.undo_gesture = None;
             if let Some(scene) = state.undo_stack.pop() {
-                state.redo_stack.push(state.device.capture_scene());
+                let current = state
+                    .host_scene
+                    .clone()
+                    .unwrap_or_else(|| state.device.capture_scene());
+                state.redo_stack.push(current);
                 if let Err(e) = state.device.apply_scene(&scene) {
                     fail(state, "undo", &e);
+                } else {
+                    state.host_scene = Some(scene);
                 }
             }
         }
         Message::Redo => {
             state.undo_gesture = None;
             if let Some(scene) = state.redo_stack.pop() {
-                state.undo_stack.push(state.device.capture_scene());
+                let current = state
+                    .host_scene
+                    .clone()
+                    .unwrap_or_else(|| state.device.capture_scene());
+                state.undo_stack.push(current);
                 if let Err(e) = state.device.apply_scene(&scene) {
                     fail(state, "redo", &e);
+                } else {
+                    state.host_scene = Some(scene);
                 }
             }
         }
         Message::ToggleSidebarPanel(panel) => state.sidebar_panels_open.toggle(panel),
         Message::ToggleSidebar => {
             state.sidebar_open = !state.sidebar_open;
-            state.auto_folded = false;
         }
         Message::SidebarResize(dx) => {
             state.sidebar_width =
                 (state.sidebar_width - dx).clamp(sidebar::MIN_WIDTH, sidebar::MAX_WIDTH);
         }
         Message::SetRowMode(mode) => state.row_mode = mode,
+        Message::SetSyncDirection(dir) => {
+            state.sync_direction = if state.device.needs_scene_restore() {
+                SyncDirection::GuiToDevice
+            } else {
+                dir
+            };
+        }
         Message::RenameStart(cid) => {
             // Opening another strip's name accepts the one being typed.
             if state.renaming.is_some_and(|open| open != cid) {
@@ -2864,11 +5508,73 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                     e.force_rate = rate;
                 }
             } else if state.device.rate_follows_sound_server() {
+                let uc = state.device.is_uc_model();
+                // The UC latches matrix routing at engine start.  A scene
+                // written while the engine is running only updates its
+                // shadow state; the next engine start applies it.
+                //
+                // Before a rate change, close the capture side so the
+                // kernel no longer locks the playback rate to the old
+                // value.  Keep playback running, write the full scene into
+                // the shadow, then change the rate.  PipeWire restarts the
+                // playback stream at the new rate, and that restarted
+                // engine latches the scene we just wrote.
+                let suspended_source = if uc && rate > 0 {
+                    let source = pw_clock::fireface_source_name();
+                    if let Some(source) = &source {
+                        if pw_clock::set_source_suspended(source, true) {
+                            // Let the kernel clear the capture hw_params
+                            // (the rate lock) before touching the graph.
+                            std::thread::sleep(Duration::from_millis(120));
+                        } else {
+                            log::warn!(
+                                "Could not suspend the RME source for the rate change"
+                            );
+                        }
+                    }
+                    source
+                } else {
+                    None
+                };
+                if uc && rate > 0 {
+                    // Shadow write before the rate change.  Playback is
+                    // still running, so this does not disturb the current
+                    // audio; the rate-change engine restart latches it.
+                    let scene = state.device.capture_scene();
+                    if let Err(e) = state.device.apply_scene(&scene) {
+                        log::warn!("Scene shadow write before rate change failed: {e:?}");
+                    }
+                }
                 if let Err(e) = pw_clock::force_rate(rate) {
                     log::warn!("Setting the PipeWire rate failed: {e}");
                 }
+                if rate > 0 {
+                    state.device.set_meter_rate(rate);
+                    // Only wait for confirmation when a stream is open.  An
+                    // idle card closes its PCM; the forced graph rate will
+                    // be used when the next stream opens, and a timeout
+                    // notice there would be a false failure.
+                    state.pending_device_rate = state
+                        .card_stream
+                        .is_some()
+                        .then_some((rate, Instant::now()));
+                    if let Some(source) = suspended_source {
+                        pw_clock::set_source_suspended(&source, false);
+                    }
+                    // Fallback for a backend/card where the restart did not
+                    // latch the shadow state.
+                    schedule_mixer_reapply(
+                        state,
+                        Duration::from_millis(1_500),
+                        "host sample-rate change",
+                    );
+                } else {
+                    state.pending_device_rate = None;
+                }
                 state.engine = pw_clock::read();
+                state.card_stream = pw_clock::card_stream(state.device.card_id());
             }
+            notify_osc_raw(state, "/sample_rate", vec![OscType::Int(rate as i32)]);
         }
         Message::EngineQuantum(quantum) => {
             if !state.device.is_mock() {
@@ -2883,20 +5589,74 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                     log::warn!("Setting the PipeWire buffer size failed: {e}");
                 }
                 state.engine = pw_clock::read();
-                state.card_stream = pw_clock::card_stream(CARD_ID);
+                state.card_stream = pw_clock::card_stream(state.device.card_id());
             }
         }
         Message::EnginePoll => {
-            // Off the UI thread: a process spawn is ~10 ms.
+            // Off the UI thread: a process spawn is ~10 ms.  Capture the
+            // card id before the async block; the device handle itself
+            // cannot cross the task boundary.
+            let card_id = state.device.card_id();
             return Task::perform(
-                async { (pw_clock::read(), pw_clock::card_stream(CARD_ID)) },
+                async move { (pw_clock::read(), pw_clock::card_stream(card_id)) },
                 |(clock, stream)| Message::EngineRead(clock, stream),
             );
         }
         Message::EngineRead(clock, stream) => {
             if state.device.rate_follows_sound_server() {
+                let sink_running =
+                    !state.device.is_mock() && pw_clock::fireface_sink_running();
+                let sink_started = sink_running && !state.last_sink_running;
+                let new_rate = stream.map(|s| s.rate);
+                let model_rate = state.device.settings().sample_rate;
+                let rate_changed = rate_needs_mixer_reapply(
+                    state.last_card_rate,
+                    new_rate,
+                    model_rate,
+                );
+                if let Some(rate) = new_rate {
+                    if rate_changed {
+                        // Keep the scene/model in step with the rate the
+                        // card actually opened at, whether TuxMix, the
+                        // player or PipeWire initiated the switch.
+                        let _ = state.device.set_sample_rate(rate);
+                    }
+                    state.last_card_rate = Some(rate);
+                }
+                if sink_started || rate_changed {
+                    // The UC reloads its stored mixer when a playback stream
+                    // starts or the device speed changes.  Reapply the
+                    // current host scene after the new stream has settled.
+                    let reason = if rate_changed {
+                        "Fireface card rate changed"
+                    } else {
+                        "Fireface playback started"
+                    };
+                    schedule_mixer_reapply(
+                        state,
+                        Duration::from_secs(1),
+                        reason,
+                    );
+                }
+                state.last_sink_running = sink_running;
                 state.engine = clock;
                 state.card_stream = stream;
+                if let Some((wanted, since)) = state.pending_device_rate {
+                    let actual = stream.map(|s| s.rate);
+                    if actual == Some(wanted) {
+                        state.pending_device_rate = None;
+                    } else if since.elapsed() >= Duration::from_secs(3) {
+                        state.pending_device_rate = None;
+                        state.notice = Some((
+                            format!(
+                                "The device did not accept {}; it is still at {}.",
+                                rate_label(wanted),
+                                actual.map(rate_label).unwrap_or_else(|| "its current rate".into())
+                            ),
+                            Instant::now(),
+                        ));
+                    }
+                }
             }
         }
         Message::PointerPressed => {
@@ -2942,9 +5702,36 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         }
         Message::DimToggle => {
             let on = !state.device.settings().dim;
+            return update(state, Message::Dim(on));
+        }
+        Message::Dim(on) => {
             if let Err(e) = state.device.set_dim(on) {
                 fail(state, "dim", &e);
             }
+            notify_osc_bool(state, "/dim", on);
+        }
+        Message::SpeakerB(on) => {
+            if let Err(e) = state.device.set_speaker_b(on) {
+                fail(state, "speaker_b", &e);
+            }
+            notify_osc_bool(state, "/speaker_b", on);
+        }
+        Message::ControlRoomRecall => {
+            if let Err(e) = state.device.set_dim(false) {
+                fail(state, "recall", &e);
+            }
+            notify_osc_bool(state, "/dim", false);
+        }
+        Message::ControlRoomMono(on) => {
+            state.device.settings_mut().mono = on;
+            notify_osc_bool(state, "/mono", on);
+        }
+        Message::ControlRoomMuteFx(on) => {
+            if let Err(e) = state.device.set_mute_fx(on) {
+                fail(state, "set_mute_fx", &e);
+            }
+            state.device.settings_mut().mute_fx = on;
+            notify_osc_bool(state, "/mute_fx", on);
         }
         Message::SnapshotClicked(n) => {
             state.active_snapshot = Some(n as usize);
@@ -2957,12 +5744,22 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             if let Some(scene) = scene {
                 if let Err(e) = state.device.apply_scene(&scene) {
                     fail(state, "snapshot", &e);
+                } else {
+                    state.host_scene = Some(scene);
                 }
             }
+            notify_osc_raw(state, "/snapshot/active", vec![OscType::Int(n as i32)]);
+        }
+        Message::SnapshotStoreTo(n) => {
+            state.active_snapshot = Some(n as usize);
+            return update(state, Message::SnapshotStore);
         }
         Message::SnapshotStore => {
             if let Some(n) = state.active_snapshot {
-                let scene = state.device.capture_scene();
+                let scene = state
+                    .host_scene
+                    .clone()
+                    .unwrap_or_else(|| state.device.capture_scene());
                 let saved = if state.device.is_mock() {
                     if let Some(slot) = state.mock_snapshots.get_mut(n - 1) {
                         *slot = Some(scene);
@@ -2978,6 +5775,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                     if let Some(slot) = state.stored_snapshots.get_mut(n - 1) {
                         *slot = true;
                     }
+                    notify_osc_bool(state, format!("/snapshot/{n}/stored"), true);
                 }
             }
         }
@@ -3029,6 +5827,14 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
         }
     }
+    if let Some(before) = host_before {
+        let after = state.device.capture_scene();
+        if let Some(host) = state.host_scene.as_mut() {
+            host.merge_host_changes(&before, &after);
+        } else {
+            state.host_scene = Some(after);
+        }
+    }
     Task::none()
 }
 
@@ -3038,6 +5844,92 @@ const NOTICE_FOR: Duration = Duration::from_secs(5);
 /// Reports a refused device write: logged, and shown briefly so a fader that
 /// moves without effect is not silent. A drag repeats the same failure many
 /// times a second; the same text only refreshes the timer.
+/// Swap the whole backend at runtime: open the chosen device, rebuild the
+/// meter vectors/tap for its channel counts, and carry the GUI prefs
+/// across.  ALSA devices keep their own live matrix; the USB backend
+/// restores its per-model auto scene.
+fn switch_device(state: &mut TuxMix, target: DeviceTarget) -> Result<(), String> {
+    if state
+        .device_target
+        .as_ref()
+        .is_some_and(|current| *current == target)
+        || (state.device_target.is_none() && state.device.kind() == target.kind)
+    {
+        return Ok(());
+    }
+    let old_has_serial = state
+        .device_target
+        .as_ref()
+        .is_some_and(|target| target.serial.is_some());
+    let old_is_uc = state.device.is_uc_model();
+    let old_key = scene_key(state);
+    if state.device.needs_scene_restore() {
+        let scene = state.device.capture_scene();
+        if old_has_serial || old_is_uc {
+            let _ = tuxmix_core::scene::save_auto_scene_for(&old_key, &scene);
+        } else {
+            let _ = tuxmix_core::scene::save_auto_scene(&scene);
+        }
+    }
+    let new = DeviceHandle::open_target(&target)
+        .ok_or_else(|| format!("{} is not connected", target.label()))?;
+    let prefs = prefs_of(state);
+    state.device = new;
+    state.device_target = Some(state.device.target());
+    // The new unit has its own layout, topology and scene; never carry the
+    // old device's host model into it.
+    state.host_scene = None;
+    state.undo_stack.clear();
+    state.redo_stack.clear();
+    state.connected = state.device.is_connected();
+    state.input_meters = vec![MeterAnim::new(); state.device.inputs().len()];
+    state.playback_meters = vec![MeterAnim::new(); state.device.playbacks().len()];
+    state.output_meters = vec![MeterAnim::new(); state.device.outputs().len()];
+    state.playback_tap = if state.device.is_mock() || state.device.has_device_playback_meters() {
+        pw_meter::PlaybackTap::disabled()
+    } else {
+        pw_meter::PlaybackTap::start()
+    };
+    state.playback_tap_channels = 0;
+    state.sel_out = 0;
+    state.quick_channel = ChannelId::Input(0);
+    state.last_panel_out = None;
+    state.renaming = None;
+    state.editing = None;
+    state.drag_range = None;
+    state.last_saved_json = None;
+    state.last_activity = Instant::now();
+    state.startup_scene = None;
+    state.startup_scene_due = None;
+    state.last_sink_running = false;
+    state.last_card_rate = None;
+    apply_prefs(state, prefs);
+    state.sel_out = state
+        .sel_out
+        .min(state.device.output_pair_count().saturating_sub(1));
+    if state.device.needs_scene_restore() {
+        if let Some(scene) = load_scene_for_current(state) {
+            state.host_scene = Some(scene.clone());
+            if state.device.apply_scene(&scene).is_ok() {
+                state.host_scene = Some(state.device.capture_scene());
+            }
+        }
+    }
+    if state.host_scene.is_none() {
+        state.host_scene = Some(state.device.capture_scene());
+    }
+    // The UC's input meters come from a PipeWire capture tap that is opened
+    // only after the scene is applied; without this a live switch to the UC
+    // leaves every input VU at zero.  The UCX uses the device meter endpoint,
+    // for which this is a no-op.
+    state.device.begin_metering();
+    if state.engine_force_rate > 0 {
+        state.device.set_meter_rate(state.engine_force_rate);
+    }
+    state.notice = Some((format!("Switched to {}", target.label()), Instant::now()));
+    Ok(())
+}
+
 fn fail(state: &mut TuxMix, what: &str, error: &dyn std::fmt::Display) {
     let what = what.trim_start_matches("set_").replace('_', " ");
     let text = format!("Could not apply {what}: {error}");
@@ -3095,7 +5987,7 @@ const TICK_ACTIVE: Duration = Duration::from_millis(33);
 /// rest it only has to keep the slow chores alive (connection probe,
 /// auto-save, the front panel); anything that changes the screen switches
 /// back to `TICK_ACTIVE` at once.
-const TICK_IDLE: Duration = Duration::from_millis(500);
+const TICK_IDLE: Duration = Duration::from_millis(100);
 /// How long after the last change the tick stays fast: longer than the
 /// meters' release, so a fading peak is drawn to the end.
 const ACTIVE_FOR: Duration = Duration::from_millis(1500);
@@ -3105,6 +5997,8 @@ fn is_active(state: &TuxMix) -> bool {
     state.last_activity.elapsed() < ACTIVE_FOR
         || state.pending_resize_width.is_some()
         || !state.collapse_anim.is_empty()
+        || !state.flyout_anim.is_empty()
+        || !state.stereo_anim.is_empty()
         || state.drag_range.is_some()
         || state.notice.is_some()
 }
@@ -3132,7 +6026,10 @@ pub fn subscription(state: &TuxMix) -> Subscription<Message> {
     // redraw the way the canvas-based fader/meter animations do, so a
     // much faster timer stands in for that during the ~160ms transition,
     // then switches itself back off once `collapse_anim` empties out.
-    if !state.collapse_anim.is_empty() {
+    if !state.collapse_anim.is_empty()
+        || !state.flyout_anim.is_empty()
+        || !state.stereo_anim.is_empty()
+    {
         subs.push(iced::time::every(Duration::from_millis(8)).map(|_| Message::CollapseTick));
     }
     // The notification-area icon and second launches, see `tray`.
@@ -3180,6 +6077,16 @@ fn handle_global_event(
                 }
             }
             match key {
+                Key::Named(keyboard::key::Named::ArrowUp)
+                    if status == iced::event::Status::Ignored =>
+                {
+                    Some(Message::NudgeVolume(1.0))
+                }
+                Key::Named(keyboard::key::Named::ArrowDown)
+                    if status == iced::event::Status::Ignored =>
+                {
+                    Some(Message::NudgeVolume(-1.0))
+                }
                 Key::Named(keyboard::key::Named::F11) => {
                     Some(Message::ToggleFullscreen(id))
                 }
@@ -3246,7 +6153,15 @@ pub fn view(state: &TuxMix, _window: window::Id) -> Element<'_, Message> {
         main = main.push(osc_log_panel(state));
     }
     let main = main.width(Length::Fill).height(Length::Fill);
-    let mut base: Element<'_, Message> = row![main, sidebar::sidebar(state)]
+    // TotalMix's own order across the window: mixer, FX column, control
+    // strip. The FX column is the two Reverb/Echo panels (see `fx_column`),
+    // shown only on a backend that has the FX bus.
+    let mut parts = row![main];
+    if state.show_fx_panel && state.device.capabilities().fx {
+        parts = parts.push(fx_column(state));
+    }
+    let mut base: Element<'_, Message> = parts
+        .push(sidebar::sidebar(state))
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
@@ -3272,7 +6187,15 @@ pub fn view(state: &TuxMix, _window: window::Id) -> Element<'_, Message> {
         // The About dialog rides above the whole window, drawers included:
         // it is a modal now, not one more docked panel (see
         // `about::about_modal`).
-        stack(vec![base, about::about_modal(state)])
+        base = stack(vec![base, about::about_modal(state)])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+    }
+    if state.startup_mismatch.is_some() {
+        // RME's mismatch prompt is the topmost modal: it must be answered
+        // before the mixer is used.
+        stack(vec![base, sync_dialog::mismatch_modal(state)])
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -3394,30 +6317,47 @@ fn osc_log_panel(state: &TuxMix) -> Element<'_, Message> {
 /// window allows from the field that opened it. A card under that field,
 /// closed by a click anywhere outside it (or by the field / Close), is
 /// what the field promises, and sections give the flags a structure.
+/// Reverb algorithm names by the measured index (`0x3c01`, capture H81).
+const REVERB_TYPES: [&str; 15] = [
+    "Small Room",
+    "Medium Room",
+    "Large Room",
+    "Walls",
+    "Shorty",
+    "Attack",
+    "Swagger",
+    "Old School",
+    "Echoistic",
+    "8plus9",
+    "Grand Wide",
+    "Thicker",
+    "Envelope",
+    "Gated",
+    "Space",
+];
+
+fn reverb_type_name(kind: u8) -> &'static str {
+    REVERB_TYPES[(kind as usize) % REVERB_TYPES.len()]
+}
+
+const ECHO_TYPES: [&str; 3] = ["Stereo Echo", "Stereo Cross", "Pong Echo"];
+
 fn device_panel(state: &TuxMix) -> Element<'_, Message> {
     let scale = state.ui_scale;
+    // Secondary text in the settings sheet is a little larger than the
+    // mixer's micro labels; it is read at popover distance, not strip
+    // distance.
+    let ts = scale * 1.15;
     let settings = state.device.settings();
     let modifiers = state.modifiers;
 
     // Caption column shared by every labelled row, so the controls line up.
     const LABEL_W: f32 = 92.0;
-    let labelled = |label: &'static str, control: Element<'static, Message>| -> Element<'static, Message> {
-        row![
-            text(label)
-                .color(theme::TEXT_SEC)
-                .size(theme::TEXT_XS * scale)
-                .width(Length::Fixed(LABEL_W * scale)),
-            control,
-        ]
-        .spacing(theme::SPACE_MD * scale)
-        .align_y(iced::Alignment::Center)
-        .into()
-    };
     let section = |label: &'static str| -> Element<'static, Message> {
         row![
             text(label)
                 .color(theme::TEXT_SEC)
-                .size(theme::TEXT_MICRO * scale),
+                .size(theme::TEXT_MICRO * ts),
             iced::widget::rule::horizontal(1),
         ]
         .spacing(theme::SPACE_MD * scale)
@@ -3426,63 +6366,25 @@ fn device_panel(state: &TuxMix) -> Element<'_, Message> {
     };
 
     let header = row![
-        text("Device settings")
+        text("Settings")
             .color(theme::TEXT_PRIMARY)
             .size(theme::TEXT_MD * scale),
         iced::widget::Space::new().width(Length::Fill),
-        iced::widget::button(text("Close").size(theme::TEXT_XS * scale))
+        iced::widget::button(text("Close").size(theme::TEXT_XS * ts))
             .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
             .style(theme::ghost_button)
             .on_press(Message::ToggleDevicePanel),
     ]
     .align_y(iced::Alignment::Center);
 
-    // The device's supported sample-rate classes (alt 1/2/3 — see
-    // PROTOCOL.md "Sample rate"): 32/44.1/48/64/88.2, 96/128, 176.4/192.
-    // A custom entry is not editable, so the full supported set is listed.
-    let rates: Vec<u32> = vec![
-        32000, 44100, 48000, 64000, 88200, 96000, 128000, 176400, 192000,
-    ];
-    let clock = column![
-        section("CLOCK"),
-        labelled(
-            "Clock source",
-            pick_list(
-                settings.clock_sources.clone(),
-                Some(settings.clock_source.clone()),
-                Message::ClockSourceSelected,
-            )
-            .style(theme::pick_list)
-            .menu_style(theme::menu)
-            .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
-            .text_size(theme::TEXT_MD * scale)
-            .width(Length::Fill)
-            .into(),
-        ),
-    ]
-    .spacing(theme::SPACE_MD * scale);
-    // The USB backend streams the device itself, so the rate is the
-    // device's to set, here. With the kernel driver the sound server owns
-    // it: see the audio engine section below (this list used to show there
-    // too, and silently did nothing).
-    let clock = if state.device.rate_follows_sound_server() || state.device.is_mock() {
-        clock
-    } else {
-        clock.push(labelled(
-            "Sample rate",
-            pick_list(rates, Some(settings.sample_rate), Message::SampleRateSelected)
-                .style(theme::pick_list)
-                .menu_style(theme::menu)
-                .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
-                .text_size(theme::TEXT_MD * scale)
-                .width(Length::Fill)
-                .into(),
-        ))
-    };
-
-    let mut body = column![header, clock]
+    let mut body = column![header]
         .spacing(theme::SPACE_XL * scale)
         .width(Length::Fill);
+
+    // One device-owned group for every model: identity, clock, sample rate
+    // and the format switches the unit itself holds. `device_group` leaves
+    // out the rows a model has no register for.
+    body = body.push(device_group(state, LABEL_W));
 
     if state.device.rate_follows_sound_server() || state.device.is_mock() {
         body = body.push(engine_section(state, LABEL_W));
@@ -3500,84 +6402,104 @@ fn device_panel(state: &TuxMix) -> Element<'_, Message> {
     // buttons that could not do anything on any backend. The real
     // optical-format control lives in the Global grid below.
 
-    if state.device.protocol_features() {
+    let caps = state.device.capabilities();
+    if caps.protocol_features && !state.device.is_uc_model() {
         let knob_cell = |label: &'static str, k: Element<'static, Message>| -> Element<'static, Message> {
             column![
                 k,
                 text(label)
                     .color(theme::TEXT_SEC)
-                    .size(theme::TEXT_XS * scale),
+                    .size(theme::TEXT_XS * ts),
             ]
             .spacing(theme::SPACE_SM * scale)
             .align_x(iced::Alignment::Center)
             .width(Length::Fill)
             .into()
         };
-        let output = column![
-            section("OUTPUT"),
-            row![
-                knob_cell(
-                    "Pitch",
-                    knob(Knob {
-                        value: settings.pitch_percent,
-                        range: (-5.0, 5.0),
-                        label: format!("{:+.1}%", settings.pitch_percent),
-                        arc_from_center: true,
-                        interactive: true,
-                        log_scale: false,
-                        modifiers,
-                        scale,
-                        on_change: Box::new(|v| Message::PitchChanged(v.clamp(-5.0, 5.0))),
-                        on_reset: Box::new(|| Message::PitchChanged(0.0)),
-                    }),
-                ),
-                knob_cell(
-                    "Width",
-                    knob(Knob {
-                        value: settings.width,
-                        range: (-1.0, 1.0),
-                        label: format!("{:+.2}", settings.width),
-                        arc_from_center: true,
-                        interactive: true,
-                        log_scale: false,
-                        modifiers,
-                        scale,
-                        on_change: Box::new(|v| Message::WidthChanged(v.clamp(-1.0, 1.0))),
-                        on_reset: Box::new(|| Message::WidthChanged(0.0)),
-                    }),
-                ),
-            ],
-        ]
-        .spacing(theme::SPACE_MD * scale);
+        let mut output_row = row![].spacing(theme::SPACE_MD * scale);
+        if caps.pitch {
+            output_row = output_row.push(knob_cell(
+                "Pitch",
+                knob(Knob {
+                    value: settings.pitch_percent,
+                    range: (-5.0, 5.0),
+                    label: format!("{:+.1}%", settings.pitch_percent),
+                    arc_from_center: true,
+                    level_arc_color: Some(theme::TEXT_PRIMARY),
+                    interactive: true,
+                    log_scale: false,
+                    modifiers,
+                    scale,
+                    on_change: Box::new(|v| Message::PitchChanged(v.clamp(-5.0, 5.0))),
+                    on_reset: Box::new(|| Message::PitchChanged(0.0)),
+                }),
+            ));
+        }
+        if caps.width {
+            output_row = output_row.push(knob_cell(
+                "Width",
+                knob(Knob {
+                    value: settings.width,
+                    range: (-1.0, 1.0),
+                    label: format!("{:+.2}", settings.width),
+                    arc_from_center: true,
+                    level_arc_color: Some(theme::TEXT_PRIMARY),
+                    interactive: true,
+                    log_scale: false,
+                    modifiers,
+                    scale,
+                    on_change: Box::new(|v| Message::WidthChanged(v.clamp(-1.0, 1.0))),
+                    on_reset: Box::new(|| Message::WidthChanged(0.0)),
+                }),
+            ));
+        }
+        if caps.pitch || caps.width {
+            body = body.push(
+                column![section("OUTPUT"), output_row].spacing(theme::SPACE_MD * scale),
+            );
+        }
 
         // The global flags as a two-column grid of equal toggles, the same
-        // family as the sidebar's group cells.
-        let flags: [(&'static str, bool, fn(bool) -> Message); 5] = [
-            ("MS Proc", settings.ms_proc, Message::MsProcChanged),
-            ("AN 1>2", settings.an12, Message::An12Changed),
-            ("Input Link", settings.input_link, Message::InputLinkChanged),
-            ("EQ for Record", settings.eq_for_record, Message::EqForRecordChanged),
-            ("Opt Out: SPDIF", settings.optical_out_spdif, Message::OpticalOutFormatChanged),
-        ];
-        let mut grid = column![section("GLOBAL")].spacing(theme::SPACE_SM * scale);
-        for pair in flags.chunks(2) {
-            let mut line = row![].spacing(theme::SPACE_SM * scale);
-            for &(label, active, on_toggle) in pair {
-                line = line.push(
-                    iced::widget::button(text(label).size(theme::TEXT_XS * scale).center())
-                        .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
-                        .width(Length::Fill)
-                        .style(theme::toggle_button(active, theme::ACCENT))
-                        .on_press(on_toggle(!active)),
-                );
-            }
-            if pair.len() == 1 {
-                line = line.push(iced::widget::Space::new().width(Length::Fill));
-            }
-            grid = grid.push(line);
+        // family as the sidebar's group cells.  Only include a toggle when
+        // the backend has a path that reaches the device or a real host
+        // mode; otherwise a press would only change cached state.
+        let mut flags: Vec<(&'static str, bool, fn(bool) -> Message)> = Vec::new();
+        if caps.ms_proc {
+            flags.push(("MS Proc", settings.ms_proc, Message::MsProcChanged));
         }
-        body = body.push(output).push(grid);
-    } else {
+        if caps.an12 {
+            flags.push(("AN 1>2", settings.an12, Message::An12Changed));
+        }
+        if caps.input_link {
+            flags.push(("Input Link", settings.input_link, Message::InputLinkChanged));
+        }
+        if caps.eq_for_record {
+            flags.push(("EQ for Record", settings.eq_for_record, Message::EqForRecordChanged));
+        }
+        if caps.optical_out {
+            flags.push(("Opt Out: SPDIF", settings.optical_out_spdif, Message::OpticalOutFormatChanged));
+        }
+        if !flags.is_empty() {
+            let mut grid = column![section("GLOBAL")].spacing(theme::SPACE_SM * scale);
+            for pair in flags.chunks(2) {
+                let mut line = row![].spacing(theme::SPACE_SM * scale);
+                for &(label, active, on_toggle) in pair {
+                    line = line.push(
+                        iced::widget::button(text(label).size(theme::TEXT_XS * ts).center())
+                            .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
+                            .width(Length::Fill)
+                            .style(theme::toggle_button(active, theme::ACCENT))
+                            .on_press(on_toggle(!active)),
+                    );
+                }
+                if pair.len() == 1 {
+                    line = line.push(iced::widget::Space::new().width(Length::Fill));
+                }
+                grid = grid.push(line);
+            }
+            body = body.push(grid);
+        }
+    } else if !state.device.is_uc_model() {
         // Say why the card is shorter rather than leaving two knobs and
         // five toggles silently missing: on the class-compliant personality
         // everything below the sample rate lives in RME's own protocol.
@@ -3590,10 +6512,9 @@ fn device_panel(state: &TuxMix) -> Element<'_, Message> {
                  same reason.",
             )
             .color(theme::TEXT_SEC)
-            .size(theme::TEXT_XS * scale),
+            .size(theme::TEXT_XS * ts),
         );
     }
-
     popover(state, body.into(), Message::ToggleDevicePanel)
 }
 
@@ -3660,12 +6581,13 @@ fn notice_toast(message: &str, scale: f32) -> Element<'_, Message> {
 /// around its window, not what the card does.
 fn settings_panel(state: &TuxMix) -> Element<'_, Message> {
     let scale = state.ui_scale;
+    let ts = scale * 1.15;
     let header = row![
         text("TuxMix settings")
             .color(theme::TEXT_PRIMARY)
             .size(theme::TEXT_MD * scale),
         iced::widget::Space::new().width(Length::Fill),
-        iced::widget::button(text("Close").size(theme::TEXT_XS * scale))
+        iced::widget::button(text("Close").size(theme::TEXT_XS * ts))
             .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
             .style(theme::ghost_button)
             .on_press(Message::ToggleSettings),
@@ -3674,13 +6596,13 @@ fn settings_panel(state: &TuxMix) -> Element<'_, Message> {
     let section = row![
         text("BACKGROUND")
             .color(theme::TEXT_SEC)
-            .size(theme::TEXT_MICRO * scale),
+            .size(theme::TEXT_MICRO * ts),
         iced::widget::rule::horizontal(1),
     ]
     .spacing(theme::SPACE_MD * scale)
     .align_y(iced::Alignment::Center);
     let toggle = |label: &'static str, active: bool, message: Message| {
-        iced::widget::button(text(label).size(theme::TEXT_XS * scale).center())
+        iced::widget::button(text(label).size(theme::TEXT_XS * ts).center())
             .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
             .width(Length::Fill)
             .style(theme::toggle_button(active, theme::ACCENT))
@@ -3697,7 +6619,7 @@ fn settings_panel(state: &TuxMix) -> Element<'_, Message> {
         background = background.push(
             text("No system tray found: closing the window quits.")
                 .color(theme::TEXT_SEC)
-                .size(theme::TEXT_XS * scale),
+                .size(theme::TEXT_XS * ts),
         );
     }
     background = background.push(toggle(
@@ -3705,7 +6627,48 @@ fn settings_panel(state: &TuxMix) -> Element<'_, Message> {
         state.autostart,
         Message::SetAutostart(!state.autostart),
     ));
-    let body = column![header, background]
+    let sync_section = row![
+        text("STARTUP SYNC")
+            .color(theme::TEXT_SEC)
+            .size(theme::TEXT_MICRO * ts),
+        iced::widget::rule::horizontal(1),
+    ]
+    .spacing(theme::SPACE_MD * scale)
+    .align_y(iced::Alignment::Center);
+    let sync_help = text(if state.device.is_uc_model() {
+        "The UC keeps input gain, reference levels, clock and rate. TuxMix writes only \
+         its mixer scene (matrix, faders, mutes, loopback) on connect."
+    } else {
+        "On first connect: read the device where it has readback, compare it with the \
+         saved TuxMix scene, and choose when they differ."
+    })
+    .color(theme::TEXT_SEC)
+    .size(theme::TEXT_XS * ts);
+    let sync_buttons = row![
+        toggle(
+            "Device → GUI",
+            state.sync_direction == SyncDirection::DeviceToGui,
+            Message::SetSyncDirection(SyncDirection::DeviceToGui),
+        ),
+        toggle(
+            "GUI → device",
+            state.sync_direction == SyncDirection::GuiToDevice,
+            Message::SetSyncDirection(SyncDirection::GuiToDevice),
+        ),
+    ]
+    .spacing(theme::SPACE_SM * scale);
+    let always_init = toggle(
+        "Always init the device with TuxMix settings",
+        state.always_init_device,
+        Message::SetAlwaysInitDevice(!state.always_init_device),
+    );
+    let sync = if state.device.is_uc_model() {
+        column![sync_section, sync_help].spacing(theme::SPACE_SM * scale)
+    } else {
+        column![sync_section, sync_help, sync_buttons, always_init]
+            .spacing(theme::SPACE_SM * scale)
+    };
+    let body = column![header, background, sync]
         .spacing(theme::SPACE_XL * scale)
         .width(Length::Fill);
     popover(state, body.into(), Message::ToggleSettings)
@@ -3730,16 +6693,262 @@ pub(crate) fn sidebar_px(state: &TuxMix) -> f32 {
     logical * sidebar_scale(state)
 }
 
-/// Sample rate and buffer size, as PipeWire runs them (see
-/// `tuxmix_core::pw_clock`). These are the settings a Windows user finds in
-/// RME's driver dialog; on Linux they belong to the sound server and are
-/// system-wide, which the section says rather than hides.
-fn engine_section(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
+/// The device-owned group: identity, clock, sample rate and the format
+/// switches the unit itself holds. Shown for every model that speaks RME's
+/// protocol, so the Settings sheet has the same shape whichever unit is
+/// attached.
+///
+/// Rows are the unit's own, not the app's: a model with no register for one
+/// is left without it rather than shown inert. The UC's Gain-tab reference
+/// levels (`0x17`), SPDIF professional and word-clock rate live only in the
+/// UC's options word; the UCX sets output levels per channel and its own
+/// options word carries none of the three (`docs/work/UCX-OPEN-ITEMS.md`).
+fn device_group(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
     let scale = state.ui_scale;
+    let ts = scale * 1.15;
+    let settings = state.device.settings();
+    let uc = state.device.is_uc_model();
+    let section = |label: &'static str| -> Element<'static, Message> {
+        row![
+            text(label)
+                .color(theme::TEXT_SEC)
+                .size(theme::TEXT_MICRO * ts),
+            iced::widget::rule::horizontal(1),
+        ]
+        .spacing(theme::SPACE_MD * scale)
+        .align_y(iced::Alignment::Center)
+        .into()
+    };
     let caption = |label: &'static str| {
         text(label)
             .color(theme::TEXT_SEC)
-            .size(theme::TEXT_XS * scale)
+            .size(theme::TEXT_XS * ts)
+            .width(Length::Fixed(label_w * scale))
+    };
+    let field = |p: iced::widget::PickList<'static, String, Vec<String>, String, Message>| {
+        p.style(theme::pick_list)
+            .menu_style(theme::menu)
+            .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
+            .text_size(theme::TEXT_MD * scale)
+            .width(Length::Fill)
+    };
+    let ref_row = |label: &'static str,
+                   options: [&'static str; 3],
+                   codes: [u16; 3],
+                   current: u16,
+                   message: fn(u16) -> Message|
+     -> Element<'static, Message> {
+        let opts: Vec<String> = options.iter().map(|s| s.to_string()).collect();
+        let selected = options
+            .iter()
+            .zip(codes)
+            .find(|(_, c)| *c == current)
+            .map(|(s, _)| s.to_string())
+            .unwrap_or_else(|| options[0].to_string());
+        let opts_for_pick = opts.clone();
+        row![
+            caption(label),
+            field(pick_list(opts, Some(selected), move |s| {
+                let idx = opts_for_pick.iter().position(|o| *o == s).unwrap_or(0);
+                message(codes[idx])
+            })),
+        ]
+        .spacing(theme::SPACE_MD * scale)
+        .align_y(iced::Alignment::Center)
+        .into()
+    };
+    let toggle = |label: &'static str, active: bool, message: Message| {
+        iced::widget::button(text(label).size(theme::TEXT_XS * ts).center())
+            .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
+            .width(Length::Fill)
+            .style(theme::toggle_button(active, theme::ACCENT))
+            .on_press(message)
+    };
+
+    let firmware = state
+        .device
+        .firmware()
+        .map(|f| f.to_string())
+        .unwrap_or_else(|| "\u{2014}".into());
+    let serial = state
+        .device
+        .serial()
+        .map(str::to_string)
+        .unwrap_or_else(|| "\u{2014}".into());
+    // The card's open stream is the device rate; while it is idle, show the
+    // requested graph rate so the single picker does not snap back after a
+    // selection.
+    let device_rate = state
+        .card_stream
+        .map(|c| c.rate)
+        .or_else(|| {
+            state
+                .engine
+                .map(|e| if e.force_rate > 0 { e.force_rate } else { e.effective_rate() })
+        })
+        .unwrap_or(settings.sample_rate);
+
+    // Every rate class the UC/UCX hardware provides.  The kernel keeps a
+    // constant 18-channel ALSA node at all rates; at 2x/4x the USB packet
+    // carries fewer words and the unused ADAT channels stay silent.
+    const UC_RATES: [u32; 9] = [
+        32_000, 44_100, 48_000, 64_000, 88_200, 96_000, 128_000, 176_400, 192_000,
+    ];
+    let rate_opts: Vec<String> = UC_RATES.iter().map(|r| rate_label(*r)).collect();
+    let rate_for_pick = UC_RATES;
+    let engine_rate_sel = if device_rate == 0 {
+        rate_label(48_000)
+    } else {
+        rate_label(device_rate)
+    };
+    let engine_rate_row = row![
+        caption("Sample rate"),
+        field(pick_list(rate_opts, Some(engine_rate_sel), move |label| {
+            let idx = UC_RATES
+                .iter()
+                .position(|r| rate_label(*r) == label)
+                .unwrap_or(2);
+            Message::EngineRate(rate_for_pick[idx])
+        })),
+    ]
+    .spacing(theme::SPACE_MD * scale)
+    .align_y(iced::Alignment::Center);
+    // The UCX's own rate class list, used when the device owns the rate.
+    let device_rate_row = row![
+        caption("Sample rate"),
+        pick_list(
+            UC_RATES.to_vec(),
+            Some(settings.sample_rate),
+            Message::SampleRateSelected,
+        )
+        .style(theme::pick_list)
+        .menu_style(theme::menu)
+        .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
+        .text_size(theme::TEXT_MD * scale)
+        .width(Length::Fill),
+    ]
+    .spacing(theme::SPACE_MD * scale)
+    .align_y(iced::Alignment::Center);
+
+    let mut body = column![
+        section("DEVICE"),
+        text("Read from the unit at connect; written only when changed here.")
+            .color(theme::TEXT_SEC)
+            .size(theme::TEXT_MICRO * ts),
+        row![
+            caption("Clock source"),
+            field(pick_list(
+                settings.clock_sources.clone(),
+                Some(settings.clock_source.clone()),
+                Message::ClockSourceSelected,
+            )),
+        ]
+        .spacing(theme::SPACE_MD * scale)
+        .align_y(iced::Alignment::Center),
+    ];
+    if uc {
+        body = body.push(engine_rate_row);
+    } else if !state.device.rate_follows_sound_server() && !state.device.is_mock() {
+        body = body.push(device_rate_row);
+    }
+    if state.device.is_uc_family() {
+        body = body.push(
+            text(
+                "32-192 kHz use the same 18-channel PipeWire node. Above 48 kHz the \
+                 ADAT channels fall away (14 at 64-96 kHz, 12 at 128-192 kHz) and \
+                 the remaining logical channels stay silent.",
+            )
+            .color(theme::TEXT_SEC)
+            .size(theme::TEXT_MICRO * ts),
+        );
+    }
+    if uc {
+        // UC-only: the Gain tab's reference levels and the two options-word
+        // flags. The UCX has no global register for any of them.
+        body = body
+            .push(ref_row("Line In", ["Lo Gain", "+4 dBu", "-10 dBV"], [0, 1, 3], settings.line_in_ref, Message::LineInRefSelected))
+            .push(ref_row("Line Out", ["Hi Gain", "+4 dBu", "-10 dBV"], [2, 3, 1], settings.line_out_ref, Message::LineOutRefSelected))
+            .push(ref_row("Phones", ["Hi Gain", "+4 dBu", "-10 dBV"], [1, 3, 2], settings.phones_ref, Message::PhonesRefSelected))
+            .push(toggle(
+                if settings.optical_out_spdif { "Optical out: SPDIF" } else { "Optical out: ADAT" },
+                settings.optical_out_spdif,
+                Message::OpticalOutFormatChanged(!settings.optical_out_spdif),
+            ))
+            .push(toggle(
+                "SPDIF professional",
+                settings.spdif_professional,
+                Message::SpdifProfessionalChanged(!settings.spdif_professional),
+            ))
+            .push(toggle(
+                "Word clock out: single speed",
+                settings.word_clock_single_speed,
+                Message::WordClockSingleSpeedChanged(!settings.word_clock_single_speed),
+            ));
+    } else if state.device.is_uc_family() {
+        // UCX references: one control for all three Line Out pairs, one for
+        // Phones/Main, and one shared group for inputs 5-8. 0 = -10 dBV is
+        // measured; 1 and 2 follow the same encoding as the other units.
+        // Only a UC/UCX has these registers; a Babyface Pro would otherwise
+        // show rows that silently do nothing.
+        body = body
+            .push(ref_row(
+                "Line Out",
+                ["-10 dBV", "+4 dBu", "Hi Gain"],
+                [0, 1, 2],
+                settings.line_out_ref,
+                Message::LineOutRefSelected,
+            ))
+            .push(ref_row(
+                "Phones",
+                ["-10 dBV", "+4 dBu", "Hi Gain"],
+                [0, 1, 2],
+                settings.phones_ref,
+                Message::PhonesRefSelected,
+            ))
+            .push(ref_row(
+                "Line In 5-8",
+                ["-10 dBV", "+4 dBu", "Lo Gain"],
+                [0, 1, 2],
+                settings.line_in_ref_58,
+                Message::LineInRef58Selected,
+            ));
+    }
+    if state.device.firmware().is_some() {
+        body = body.push(
+            row![
+                caption("Firmware"),
+                text(firmware)
+                    .color(theme::TEXT_PRIMARY)
+                    .size(theme::TEXT_XS * ts),
+            ]
+            .spacing(theme::SPACE_MD * scale)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+    if state.device.serial().is_some() {
+        body = body.push(
+            row![
+                caption("Serial"),
+                text(serial)
+                    .color(theme::TEXT_PRIMARY)
+                    .size(theme::TEXT_XS * ts),
+            ]
+            .spacing(theme::SPACE_MD * scale)
+            .align_y(iced::Alignment::Center),
+        );
+    }
+    body.spacing(theme::SPACE_MD * scale)
+        .width(Length::Fill)
+        .into()
+}
+
+fn engine_section(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
+    let scale = state.ui_scale;
+    let ts = scale * 1.15;
+    let caption = |label: &'static str| {
+        text(label)
+            .color(theme::TEXT_SEC)
+            .size(theme::TEXT_XS * ts)
             .width(Length::Fixed(label_w * scale))
     };
     let heading = row![
@@ -3749,7 +6958,7 @@ fn engine_section(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
             "AUDIO ENGINE \u{00b7} PIPEWIRE"
         })
         .color(theme::TEXT_SEC)
-        .size(theme::TEXT_MICRO * scale),
+        .size(theme::TEXT_MICRO * ts),
         iced::widget::rule::horizontal(1),
     ]
     .spacing(theme::SPACE_MD * scale)
@@ -3763,7 +6972,7 @@ fn engine_section(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
                  set by whatever opens the card.",
             )
             .color(theme::TEXT_SEC)
-            .size(theme::TEXT_XS * scale),
+            .size(theme::TEXT_XS * ts),
         ]
         .spacing(theme::SPACE_MD * scale)
         .width(Length::Fill)
@@ -3791,10 +7000,8 @@ fn engine_section(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
     } else {
         rate_label(clock.force_rate)
     };
-    // "Auto" without a number: with nothing forced, the card runs what
-    // its active clients ask for, 256 by default from the WirePlumber rule
-    // (`node.latency`), not PipeWire's global `clock.quantum`, which this
-    // label used to show. The latency line below shows what really runs.
+    // "Auto" without a number: the card follows the graph's quantum.
+    // The latency line below shows the resulting hardware buffer and chain.
     let quantum_opts: Vec<String> = std::iter::once("Auto".to_string())
         .chain(quanta.iter().map(|q| format!("{q} samples")))
         .collect();
@@ -3822,30 +7029,35 @@ fn engine_section(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
         Message::EngineQuantum(if idx == 0 { 0 } else { quanta_for_pick[idx - 1] })
     }));
 
-    column![
-        heading,
-        row![caption("Sample rate"), rate_pick]
-            .spacing(theme::SPACE_MD * scale)
-            .align_y(iced::Alignment::Center),
+    let mut body = column![heading];
+    // The UC's single sample-rate control lives in the DEVICE group above.
+    // This section is the host/PipeWire graph: buffer and latency only.
+    if !state.device.is_uc_model() {
+        body = body.push(
+            row![caption("Sample rate"), rate_pick]
+                .spacing(theme::SPACE_MD * scale)
+                .align_y(iced::Alignment::Center),
+        );
+    }
+    body = body.push(
         row![caption("Buffer size"), quantum_pick]
             .spacing(theme::SPACE_MD * scale)
             .align_y(iced::Alignment::Center),
+    );
+    body = body.push(
         row![caption("Latency"), latency_readout(state, clock)]
             .spacing(theme::SPACE_MD * scale)
             .align_y(iced::Alignment::Center),
-    ]
-    .spacing(theme::SPACE_MD * scale)
+    );
+    body.spacing(theme::SPACE_MD * scale)
     .width(Length::Fill)
     .into()
 }
 
-/// The latency line, from the card's own stream when it is playing: the
-/// quantum is only the graph's, and the sound server may open the card with
-/// a fixed hardware period of its own (WirePlumber's `api.alsa.period-size`
-/// in IRQ mode; `tools/alsa/wireplumber-rme.conf` pinned 256 until
-/// 2026-10-21 and no longer does, but a user rule still can). Then
-/// the buffer size above does not reach the card, and this says so instead
-/// of showing the quantum's latency as the card's.
+/// The latency line.  While the card plays, it uses the card's actual ring
+/// buffer and the UC's USB queue from the module parameters.  When idle, it
+/// estimates the same chain from the graph quantum: one quantum is one ALSA
+/// period, and the card runs two periods.
 fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
     let scale = state.ui_scale;
     let line = |s: String, c: Color| text(s).color(c).size(theme::TEXT_XS * scale);
@@ -3853,14 +7065,29 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
         Some(card) => {
             let mut col = column![line(
                 format!(
-                    "{:.1} ms \u{00b7} {} samples at {}",
-                    card.period_ms(),
-                    card.period,
+                    "{:.1} ms buffer · {} samples at {}",
+                    card.buffer_ms(),
+                    card.buffer,
                     rate_label(card.rate)
                 ),
                 theme::TEXT_PRIMARY,
             )]
             .spacing(theme::SPACE_TIGHT * scale);
+            if state.device.is_uc_model() {
+                if let Some(queue) = state.driver_queue {
+                    let (usb, endpoint) = uc_usb_frames(card.rate, queue);
+                    let total = card.buffer + usb + endpoint;
+                    col = col.push(line(
+                        format!(
+                            "{:.1} ms USB + {:.1} ms endpoint ≈ {:.1} ms total",
+                            frames_ms(usb, card.rate),
+                            frames_ms(endpoint, card.rate),
+                            frames_ms(total, card.rate)
+                        ),
+                        theme::TEXT_SEC,
+                    ));
+                }
+            }
             // Only when the user asked for a size and the card ignores it
             // (a fixed period in a WirePlumber rule); "Auto" follows clients.
             if clock.force_quantum != 0 && card.period != clock.effective_quantum() {
@@ -3871,25 +7098,77 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
             }
             col.into()
         }
-        None if state.device.is_mock() => line(
-            format!(
-                "{:.1} ms per buffer at {}",
-                clock.latency_ms(),
-                rate_label(clock.effective_rate())
-            ),
-            theme::TEXT_PRIMARY,
-        )
-        .into(),
-        None => line(
-            format!(
-                "{:.1} ms per buffer at {}",
-                clock.latency_ms(),
-                rate_label(clock.effective_rate())
-            ),
-            theme::TEXT_PRIMARY,
-        )
-        .into(),
+        None => {
+            let rate = clock.effective_rate();
+            let quantum = clock.effective_quantum();
+            if state.device.is_uc_model() {
+                let mut periods = 2;
+                if let Some(queue) = state.driver_queue {
+                    let minimum = uc_min_buffer_frames(rate, queue);
+                    periods = minimum.div_ceil(quantum.max(1)).max(2);
+                }
+                let buffer = quantum.max(1).saturating_mul(periods);
+                let mut col = column![line(
+                    format!(
+                        "{:.1} ms buffer ({} × {}) at {}",
+                        frames_ms(buffer, rate),
+                        periods,
+                        quantum,
+                        rate_label(rate)
+                    ),
+                    theme::TEXT_PRIMARY,
+                )]
+                .spacing(theme::SPACE_TIGHT * scale);
+                if let Some(queue) = state.driver_queue {
+                    let (usb, endpoint) = uc_usb_frames(rate, queue);
+                    let total = buffer + usb + endpoint;
+                    col = col.push(line(
+                        format!(
+                            "{:.1} ms USB + {:.1} ms endpoint ≈ {:.1} ms total",
+                            frames_ms(usb, rate),
+                            frames_ms(endpoint, rate),
+                            frames_ms(total, rate)
+                        ),
+                        theme::TEXT_SEC,
+                    ));
+                }
+                col.into()
+            } else {
+                line(
+                    format!(
+                        "{:.1} ms per buffer at {}",
+                        clock.latency_ms(),
+                        rate_label(rate)
+                    ),
+                    theme::TEXT_PRIMARY,
+                )
+                .into()
+            }
+        }
     }
+}
+
+/// Frames covered by the UC's host queue and endpoint at the current rate.
+fn uc_usb_frames(rate: u32, (frames, urbs): (u32, u32)) -> (u32, u32) {
+    let factor = if rate > 128_000 {
+        4
+    } else if rate > 64_000 {
+        2
+    } else {
+        1
+    };
+    let per_urb = frames * factor;
+    (per_urb * urbs, per_urb)
+}
+
+/// Frames the ALSA ring needs: the USB queue plus two URBs of margin.
+fn uc_min_buffer_frames(rate: u32, queue: (u32, u32)) -> u32 {
+    let (usb, endpoint) = uc_usb_frames(rate, queue);
+    usb + 2 * endpoint
+}
+
+fn frames_ms(frames: u32, rate: u32) -> f32 {
+    frames as f32 * 1000.0 / rate.max(1) as f32
 }
 
 /// Where the device popover's card starts, from the window top at scale 1:
@@ -3900,17 +7179,23 @@ const POPOVER_TOP: f32 = theme::TOP_BAR_H;
 /// tick and a rule trailing off to the right, instead of bare gray text that
 /// blends into the background.
 fn section_header(label: &str, scale: f32) -> Element<'_, Message> {
-    row![
+    // The tick opens the line, the block closes it: the pair marks exactly
+    // which channels the section holds.
+    let block = || {
         container(
             iced::widget::Space::new()
                 .width(3.0 * scale)
-                .height(12.0 * scale)
+                .height(12.0 * scale),
         )
-        .style(theme::accent_bar),
+        .style(theme::accent_bar)
+    };
+    row![
+        block(),
         text(label)
             .color(theme::TEXT_PRIMARY)
             .size(theme::TEXT_MD * scale),
         iced::widget::rule::horizontal(1),
+        block(),
     ]
     .spacing(theme::SPACE_LG)
     .align_y(iced::Alignment::Center)
@@ -3923,9 +7208,20 @@ fn section_header(label: &str, scale: f32) -> Element<'_, Message> {
 fn page<'a>(body: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
     mouse_area(
         container(
+            // One scroll area for the whole view.  A narrow window must not
+            // squeeze any row out of the layout: the three mixer rows scroll
+            // horizontally together, with the scrollbar at the bottom, and
+            // vertically when the content is taller than the window.
             scrollable(body)
-                .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+                .direction(scrollable::Direction::Both {
+                    vertical: theme::thin_scrollbar(),
+                    horizontal: theme::thin_scrollbar(),
+                })
                 .width(Length::Fill)
+                // Fill the window, not the content height: this keeps the
+                // horizontal scrollbar pinned to the bottom of the window
+                // instead of sitting under the last mixer row.
+                .height(Length::Fill)
                 .style(theme::scrollable),
         )
         .style(theme::root)
@@ -3978,16 +7274,56 @@ fn top_bar(state: &TuxMix) -> Element<'_, Message> {
     // no reason to keep two separate homes for one feature.
     // Flat fields, like everything else in the bar: this was the bar's
     // only boxed element (a `chip`), and read as dropped into the corner.
+    let out_labels = state.display_pair_labels();
+    let out_labels_pick = out_labels.clone();
+    let display_to_internal = state.device.output_display_order();
+    let selected_pair_label = state
+        .pair_labels()
+        .get(state.sel_out)
+        .cloned()
+        .unwrap_or_default();
+    let current_target = state
+        .device_target
+        .clone()
+        .unwrap_or_else(|| state.device.target());
+    let mut targets = DeviceHandle::available_targets();
+    if !targets.contains(&current_target) {
+        targets.push(current_target.clone());
+    }
+    let device_labels: Vec<String> = targets.iter().map(DeviceTarget::label).collect();
+    let targets_for_pick = targets.clone();
     let session = row![
+            text("Device")
+                .color(theme::TEXT_SEC)
+                .size(theme::TEXT_XS * scale),
+            pick_list(
+                device_labels,
+                Some(current_target.label()),
+                move |label| {
+                    let target = targets_for_pick
+                        .iter()
+                        .find(|target| target.label() == label)
+                        .cloned()
+                        .unwrap_or_else(|| current_target.clone());
+                    Message::SelectDevice(target)
+                },
+            )
+            .style(theme::pick_list)
+            .menu_style(theme::menu)
+            .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
+            .text_size(theme::TEXT_MD * scale),
             text("Submix")
                 .color(theme::TEXT_SEC)
                 .size(theme::TEXT_XS * scale),
             pick_list(
-                OUT_LABELS.to_vec(),
-                Some(OUT_LABELS[state.sel_out]),
-                |label| {
-                    let idx = OUT_LABELS.iter().position(|l| *l == label).unwrap_or(0);
-                    Message::SelectOutput(idx)
+                out_labels,
+                Some(selected_pair_label.clone()),
+                move |label| {
+                    let display = out_labels_pick
+                        .iter()
+                        .position(|l| *l == label)
+                        .unwrap_or(0);
+                    Message::SelectOutput(display_to_internal.get(display).copied().unwrap_or(display))
                 },
             )
             .style(theme::pick_list)
@@ -4035,9 +7371,27 @@ fn top_bar(state: &TuxMix) -> Element<'_, Message> {
         .style(theme::ghost_button)
         .on_press(Message::ToggleAbout);
 
+    // Options > Reset Mix (manual 25.10), beside the view tabs: a pick list
+    // so the menu is the standard anchored one.
+    let reset_opts: Vec<String> = RESET_MIX.iter().map(|(n, _)| n.to_string()).collect();
+    let reset_pick = pick_list(reset_opts, None::<String>, |name: String| {
+        let kind = RESET_MIX
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, k)| *k)
+            .unwrap_or(ResetMix::TotalReset);
+        Message::ResetMix(kind)
+    })
+    .placeholder("RESET MIX")
+    .style(theme::pick_list)
+    .menu_style(theme::menu)
+    .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
+    .text_size(theme::TEXT_MD * scale);
+
     let mut bar = row![
         brand,
         tab_toggle,
+        reset_pick,
         // Everything right of here is the tool side of the bar: the
         // flexible space sits in the middle, so the session chip stays
         // against the right edge instead of floating at whatever width it
@@ -4079,11 +7433,13 @@ fn top_bar(state: &TuxMix) -> Element<'_, Message> {
 
 /// Whether playback channel `idx` has a real level. Mock has its own
 /// generated meters; real backends get them from the PipeWire monitor,
-/// whose channel count depends on the card profile (2 = PB1 only, 12 =
-/// all six pairs). See `pw_meter`.
+/// whose channel count depends on the card profile (2 = PB1 only,
+/// 12 = Babyface six pairs, 18 = UCX nine pairs). See `pw_meter`.
 fn playback_meter_available(state: &TuxMix, idx: usize) -> bool {
     if state.device.is_mock() {
         state.device.has_playback_meters()
+    } else if state.device.has_device_playback_meters() {
+        idx < state.device.playbacks().len()
     } else {
         idx < state.playback_tap_channels
     }
@@ -4092,9 +7448,9 @@ fn playback_meter_available(state: &TuxMix, idx: usize) -> bool {
 /// Whether an output's host-computed meter is complete: every source
 /// routed into that output pair must itself have a real meter. Inputs
 /// are all real with the updated ALSA driver; playbacks depend on the
-/// PipeWire tap's channel count (2 = PB1 only, 12 = all six pairs). An
-/// output with an unmetered nonzero crosspoint stays N/A instead of
-/// showing a partial sum.
+/// PipeWire tap's channel count (2 = PB1 only, 12 = Babyface six pairs,
+/// 18 = UCX nine pairs). An output with an unmetered nonzero crosspoint
+/// stays N/A instead of showing a partial sum.
 fn output_meter_available(state: &TuxMix, out_idx: usize) -> bool {
     let pair = if state.device.outputs_one_per_pair() {
         out_idx
@@ -4141,29 +7497,58 @@ fn strip_params<'a>(
         ChannelId::Output(i) => i,
         _ => output_idx,
     };
+    // FX send on inputs and software playbacks, FX Return on outputs: the
+    // thin fader TotalMix draws beside the main one.
+    let fx_level = if state.device.capabilities().fx {
+        match cid {
+            ChannelId::Input(i) => state.device.inputs().get(i).map(|c| c.fx_send_db),
+            ChannelId::Playback(i) => state.device.playbacks().get(i).map(|c| c.fx_send_db),
+            ChannelId::Output(i) => state.device.outputs().get(i).map(|c| c.fx_return_db),
+        }
+    } else {
+        None
+    };
+
     let base = strip::StripParams {
         cid,
         output_idx,
+        bus_label: state
+            .pair_labels()
+            .get(output_idx)
+            .cloned()
+            .unwrap_or_default(),
         // The three per-kind literals below spread this one, so the
         // capability is read once. See `RmeDevice::protocol_features`.
         protocol_features: state.device.protocol_features(),
+        stereo_split_supported: state.device.stereo_split_supported(),
         name: String::new(),
         type_tag: None,
         vol: 0.0,
         pan: 0,
+        output_balance_supported: false,
+        fx_level,
         meter: fader::MeterFrame::still(0.0),
         meter_available: false,
         meter2: None,
         meter2_available: false,
         has_48v: false,
         has_pad: false,
+        has_instrument: false,
         phantom: false,
         pad: false,
+        instrument: false,
         has_gain: false,
         gain: 0,
         gain_max: 0,
+        gain_half: false,
         has_sensitivity: false,
         sensitivity_plus4: false,
+        has_level: false,
+        level: InputLevel::Plus4dBu,
+        has_autoset: false,
+        autoset: false,
+        has_dynamics: false,
+        dynamics_on: false,
         has_eq: false,
         eq_enabled: false,
         has_trim: false,
@@ -4171,6 +7556,7 @@ fn strip_params<'a>(
         has_phase: false,
         phase: false,
         loopback: false,
+        loopback_supported: state.device.loopback_supported(),
         stereo_linked: false,
         open_flyout: state
             .flyout_open
@@ -4195,15 +7581,25 @@ fn strip_params<'a>(
         scale: state.ui_scale,
         selected: state.selected.contains(&cid),
         hovered: state.hovered_strip == Some(cid),
+        active_surface: false,
+        name_custom: false,
     };
 
+    let caps = state.device.capabilities();
     match cid {
         ChannelId::Input(i) => {
             let ch = &state.device.inputs()[i];
-            let has_48v = ch.channel_type == ChannelType::Mic;
+            let has_48v = caps.input_phantom && ch.channel_type == ChannelType::Mic;
             strip::StripParams {
                 name: ch.name.clone(),
-                type_tag: Some(type_tag(ch.channel_type)),
+                // RME TotalMix identifies the row and the channel name; a
+                // second "MIC"/"LINE"/"SPDIF" badge next to every name is
+                // redundant.  Keep the channel-type colour for the Matrix
+                // and the settings panel only.
+                type_tag: None,
+                // Input strips always use the lighter active-source
+                // surface; the current output strip uses the same tone.
+                active_surface: true,
                 vol: ch.volumes[output_idx],
                 pan: ch.pans[output_idx],
                 meter: state
@@ -4213,19 +7609,32 @@ fn strip_params<'a>(
                     .unwrap_or_else(|| fader::MeterFrame::still(0.0)),
                 meter_available: state.device.has_input_meter(i),
                 has_48v,
-                has_pad: has_48v,
+                has_pad: caps.input_pad && ch.has_pad,
+                has_instrument: ch.has_instrument,
                 phantom: ch.phantom,
                 pad: ch.pad,
+                instrument: ch.instrument,
                 has_gain: ch.gain_max.is_some(),
                 gain: ch.gain.unwrap_or(0),
                 gain_max: ch.gain_max.unwrap_or(0),
+                // The driver's new UCX control is 0..24 in 0.5 dB units;
+                // the older whole-dB control was 0..18 (or 0..12).
+                gain_half: matches!(ch.gain_max, Some(24 | 36)),
                 has_sensitivity: ch.sensitivity.is_some(),
                 sensitivity_plus4: ch.sensitivity == Some(Sensitivity::Plus4dBu),
+                has_level: caps.input_level && (2..4).contains(&i),
+                level: ch.level.unwrap_or(InputLevel::Plus4dBu),
+                has_autoset: caps.input_autoset && i < 2,
+                autoset: ch.autoset,
+                has_dynamics: caps.dynamics && ch.dynamics.is_some(),
+                dynamics_on: ch.dynamics.is_some_and(|d| d.on),
                 has_eq: ch.eq.is_some(),
                 eq_enabled: ch.eq.is_some_and(|e| e.enabled),
                 has_trim: true,
                 trim: ch.trim,
-                has_phase: ch.eq.is_some(),
+                // The UC now stores phase as the sign of every routed
+                // matrix cell; it has no EQ, so the old UCX EQ test hid it.
+                has_phase: caps.phase && (ch.eq.is_some() || caps.phase_without_eq),
                 phase: ch.phase,
                 stereo_linked: state.device.input_pair_linked(i / 2),
                 mute: ch.mute,
@@ -4238,7 +7647,10 @@ fn strip_params<'a>(
             let ch = &state.device.playbacks()[i];
             strip::StripParams {
                 name: ch.name.clone(),
-                type_tag: Some(("PB", PB_TAG)),
+                // The software-playback row already says what these are;
+                // no redundant "PB" tag next to every name (TotalMix).
+                type_tag: None,
+                active_surface: true,
                 vol: ch.volumes[output_idx],
                 pan: ch.pans[output_idx],
                 meter: state
@@ -4256,11 +7668,52 @@ fn strip_params<'a>(
         }
         ChannelId::Output(i) => {
             let ch = &state.device.outputs()[i];
+            let linked = state.device.output_linked(i / 2);
+            let left = i & !1;
+            let right = left + 1;
+            // Output balance is implicit in the two channel levels.  The
+            // linked fader displays the louder side (the pair level), so
+            // moving it preserves the balance.
+            let pair_level = if linked {
+                let l = state.device.outputs()[left].volume;
+                let r = state.device.outputs()[right].volume;
+                l.max(r)
+            } else {
+                ch.volume
+            };
+            // The UCX stores balance in its own register (`NN01`), so the
+            // knob must read that; the UC derives it from the two volumes.
+            let balance_register =
+                state.device.output_balance_supported() && !state.device.is_uc_model();
+            let pan: i8 = if balance_register {
+                ch.balance
+            } else if linked && state.device.output_balance_supported() {
+                output_balance_from_volumes(
+                    state.device.outputs()[left].volume,
+                    state.device.outputs()[right].volume,
+                )
+            } else {
+                0
+            };
+            // Device block pair 0 is Phones 7/8, wherever the display
+            // order puts it.  The unit's physical encoder writes the IF1
+            // 0x1800/0x1900 hardware volume, which the driver exposes
+            // separately from the DSP master.  Show that value on the
+            // Phones strip so the slider follows the unit.
+            let hw = if i / 2 == 0 {
+                state.device.hardware_volume()
+            } else {
+                None
+            };
             strip::StripParams {
                 name: ch.name.clone(),
-                type_tag: Some(("OUT", OUT_TAG)),
-                vol: ch.volume,
-                pan: 0,
+                // The hardware-output row already says what these are; no
+                // redundant "OUT" tag next to every name (TotalMix).
+                type_tag: None,
+                vol: hw.unwrap_or(pair_level),
+                pan,
+                output_balance_supported: state.device.output_balance_supported()
+                    && (linked || balance_register),
                 meter: state
                     .output_meters
                     .get(i)
@@ -4270,6 +7723,10 @@ fn strip_params<'a>(
                 // when every nonzero crosspoint feeding this pair has
                 // a real meter (see `output_meter_available`).
                 meter_available: output_meter_available(state, i),
+                has_eq: ch.eq.is_some(),
+                eq_enabled: ch.eq.is_some_and(|e| e.enabled),
+                has_dynamics: caps.dynamics && ch.dynamics.is_some(),
+                dynamics_on: ch.dynamics.is_some_and(|d| d.on),
                 loopback: ch.loopback,
                 stereo_linked: state.device.output_linked(i / 2),
                 mute: ch.mute,
@@ -4277,6 +7734,11 @@ fn strip_params<'a>(
                 has_cue: true,
                 cue: ch.cue,
                 default_vol: 1.0,
+                active_surface: if state.device.outputs_one_per_pair() {
+                    i == state.sel_out
+                } else {
+                    i / 2 == state.sel_out
+                },
                 ..base
             }
         }
@@ -4322,24 +7784,12 @@ fn apply_pending_resize(state: &mut TuxMix) {
 // ── Scale: initial zoom, fit, sidebar ────────────────────────────
 
 /// The smallest window the app opens at (logical px). Width: a strip row at
-/// the minimum zoom plus the folded rail and the top bar's tools; height: one
-/// row of strips under the top bar (the rest scrolls). It was 960x600, a
-/// round number rather than a measured one, and it kept a window that fits
-/// everything at 80 % from being any smaller.
+/// the minimum zoom plus the always-visible right sidebar and the top bar's
+/// tools; height: one row of strips under the top bar (the rest scrolls).
+/// It was 960x600, a round number rather than a measured one, and it kept a
+/// window that fits everything at 80 % from being any smaller.
 pub(crate) const MIN_WINDOW: (f32, f32) = (640.0, 420.0);
 
-/// Whether, in a window `w` wide, the sidebar would leave the widest strip
-/// row less room than it needs at the current zoom (the sidebar then folds
-/// itself, see `Message::WindowSize`). Measured against the real row widths
-/// rather than a fixed threshold: at 80 % everything fits beside the
-/// sidebar in 970 px, at 130 % it needs more than 1300.
-fn sidebar_does_not_fit(state: &TuxMix, w: f32) -> bool {
-    let (inputs, playbacks, outputs) = unit_row_widths(state);
-    let row = inputs.max(playbacks).max(outputs) * state.ui_scale;
-    let sidebar = state.sidebar_width * sidebar_scale(state);
-    // Slack so the fold is not on the very edge of "just fits".
-    w < row + sidebar + 2.0 * theme::SPACE_XL + 4.0 + 24.0
-}
 /// The sidebar scales with the zoom only up to this: it is a column of
 /// small controls, and at the strips' 175 % it was as wide as half a
 /// small window for no gain.
@@ -4365,50 +7815,6 @@ pub(crate) fn sidebar_scale(state: &TuxMix) -> f32 {
     state.ui_scale.min(SIDEBAR_SCALE_MAX)
 }
 
-/// One strip's width at scale 1 (collapsed or full).
-fn unit_strip_width(state: &TuxMix, cid: ChannelId) -> f32 {
-    if state.collapsed.contains(&cid) {
-        strip::COLLAPSED_W
-    } else {
-        strip::full_width(cid)
-    }
-}
-
-/// The widths, at scale 1, of the mixer's three rows (inputs, playbacks,
-/// outputs): a linked pair is one strip, a split one two.
-fn unit_row_widths(state: &TuxMix) -> (f32, f32, f32) {
-    let row = |n_pairs: usize, linked: &dyn Fn(usize) -> bool, id: &dyn Fn(usize) -> ChannelId| {
-        let mut w = 0.0;
-        let mut n = 0usize;
-        for pair in 0..n_pairs {
-            let l = pair * 2;
-            let shown: &[usize] = if linked(pair) { &[0] } else { &[0, 1] };
-            for k in shown {
-                w += unit_strip_width(state, id(l + k));
-                n += 1;
-            }
-        }
-        w + n.saturating_sub(1) as f32 * theme::SPACE_MD
-    };
-    (
-        row(
-            state.device.inputs().len() / 2,
-            &|p| state.device.input_pair_linked(p),
-            &ChannelId::Input,
-        ),
-        row(
-            state.device.playbacks().len() / 2,
-            &|p| state.device.playback_linked(p),
-            &ChannelId::Playback,
-        ),
-        row(
-            state.device.output_pair_count(),
-            &|p| state.device.output_linked(p),
-            &ChannelId::Output,
-        ),
-    )
-}
-
 /// How much one zoom step changes `ui_scale` (a Ctrl+molette notch, or one
 /// Ctrl+= / Ctrl+- press). The scale is decoupled from window size — fixed
 /// geometry, rows and pages scroll — so this is the only thing that moves it.
@@ -4432,38 +7838,142 @@ fn rendered_strip_width(state: &TuxMix, cid: ChannelId) -> f32 {
     w * state.ui_scale
 }
 
-/// Wraps a strip row: always left-aligned (stuck to the window's left
-/// edge), like a real mixer's channel strips, whether or not it fits —
-/// falls back to the horizontal scrollable only once it doesn't.
-fn responsive_row<'a>(
-    content: Element<'a, Message>,
-    content_width: f32,
-    available_width: f32,
-) -> Element<'a, Message> {
-    if content_width <= available_width {
-        content
+/// Derive a stereo balance from the two hardware-output levels.  Output
+/// balance is not stored anywhere: the per-channel volumes are the state,
+/// exactly as on the UC wire (two unequal `0x1a` codes).
+fn output_balance_from_volumes(left: f32, right: f32) -> i8 {
+    let peak = left.max(right);
+    if peak <= 0.0 {
+        0
     } else {
-        scrollable(content)
-            .direction(scrollable::Direction::Horizontal(theme::thin_scrollbar()))
-            .style(theme::scrollable)
-            .into()
+        (((right - left) / peak) * 100.0)
+            .round()
+            .clamp(-100.0, 100.0) as i8
     }
 }
+
+/// The left/right channel ids of the pair containing `cid`.
+fn stereo_pair(cid: ChannelId) -> (ChannelId, ChannelId) {
+    match cid {
+        ChannelId::Input(i) => (ChannelId::Input(i & !1), ChannelId::Input(i | 1)),
+        ChannelId::Playback(i) => {
+            (ChannelId::Playback(i & !1), ChannelId::Playback(i | 1))
+        }
+        ChannelId::Output(i) => (ChannelId::Output(i & !1), ChannelId::Output(i | 1)),
+    }
+}
+
+/// Width of the second strip of a pair: 0 while linked, its full width
+/// while split.  During a Stereo toggle it tweens between the two, which is
+/// what makes the rest of the row slide at the fold-out speed.
+fn stereo_extra_width(
+    state: &TuxMix,
+    left: ChannelId,
+    linked: bool,
+    full: f32,
+    now: Instant,
+) -> f32 {
+    state
+        .stereo_anim
+        .get(&left)
+        .map(|a| a.at(now).clamp(0.0, full))
+        .unwrap_or(if linked { 0.0 } else { full })
+}
+
+fn start_stereo_anim(state: &mut TuxMix, cid: ChannelId, linked: bool) {
+    let (left, right) = stereo_pair(cid);
+    let full = rendered_strip_width(state, right);
+    let now = Instant::now();
+    let prev = state
+        .stereo_anim
+        .get(&left)
+        .map(|a| a.at(now))
+        .unwrap_or(if linked { full } else { 0.0 });
+    let target = if linked { 0.0 } else { full };
+    if (prev - target).abs() < 0.5 {
+        state.stereo_anim.remove(&left);
+    } else {
+        state.stereo_anim.insert(
+            left,
+            strip::CollapseAnim {
+                prev,
+                value: target,
+                since: now,
+            },
+        );
+    }
+}
+
+/// Natural width of an inline panel, matching the width the render loops
+/// pass to its popover function.
+fn flyout_width(state: &TuxMix, cid: ChannelId, kind: strip::FlyoutKind) -> f32 {
+    match kind {
+        strip::FlyoutKind::Settings => rendered_strip_width(state, cid),
+        strip::FlyoutKind::Eq => strip::EQ_FLYOUT_W * state.ui_scale,
+        strip::FlyoutKind::Dynamics => strip::DYN_FLYOUT_W * state.ui_scale,
+        strip::FlyoutKind::Trim => strip::FLYOUT_W,
+        strip::FlyoutKind::Route => strip::FLYOUT_W,
+    }
+}
+
+/// Current animated width of an inline panel, or `None` when it is fully
+/// closed and should not occupy a row slot.  `full_width` is the strip's
+/// current width (settings panels match the strip).
+fn flyout_slot(
+    state: &TuxMix,
+    cid: ChannelId,
+    kind: strip::FlyoutKind,
+    full_width: f32,
+    now: Instant,
+) -> Option<f32> {
+    let open = state.flyout_open.contains(&(cid, kind));
+    match state.flyout_anim.get(&(cid, kind)) {
+        Some(anim) => {
+            let w = anim.at(now);
+            if !open && !anim.is_settling(now) {
+                None
+            } else {
+                Some(w.max(0.0))
+            }
+        }
+        None => open.then_some(full_width),
+    }
+}
+
+/// Route is rendered as a Stack overlay, so its row needs the strip's
+/// right edge while it is open *or* still sliding out.
+fn route_visible(state: &TuxMix, cid: ChannelId, now: Instant) -> bool {
+    state
+        .flyout_open
+        .contains(&(cid, strip::FlyoutKind::Route))
+        || state
+            .flyout_anim
+            .get(&(cid, strip::FlyoutKind::Route))
+            .is_some_and(|a| a.is_settling(now))
+}
+
+// Rows are plain content now: the whole page is the one bidirectional
+// scroll area (`page()`), so all three rows scroll together and no row
+// can be squeezed out by a narrow window.
 
 /// The route flyout's content — one button per output bus, current
 /// selection highlighted. `width` is the caller's animated tween value;
 /// `.clip(true)` keeps the list from spilling out past it mid-animation.
 fn route_popover(state: &TuxMix, width: f32, scale: f32) -> Element<'_, Message> {
     let mut list = column![].spacing(theme::SPACE_TIGHT);
-    for (idx, label) in OUT_LABELS.iter().enumerate() {
+    let labels = state.display_pair_labels();
+    let display_to_internal = state.device.output_display_order();
+    let selected_display = state.device.display_pair_index(state.sel_out);
+    for (display, label) in labels.iter().enumerate() {
+        let internal = display_to_internal.get(display).copied().unwrap_or(display);
         list = list.push(
-            button(text(*label).size(theme::TEXT_SM * scale))
+            button(text(label.clone()).size(theme::TEXT_SM * scale))
                 .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
                 .width(Length::Fill)
                 // The bus a strip routes to is a position, not an "on"
                 // state: the graphite thumb, not the white fill.
-                .style(theme::segment_button(idx == state.sel_out))
-                .on_press(Message::SelectOutput(idx)),
+                .style(theme::segment_button(display == selected_display))
+                .on_press(Message::SelectOutput(internal)),
         );
     }
     // Floats over the next strips, so it is a raised card with a shadow,
@@ -4472,6 +7982,7 @@ fn route_popover(state: &TuxMix, width: f32, scale: f32) -> Element<'_, Message>
     container(list)
         .padding(theme::SPACE_SM * scale)
         .width(Length::Fixed(width))
+        .clip(true)
         .style(theme::dialog)
         .into()
 }
@@ -4486,11 +7997,16 @@ fn flyout_card<'a>(
     scale: f32,
 ) -> Element<'a, Message> {
     container(content)
-        .padding(theme::SPACE_MD * scale)
+        .padding(theme::FLYOUT_PAD * scale)
         .width(Length::Fixed(width))
-        // As tall as the strip beside it, like the EQ panel.
-        .height(Length::Fill)
-        .style(theme::panel)
+        // A fixed full-strip height, not the content's natural height: every
+        // slideout must occupy the same row height (Settings is short, Trim
+        // is short, EQ is tall).  `Length::Fill` resolves to zero inside the
+        // page-level horizontal scrollable, so this is the measured full
+        // strip height (`strip::STRIP_H`), not a fill.
+        .height(Length::Fixed(strip::STRIP_H * scale))
+        .align_y(iced::Alignment::Start)
+        .style(theme::panel_attached)
         .clip(true)
         .into()
 }
@@ -4520,10 +8036,13 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
     // A playback pair's link is its hardware stereo split (the pair goes
     // split-mono into AN1/2), an RME-protocol register: in Class Compliant
     // mode the switch is shown but inert, saying why.
-    let can_toggle = !matches!(cid, ChannelId::Playback(_)) || p.protocol_features;
+    let can_toggle = !matches!(cid, ChannelId::Playback(_)) || p.stereo_split_supported;
     let tip = match (cid, can_toggle) {
-        (ChannelId::Playback(_), false) => {
+        (ChannelId::Playback(_), false) if state.device.class_compliant() => {
             "Splitting a playback pair needs the RME protocol (not in Class Compliant mode)"
+        }
+        (ChannelId::Playback(_), false) => {
+            "Splitting a playback pair is not supported by this backend"
         }
         (ChannelId::Playback(_), true) => {
             "Stereo: one strip for the pair. Off: two mono strips, split L/R into AN1/2"
@@ -4534,7 +8053,7 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
         button(text("STEREO").size(theme::TEXT_SM * scale))
             .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
             .width(Length::Fill)
-            .style(theme::toggle_button(p.stereo_linked, theme::ACCENT))
+            .style(theme::stereo_button(p.stereo_linked))
             .on_press_maybe(
                 can_toggle.then_some(Message::StereoLinkChanged(cid, !p.stereo_linked)),
             ),
@@ -4542,9 +8061,128 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
         scale,
     ));
 
+    // FX send: per channel on the UCX, so it sits in the channel's own
+    // settings panel rather than a global row.
+    if state.device.capabilities().fx {
+        let send = match cid {
+            ChannelId::Input(i) => state.device.inputs().get(i).map(|c| c.fx_send_db),
+            ChannelId::Playback(i) => state.device.playbacks().get(i).map(|c| c.fx_send_db),
+            ChannelId::Output(_) => None,
+        };
+        if let Some(send) = send {
+            let modifiers = state.modifiers;
+            col = col.push(
+                row![
+                    text("FX send")
+                        .size(theme::TEXT_SM * scale)
+                        .color(theme::TEXT_SEC)
+                        .width(Length::Fill),
+                    container(knob(Knob {
+                        value: send,
+                        range: (-65.0, 0.0),
+                        label: format!("{send:+.1}"),
+                        arc_from_center: false,
+                        level_arc_color: Some(theme::PHANTOM),
+                        interactive: true,
+                        log_scale: false,
+                        modifiers,
+                        scale,
+                        on_change: Box::new(move |v| Message::FxSendChanged(cid, v)),
+                        on_reset: Box::new(move || Message::FxSendChanged(cid, -65.0)),
+                    }))
+                    .width(Length::Fixed(54.0 * scale)),
+                ]
+                .align_y(iced::Alignment::Center)
+                .width(Length::Fill),
+            );
+        }
+    }
+
     let ChannelId::Input(idx) = cid else {
+        if let ChannelId::Output(out) = cid {
+            if state.device.capabilities().fx {
+                let fx = state
+                    .device
+                    .outputs()
+                    .get(out)
+                    .map(|o| o.fx_return_db)
+                    .unwrap_or(-65.0);
+                let modifiers = state.modifiers;
+                col = col.push(
+                    row![
+                        text("FX Return")
+                            .size(theme::TEXT_SM * scale)
+                            .color(theme::TEXT_SEC),
+                        container(knob(Knob {
+                            value: fx,
+                            range: (-65.0, 6.0),
+                            label: format!("{fx:+.1}"),
+                            arc_from_center: false,
+                            level_arc_color: Some(theme::PHANTOM),
+                            interactive: true,
+                            log_scale: false,
+                            modifiers,
+                            scale,
+                            on_change: Box::new(move |v| Message::FxReturnChanged(out, v)),
+                            on_reset: Box::new(move || Message::FxReturnChanged(out, -65.0)),
+                        }))
+                        .width(Length::Fill)
+                        .align_x(iced::Alignment::End),
+                    ]
+                    .align_y(iced::Alignment::Center)
+                    .width(Length::Fill),
+                );
+            }
+            if p.loopback_supported {
+                // Loopback is the manual's last output item and now sits at
+                // the bottom of the full-height panel, below the STEREO row.
+                col = col.push(iced::widget::Space::new().height(Length::Fill));
+                col = col.push(hint(
+                    button(text("LOOPBACK").size(theme::TEXT_SM * scale))
+                        .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                        .width(Length::Fill)
+                        .style(theme::stereo_button(p.loopback))
+                        .on_press(Message::LoopbackChanged(out, !p.loopback)),
+                    "Records this output on the same-numbered input channel",
+                    scale,
+                ));
+                col = col.height(Length::Fill);
+            }
+        }
         return flyout_card(col, width, scale);
     };
+
+    if p.has_48v || p.has_pad || p.has_instrument {
+        let mut tg_row = row![].spacing(theme::SPACE_TIGHT).width(Length::Fill);
+        if p.has_48v {
+            tg_row = tg_row.push(
+                button(text("48V").size(theme::TEXT_SM * scale))
+                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                    .width(Length::Fill)
+                    .style(theme::phantom_button(p.phantom))
+                    .on_press(Message::Phantom(idx, !p.phantom)),
+            );
+        }
+        if p.has_pad {
+            tg_row = tg_row.push(
+                button(text("PAD").size(theme::TEXT_SM * scale))
+                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                    .width(Length::Fill)
+                    .style(theme::stereo_button(p.pad))
+                    .on_press(Message::Pad(idx, !p.pad)),
+            );
+        }
+        if p.has_instrument {
+            tg_row = tg_row.push(
+                button(text("INST").size(theme::TEXT_SM * scale))
+                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                    .width(Length::Fill)
+                    .style(theme::stereo_button(p.instrument))
+                    .on_press(Message::Instrument(idx, !p.instrument)),
+            );
+        }
+        col = col.push(tg_row);
+    }
 
     if p.has_gain {
         let gain_max = p.gain_max;
@@ -4558,8 +8196,15 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
                     range: (0.0, gain_max as f32),
                     // Gain is tracked in dB (0-65 Mic / 0-18 Instr),
                     // 1 dB steps, like TotalMix.
-                    label: p.gain.to_string(),
+                    label: if p.gain_half {
+                        format!("{:.1}", p.gain as f32 / 2.0)
+                    } else {
+                        p.gain.to_string()
+                    },
                     arc_from_center: false,
+                    level_arc_color: Some(theme::PHANTOM),
+                    // AN1 keeps its original arc-only look; every other
+                    // gain knob gets the same visible orange rim at rest.
                     interactive: true,
                     log_scale: false,
                     modifiers: p.modifiers,
@@ -4578,62 +8223,434 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
         );
     }
 
-    if p.has_48v || p.has_pad {
-        let mut tg_row = row![].spacing(theme::SPACE_TIGHT).width(Length::Fill);
-        if p.has_48v {
-            tg_row = tg_row.push(
-                button(text("48V").size(theme::TEXT_SM * scale))
-                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
-                    .width(Length::Fill)
-                    .style(theme::toggle_button(p.phantom, theme::PHANTOM))
-                    .on_press(Message::Phantom(idx, !p.phantom)),
-            );
-        }
-        if p.has_pad {
-            tg_row = tg_row.push(
-                button(text("PAD").size(theme::TEXT_SM * scale))
-                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
-                    .width(Length::Fill)
-                    .style(theme::toggle_button(p.pad, theme::ACCENT))
-                    .on_press(Message::Pad(idx, !p.pad)),
-            );
-        }
-        col = col.push(tg_row);
+    if p.has_level {
+        let next = match p.level {
+            InputLevel::Minus10dBV => InputLevel::Plus4dBu,
+            InputLevel::Plus4dBu => InputLevel::LoGain,
+            InputLevel::LoGain => InputLevel::Minus10dBV,
+        };
+        col = col.push(hint(
+            button(text(format!("LEVEL  {}", p.level.label())).size(theme::TEXT_SM * scale))
+                .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                .width(Length::Fill)
+                .style(theme::stereo_button(p.level != InputLevel::Plus4dBu))
+                .on_press(Message::LevelChanged(idx, next)),
+            "Input reference level — −10 dBV / +4 dBu / LoGain",
+            scale,
+        ));
     }
 
-    if p.has_sensitivity {
+    if p.has_autoset {
+        col = col.push(hint(
+            button(text("AUTOSET").size(theme::TEXT_SM * scale))
+                .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                .width(Length::Fill)
+                .style(theme::stereo_button(p.autoset))
+                .on_press(Message::Autoset(idx, !p.autoset)),
+            "AutoSet — automatic gain reduction to prevent overloads",
+            scale,
+        ));
+    }
+
+    if p.has_sensitivity && state.device.has_sensitivity_control() {
         let label = if p.sensitivity_plus4 {
             "+4dBu"
         } else {
             "-10dBV"
         };
-        // The USB/libusb backend genuinely implements this (wired to
-        // the same hardware-verified ref-level mechanism `set_ref_level`
-        // already used for Instr 3/4's ref-level switch) — only the
-        // ALSA/kernel-driver backend still has no such control at all,
-        // dimmed and unpressable there, same treatment as this
-        // session's other confirmed-N/A controls (Output balance,
-        // `meters: post fx/RMS`).
-        if state.device.has_sensitivity_control() {
-            col = col.push(
+        col = col.push(
+            button(text(label).size(theme::TEXT_SM * scale))
+                .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                .width(Length::Fill)
+                .style(theme::plain_button)
+                .on_press(Message::Sensitivity(idx, !p.sensitivity_plus4)),
+        );
+    }
+
+    if p.has_phase {
+        // Pin Phase to the bottom edge of the panel, as in the manual.
+        col = col.push(iced::widget::Space::new().height(Length::Fill));
+
+        let phase_button = |label: &'static str, channel: usize, on: bool| -> Element<'_, Message> {
+            hint(
                 button(text(label).size(theme::TEXT_SM * scale))
                     .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
                     .width(Length::Fill)
-                    .style(theme::plain_button)
-                    .on_press(Message::Sensitivity(idx, !p.sensitivity_plus4)),
+                    .style(theme::phase_button(on))
+                    .on_press(Message::PhaseChanged(ChannelId::Input(channel), !on)),
+                if on { "Phase inverted" } else { "Phase normal" },
+                scale,
+            )
+        };
+        // Inputs 1/2 are the mic channels and get a worded Phase button.
+        // The other input channels use the manual's Ø symbols.
+        let mic = idx < 2;
+        if p.stereo_linked {
+            let left = idx & !1;
+            let right = left + 1;
+            let left_on = state.device.inputs().get(left).is_some_and(|c| c.phase);
+            let right_on = state
+                .device
+                .inputs()
+                .get(right)
+                .is_some_and(|c| c.phase);
+            let (left_label, right_label) = if mic {
+                ("Phase L", "Phase R")
+            } else {
+                ("Ø L", "R Ø")
+            };
+            col = col.push(
+                row![
+                    phase_button(left_label, left, left_on),
+                    phase_button(right_label, right, right_on),
+                ]
+                .spacing(theme::SPACE_TIGHT)
+                .width(Length::Fill),
             );
         } else {
-            let dim = Color { a: 0.4, ..theme::TEXT_SEC };
-            col = col.push(
-                button(text(label).size(theme::TEXT_SM * scale).color(dim))
-                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
-                    .width(Length::Fill)
-                    .style(theme::plain_button),
-            );
+            let label = if mic { "Phase" } else { "Ø" };
+            col = col.push(row![phase_button(label, idx, p.phase)].width(Length::Fill));
         }
+        col = col.height(Length::Fill);
     }
 
     flyout_card(col, width, scale)
+}
+
+/// The Dynamics flyout: Compressor, Expander, the shared CompEx gain/attack/
+/// release and Auto Level, in the order of the UCX manual (§25.3.3).
+fn dynamics_popover(
+    state: &TuxMix,
+    cid: ChannelId,
+    width: f32,
+    scale: f32,
+) -> Element<'_, Message> {
+    let d = dynamics_for(state, cid);
+    let modifiers = state.modifiers;
+    // Vertical proportions follow the measured TotalMix FX 2.x panel:
+    // header 21, graph 71, gap 3, gain row 60, gap 10, comp/exp 96.4,
+    // gap 3, auto level 62.  These land on the measured line centres.
+    let ds = scale * 0.76;
+    let mut col = column![].spacing(0.0);
+
+    // One knob cell.  `label_gap` is the vertical distance from the knob
+    // box to its label; the gain row uses the larger RME spacing, Auto
+    // Level uses the closer spacing.
+    let cell = move |label: Option<&'static str>,
+                     label_gap: f32,
+                     overlap: bool,
+                     colour: Color,
+                     value: f32,
+                     range: (f32, f32),
+                     value_text: String,
+                     reset: f32,
+                     mutate: fn(&mut Dynamics, f32)|
+     -> Element<'static, Message> {
+        let d = d;
+        let knob_box = 54.0 * ds;
+        let face = container(knob(Knob {
+            value,
+            range,
+            label: value_text,
+            arc_from_center: range.0 < 0.0,
+            level_arc_color: Some(colour),
+            interactive: true,
+            log_scale: false,
+            modifiers,
+            scale: ds,
+            on_change: Box::new(move |v| {
+                let mut next = d;
+                mutate(&mut next, v);
+                Message::DynamicsChanged(cid, next)
+            }),
+            on_reset: Box::new(move || {
+                let mut next = d;
+                mutate(&mut next, reset);
+                Message::DynamicsChanged(cid, next)
+            }),
+        }))
+        .width(Length::Fill)
+        .center_x(Length::Fill);
+        match label {
+            Some(label) => {
+                let label_text = text(label)
+                    .size(theme::TEXT_XS * scale)
+                    .color(colour)
+                    .width(Length::Fill)
+                    .center();
+                if overlap {
+                    let chip = container(label_text)
+                        .padding([0.0, theme::SPACE_TIGHT * scale])
+                        .style(theme::label_backdrop);
+                    // Keep the label in the same bottom position but give the
+                    // knob 4 px more room above it, reducing the overlap.
+                    let stack_h = knob_box + 8.0 * scale;
+                    iced::widget::Stack::new()
+                        .width(Length::Fill)
+                        .height(Length::Fixed(stack_h))
+                        .push(face)
+                        .push(
+                            container(chip)
+                                .width(Length::Fill)
+                                .height(Length::Fixed(stack_h))
+                                .align_y(iced::Alignment::End)
+                                .center_x(Length::Fill),
+                        )
+                        .into()
+                } else {
+                    column![face, label_text]
+                        .spacing(label_gap * scale)
+                        .align_x(iced::Alignment::Center)
+                        .width(Length::Fill)
+                        .into()
+                }
+            }
+            None => face.into(),
+        }
+    };
+
+    let toggle = |on: bool, msg: Message| -> Element<'static, Message> {
+        button(text(if on { "ON" } else { "OFF" }).size(theme::TEXT_XS * scale))
+            .padding([0.0, theme::SPACE_SM * scale])
+            .style(theme::toggle_button(on, theme::ACCENT))
+            .on_press(msg)
+            .into()
+    };
+
+    col = col.push(
+        container(
+            row![
+                toggle(d.on, Message::DynamicsEnabled(cid, !d.on)),
+                text("dynamics").size(theme::TEXT_SM * scale),
+                iced::widget::Space::new().width(Length::Fill),
+            ]
+            .spacing(theme::SPACE_SM * scale)
+            .align_y(iced::Alignment::Center)
+            .width(Length::Fill),
+        )
+        .height(Length::Fixed(21.0 * scale))
+        .align_y(iced::Alignment::Center),
+    );
+
+    col = col.push(dynamics_plot(d, 75.0 * scale, scale));
+    col = col.push(iced::widget::Space::new().height(Length::Fixed(3.0 * scale)));
+
+    col = col.push(
+        row![
+            cell(
+                Some("gain"),
+                theme::KNOB_LABEL_GAP,
+                false,
+                theme::TEXT_PRIMARY,
+                d.gain_db,
+                (-30.0, 30.0),
+                format!("{:+.1}", d.gain_db),
+                0.0,
+                |d, v| d.gain_db = v,
+            ),
+            cell(
+                Some("attack"),
+                theme::KNOB_LABEL_GAP,
+                false,
+                theme::TEXT_PRIMARY,
+                d.attack_ms as f32,
+                (0.0, 200.0),
+                format!("{}", d.attack_ms),
+                10.0,
+                |d, v| d.attack_ms = v.round().clamp(0.0, 200.0) as u16,
+            ),
+            cell(
+                Some("release"),
+                theme::KNOB_LABEL_GAP,
+                false,
+                theme::TEXT_PRIMARY,
+                d.release_ms as f32,
+                (100.0, 999.0),
+                format!("{}", d.release_ms),
+                300.0,
+                |d, v| d.release_ms = v.round().clamp(100.0, 999.0) as u16,
+            ),
+        ]
+        .spacing(theme::SPACE_TIGHT * scale)
+        .width(Length::Fill),
+    );
+    col = col.push(iced::widget::Space::new().height(Length::Fixed(10.0 * scale)));
+
+    let mut comp_rows = column![].spacing(3.4 * scale);
+    let mut comp_exp = column![].spacing(theme::KNOB_LABEL_GAP * scale);
+    let blank = || -> Element<'static, Message> {
+        container(iced::widget::Space::new())
+            .width(Length::Fill)
+            .into()
+    };
+    let heading = |label: &'static str, colour: Color| -> Element<'static, Message> {
+        container(
+            text(label)
+                .size(theme::TEXT_XS * scale)
+                .color(colour)
+                .width(Length::Fill)
+                .center(),
+        )
+        .width(Length::Fill)
+        .into()
+    };
+    comp_exp = comp_exp.push(
+        row![
+            blank(),
+            heading("compressor", theme::MRED),
+            heading("expander", theme::MGREEN),
+        ]
+        .spacing(theme::SPACE_TIGHT * scale)
+        .width(Length::Fill),
+    );
+    let row_label = |top: &'static str, bottom: &'static str| -> Element<'static, Message> {
+        container(
+            column![
+                text(top).size(theme::TEXT_XS * scale).color(theme::TEXT_SEC),
+                text(bottom).size(theme::TEXT_XS * scale).color(theme::TEXT_SEC),
+            ]
+            .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .align_x(iced::Alignment::Start)
+        .into()
+    };
+    comp_rows = comp_rows.push(
+        row![
+            row_label("threshold", "dB"),
+            cell(
+                None,
+                0.0,
+                false,
+                theme::MRED,
+                d.comp_threshold_db,
+                (-60.0, 0.0),
+                format!("{:.1}", d.comp_threshold_db),
+                -30.0,
+                |d, v| d.comp_threshold_db = v,
+            ),
+            cell(
+                None,
+                0.0,
+                false,
+                theme::MGREEN,
+                d.exp_threshold_db,
+                (-99.0, -30.0),
+                format!("{:.1}", d.exp_threshold_db),
+                -60.0,
+                |d, v| d.exp_threshold_db = v,
+            ),
+        ]
+        .spacing(theme::SPACE_TIGHT * scale)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill),
+    );
+    comp_rows = comp_rows.push(
+        row![
+            container(
+                text("ratio 1:")
+                    .size(theme::TEXT_XS * scale)
+                    .color(theme::TEXT_SEC),
+            )
+            .width(Length::Fill)
+            .align_x(iced::Alignment::Start),
+            cell(
+                None,
+                0.0,
+                false,
+                theme::MRED,
+                d.comp_ratio,
+                (1.0, 10.0),
+                format!("{:.1}", d.comp_ratio),
+                1.0,
+                |d, v| d.comp_ratio = v,
+            ),
+            cell(
+                None,
+                0.0,
+                false,
+                theme::MGREEN,
+                d.exp_ratio,
+                (1.0, 10.0),
+                format!("{:.1}", d.exp_ratio),
+                1.0,
+                |d, v| d.exp_ratio = v,
+            ),
+        ]
+        .spacing(theme::SPACE_TIGHT * scale)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill),
+    );
+    comp_exp = comp_exp.push(comp_rows);
+    col = col.push(comp_exp);
+    col = col.push(iced::widget::Space::new().height(Length::Fixed(3.0 * scale)));
+
+    let mut auto = column![].spacing(theme::KNOB_LABEL_GAP * scale);
+    auto = auto.push(
+        row![
+            toggle(d.auto_level, Message::DynamicsChanged(
+                cid,
+                Dynamics { auto_level: !d.auto_level, ..d }
+            )),
+            text("auto level").size(theme::TEXT_XS * scale).color(theme::TEXT_SEC),
+            iced::widget::Space::new().width(Length::Fill),
+        ]
+        .spacing(theme::SPACE_SM * scale)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill),
+    );
+    auto = auto.push(
+        row![
+            cell(
+                Some("max gain"),
+                0.0,
+                true,
+                theme::TEXT_PRIMARY,
+                d.auto_max_gain_db,
+                (0.0, 18.0),
+                format!("{:.1}", d.auto_max_gain_db),
+                6.0,
+                |d, v| d.auto_max_gain_db = v,
+            ),
+            cell(
+                Some("headroom"),
+                0.0,
+                true,
+                theme::TEXT_PRIMARY,
+                d.auto_headroom_db,
+                (3.0, 12.0),
+                format!("{:.1}", d.auto_headroom_db),
+                6.0,
+                |d, v| d.auto_headroom_db = v,
+            ),
+            cell(
+                Some("rise time"),
+                0.0,
+                true,
+                theme::TEXT_PRIMARY,
+                d.auto_rise_s,
+                (0.1, 9.9),
+                format!("{:.1}", d.auto_rise_s),
+                5.0,
+                |d, v| d.auto_rise_s = v,
+            ),
+        ]
+        .spacing(theme::SPACE_TIGHT * scale)
+        .width(Length::Fill),
+    );
+    col = col.push(auto);
+
+    // Keep the scrollable wrapper as a safety net; at normal size the
+    // content fits the panel and no scrollbar is shown.
+    flyout_card(
+        scrollable(col)
+            .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+            .style(theme::scrollable)
+            .width(Length::Fill)
+            .height(Length::Fill),
+        width,
+        scale,
+    )
 }
 
 /// The Trim flyout's content: a single knob, -65..+6 dB on the fader's
@@ -4656,6 +8673,7 @@ fn trim_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Eleme
             range: (-65.0, 6.0),
             label: format!("{trim:+.1}"),
             arc_from_center: false,
+            level_arc_color: Some(theme::TEXT_PRIMARY),
             interactive: true,
             log_scale: false,
             modifiers,
@@ -4682,12 +8700,15 @@ fn trim_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Eleme
 /// show them all. The frequency knobs are log-scaled, matching the plot's
 /// axis.
 fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element<'_, Message> {
-    let ChannelId::Input(idx) = cid else {
+    let eq = match cid {
+        ChannelId::Input(idx) => state.device.inputs().get(idx).and_then(|c| c.eq),
+        ChannelId::Output(idx) => state.device.outputs().get(idx).and_then(|c| c.eq),
+        ChannelId::Playback(_) => None,
+    };
+    let Some(eq) = eq else {
         return container(iced::widget::Space::new()).into();
     };
-    let Some(eq) = state.device.inputs()[idx].eq else {
-        return container(iced::widget::Space::new()).into();
-    };
+    let low_cut_supported = state.device.capabilities().low_cut;
     let modifiers = state.modifiers;
     let label_w = 42.0 * scale;
     let gap = theme::SPACE_TIGHT;
@@ -4703,7 +8724,7 @@ fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element
             button(text("EQ").size(theme::TEXT_XS * scale))
                 .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
                 .style(theme::toggle_button(eq.enabled, theme::ACCENT))
-                .on_press(Message::EqEnabled(idx, !eq.enabled)),
+                .on_press(Message::EqEnabled(cid, !eq.enabled)),
             text(if eq.enabled { "enabled" } else { "bypassed" })
                 .size(theme::TEXT_XS * scale)
                 .color(theme::TEXT_SEC),
@@ -4719,11 +8740,11 @@ fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element
         modifiers,
         EqPlotActions {
             on_band: Box::new(move |band, freq, gain| {
-                Message::EqBandPoint(idx, band, freq, gain)
+                Message::EqBandPoint(cid, band, freq, gain)
             }),
-            on_band_reset: Box::new(move |band| Message::EqBandReset(idx, band)),
-            on_band_q: Box::new(move |band, q| Message::EqBandQ(idx, band, q)),
-            on_low_cut: Box::new(move |freq| Message::EqLowCutFreq(idx, freq)),
+            on_band_reset: Box::new(move |band| Message::EqBandReset(cid, band)),
+            on_band_q: Box::new(move |band, q| Message::EqBandQ(cid, band, q)),
+            on_low_cut: Box::new(move |freq| Message::EqLowCutFreq(cid, freq)),
         },
     ));
 
@@ -4741,15 +8762,34 @@ fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element
         .align_y(iced::Alignment::Center);
     for band in 0..3 {
         let b = eq.bands[band];
-        let (short, full, next_type) = match b.band_type {
-            EqBandType::Off => ("Off", "Off (click for Bell)", EqBandType::Bell),
-            EqBandType::Bell => ("Bell", "Bell (click for Low Shelf)", EqBandType::LowShelf),
-            EqBandType::LowShelf => (
+        // Band 2 is fixed to peak (manual §25.3.2); bands 1 and 3 can be
+        // shelves, and band 3 also runs as Hi Cut (`NN48` = 2).
+        let (short, full, next_type) = match (band, b.band_type) {
+            (_, EqBandType::Off) => ("Off", "Off (click for Bell)", EqBandType::Bell),
+            (1, EqBandType::Bell) => ("Bell", "Bell (click for Off)", EqBandType::Off),
+            (_, EqBandType::Bell) => (
+                "Bell",
+                "Bell (click for Low Shelf)",
+                EqBandType::LowShelf,
+            ),
+            (_, EqBandType::LowShelf) => (
                 "Low",
                 "Low Shelf (click for High Shelf)",
                 EqBandType::HighShelf,
             ),
-            EqBandType::HighShelf => ("High", "High Shelf (click for Off)", EqBandType::Off),
+            (2, EqBandType::HighShelf) => (
+                "High",
+                "High Shelf (click for Hi Cut)",
+                EqBandType::LowPass,
+            ),
+            (_, EqBandType::HighShelf) => (
+                "High",
+                "High Shelf (click for Off)",
+                EqBandType::Off,
+            ),
+            (_, EqBandType::LowPass) => {
+                ("Hi Cut", "Hi Cut, low pass (click for Off)", EqBandType::Off)
+            }
         };
         let number_color = if b.band_type == EqBandType::Off {
             theme::EQ_BAND[band]
@@ -4774,7 +8814,7 @@ fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element
                     b.band_type != EqBandType::Off,
                     theme::EQ_BAND[band],
                 ))
-                .on_press(Message::EqBandType(idx, band, next_type)),
+                .on_press(Message::EqBandType(cid, band, next_type)),
                 full,
                 scale,
             ))
@@ -4793,17 +8833,18 @@ fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element
             container(hint(
                 knob(Knob {
                     value: b.gain_db,
-                    range: (-24.0, 24.0),
+                    range: (-20.0, 20.0),
                     label: format!("{:+.1}", b.gain_db),
                     arc_from_center: true,
+                    level_arc_color: Some(theme::EQ_BAND[band]),
                     interactive: true,
                     log_scale: false,
                     modifiers,
                     scale: eq_scale,
                     on_change: Box::new(move |v| {
-                        Message::EqBandGain(idx, band, v.clamp(-24.0, 24.0))
+                        Message::EqBandGain(cid, band, v.clamp(-20.0, 20.0))
                     }),
-                    on_reset: Box::new(move || Message::EqBandGain(idx, band, 0.0)),
+                    on_reset: Box::new(move || Message::EqBandGain(cid, band, 0.0)),
                 }),
                 "Band gain",
                 scale,
@@ -4824,16 +8865,17 @@ fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element
                 knob(Knob {
                     value: b.freq_hz as f32,
                     range: (20.0, 20_000.0),
-                    label: format!("{}Hz", b.freq_hz),
+                    label: freq_text(b.freq_hz),
                     arc_from_center: false,
+                    level_arc_color: Some(theme::TEXT_PRIMARY),
                     interactive: true,
                     log_scale: true,
                     modifiers,
                     scale: eq_scale,
                     on_change: Box::new(move |v| {
-                        Message::EqBandFreq(idx, band, v.round().clamp(20.0, 20_000.0) as u16)
+                        Message::EqBandFreq(cid, band, v.round().clamp(20.0, 20_000.0) as u16)
                     }),
-                    on_reset: Box::new(move || Message::EqBandFreq(idx, band, 1000)),
+                    on_reset: Box::new(move || Message::EqBandFreq(cid, band, 1000)),
                 }),
                 "Band frequency",
                 scale,
@@ -4853,17 +8895,18 @@ fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element
             container(hint(
                 knob(Knob {
                     value: b.q,
-                    range: (0.05, 10.0),
+                    range: (0.7, 5.0),
                     label: format!("{:.2}", b.q),
                     arc_from_center: false,
+                    level_arc_color: Some(theme::TEXT_PRIMARY),
                     interactive: true,
                     log_scale: false,
                     modifiers,
                     scale: eq_scale,
                     on_change: Box::new(move |v| {
-                        Message::EqBandQ(idx, band, v.clamp(0.05, 10.0))
+                        Message::EqBandQ(cid, band, v.clamp(0.7, 5.0))
                     }),
-                    on_reset: Box::new(move || Message::EqBandQ(idx, band, 0.7)),
+                    on_reset: Box::new(move || Message::EqBandQ(cid, band, 0.7)),
                 }),
                 "Band Q",
                 scale,
@@ -4874,43 +8917,62 @@ fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element
     }
     col = col.push(q_row);
 
+    let lc_label = if width / scale >= 230.0 {
+        "Low Cut"
+    } else {
+        "LC"
+    };
+    let lc_button: Option<Element<'_, Message>> = if low_cut_supported {
+        Some(
+            container(hint(
+                button(text(lc_label).size(theme::TEXT_XS * scale))
+                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_TIGHT * scale])
+                    .width(Length::Fill)
+                    .style(theme::toggle_button(eq.low_cut_enabled, theme::ACCENT))
+                    .on_press(Message::EqLowCutEnabled(cid, !eq.low_cut_enabled)),
+                "Low cut on/off (independent of the main EQ bypass)",
+                scale,
+            ))
+            .width(Length::Fixed(58.0 * scale))
+            .into(),
+        )
+    } else {
+        None
+    };
     let mut slope_row = row![].spacing(gap).width(Length::Fill);
     for slope in [6u8, 12, 18, 24] {
         slope_row = slope_row.push(
-            button(text(format!("{slope}")).size(theme::TEXT_XS * scale))
-                .padding([theme::SPACE_TIGHT * scale, theme::SPACE_TIGHT * scale])
-                .width(Length::Fill)
-                .style(theme::toggle_button(
-                    eq.low_cut_slope_db_oct == slope,
-                    theme::ACCENT,
-                ))
-                .on_press(Message::EqLowCutSlope(idx, slope)),
+            container(hint(
+                button(text(format!("{slope}")).size(theme::TEXT_XS * scale))
+                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_TIGHT * scale])
+                    .width(Length::Fill)
+                    .style(theme::toggle_button(
+                        eq.low_cut_slope_db_oct == slope,
+                        theme::ACCENT,
+                    ))
+                    .on_press(Message::EqLowCutSlope(cid, slope)),
+                "Low-cut slope (dB/oct)",
+                scale,
+            ))
+            .width(Length::Fill),
         );
     }
-    let slope_col = column![
-        slope_row,
-        text("dB/oct")
-            .size(theme::TEXT_MICRO * scale)
-            .color(theme::TEXT_SEC),
-    ]
-    .spacing(theme::SPACE_TIGHT)
-    .width(Length::Fill)
-    .align_x(iced::Alignment::Center);
 
     let freq_col = container(hint(
         knob(Knob {
             value: eq.low_cut_freq_hz as f32,
-            range: (20.0, 20_000.0),
-            label: format!("{}Hz", eq.low_cut_freq_hz),
+            range: (20.0, 500.0),
+            label: freq_text(eq.low_cut_freq_hz),
             arc_from_center: false,
+            level_arc_color: Some(theme::TEXT_PRIMARY),
             interactive: true,
             log_scale: true,
             modifiers,
             scale: eq_scale,
             on_change: Box::new(move |v| {
-                Message::EqLowCutFreq(idx, v.round().clamp(20.0, 20_000.0) as u16)
+                Message::EqLowCutFreq(cid, v.round().clamp(20.0, 500.0) as u16)
             }),
-            on_reset: Box::new(move || Message::EqLowCutFreq(idx, 20)),
+            on_reset: Box::new(move || Message::EqLowCutFreq(cid, 20)),
         }),
         "Low-cut frequency",
         scale,
@@ -4918,20 +8980,24 @@ fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element
     .width(Length::Fill)
     .center_x(Length::Fill);
 
+    let mut low_cut_row = row![].spacing(gap).align_y(iced::Alignment::Center);
+    if let Some(lc) = lc_button {
+        low_cut_row = low_cut_row.push(lc);
+    }
     col = col.push(
-        row![label("low cut"), slope_col, freq_col]
-            .spacing(gap)
-            .align_y(iced::Alignment::Center),
+        low_cut_row
+            .push(freq_col)
+            .push(slope_row),
     );
 
     container(
         scrollable(col)
-            .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+            .direction(scrollable::Direction::Vertical(theme::hidden_scrollbar()))
             .style(theme::scrollable)
             .width(Length::Fill)
             .height(Length::Fill),
     )
-    .padding(theme::SPACE_MD * scale)
+    .padding(theme::FLYOUT_PAD * scale)
     .width(Length::Fixed(width))
     .height(Length::Fill)
     .style(theme::panel)
@@ -4960,19 +9026,28 @@ fn eq_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> Element
 fn with_flyout<'a>(
     state: &'a TuxMix,
     row_element: Element<'a, Message>,
-    open_x: Option<f32>,
+    route: Option<(ChannelId, f32)>,
 ) -> Element<'a, Message> {
-    let Some(x) = open_x else {
+    let now = Instant::now();
+    let Some((cid, x)) = route else {
         return row_element;
     };
-    if !state
+    let open = state
         .flyout_open
-        .iter()
-        .any(|(_, k)| *k == strip::FlyoutKind::Route)
-    {
+        .contains(&(cid, strip::FlyoutKind::Route));
+    let Some(width) = flyout_slot(
+        state,
+        cid,
+        strip::FlyoutKind::Route,
+        strip::FLYOUT_W,
+        now,
+    ) else {
+        return row_element;
+    };
+    if !open && width <= 0.0 {
         return row_element;
     }
-    let content = route_popover(state, strip::FLYOUT_W, state.ui_scale);
+    let content = route_popover(state, width, state.ui_scale);
     // `opaque` captures clicks across its *own* widget's bounds — those
     // have to be just the small popover itself (its natural, tightly-fit
     // size), not the Length::Fill positioning container around it. Get
@@ -5007,7 +9082,1133 @@ fn with_flyout<'a>(
     .into()
 }
 
+// ── FX column (Reverb / Echo) ─────────────────────────────────────
+//
+// TotalMix's own place for the FX bus: a column between the mixer and the
+// control strip, Reverb above Echo. Every height below is measured from the
+// RME panel (`docs/work/UCX-FX-PANEL-METRICS.md`) and scaled by 1.125, the
+// ratio between TuxMix's 90 px strip and the 80 px strip in the same
+// screenshot, so a 160 px column becomes 180 px.
+
+/// Content width: 160 px at RME scale.
+const FX_W: f32 = 180.0;
+/// Effect name and its on switch.
+const FX_HEADER_H: f32 = 36.0;
+/// `type` caption and the algorithm pick list.
+const FX_TYPE_H: f32 = 31.5;
+/// Reverb controls: three rows of two knob columns plus the volume fader,
+/// which spans the first two rows.
+const FX_REV_CONTROLS_H: f32 = 247.5;
+/// The Reverb panel's tail. This is the type-specific parameter band:
+/// `Envelope` puts attack, hold and release here, `Gated` hold and release,
+/// the Space types reverb time and high damp. It stays reserved and empty
+/// until those registers are known (`docs/work/UCX-OPEN-ITEMS.md`).
+const FX_REV_TAIL_H: f32 = 98.0;
+/// Echo controls: four rows plus the high-cut picker.
+const FX_ECHO_CONTROLS_H: f32 = 343.0;
+/// Row pitch: 70 px at RME scale. Each row owns a whole pitch, so the
+/// rhythm holds whatever the label's font metrics turn out to be.
+const FX_ROW_H: f32 = 78.75;
+/// FX knobs use the house knob size — the same 42 px face as a channel's
+/// balance knob. They are only scaled down where a row needs more of them
+/// than the width holds.
+const FX_KNOB: f32 = 1.0;
+/// Knob-area width and fader-column width inside the content box. The
+/// measured column centres land at 34, 94 and 152 px.
+const FX_KNOBS_W: f32 = 120.0;
+const FX_FADER_W: f32 = 56.0;
+
+fn fx_column(state: &TuxMix) -> Element<'_, Message> {
+    let scale = state.ui_scale;
+    let body = column![reverb_panel(state, scale), echo_panel(state, scale)]
+        .spacing(theme::SPACE_SM * scale);
+    // The two panels together are 840 px tall, short enough for the default
+    // window; the scrollable is the safety net for a squeezed one.
+    container(
+        scrollable(body)
+            .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
+            .style(theme::scrollable)
+            .width(Length::Fixed(FX_W * scale))
+            .height(Length::Fill),
+    )
+    .width(Length::Fixed(FX_W * scale))
+    .height(Length::Fill)
+    .padding(iced::Padding {
+        top: theme::SPACE_MD * scale,
+        ..iced::Padding::ZERO
+    })
+    .into()
+}
+
+/// One FX panel's title bar: the on switch at the left, then the effect
+/// name — lowercase, like every ordinary noun in a panel.
+fn fx_header_row(
+    name: &'static str,
+    on: bool,
+    toggle: Message,
+    scale: f32,
+) -> Element<'static, Message> {
+    container(
+        row![
+            iced::widget::button(text(if on { "ON" } else { "OFF" }).size(theme::TEXT_XS * scale))
+                .padding([0.0, theme::SPACE_MD * scale])
+                .style(theme::toggle_button(on, theme::ACCENT))
+                .on_press(toggle),
+            text(name).size(theme::TEXT_SM * scale).color(theme::TEXT_SEC),
+            iced::widget::Space::new().width(Length::Fill),
+        ]
+        .spacing(theme::SPACE_MD * scale)
+        .align_y(iced::Alignment::Center),
+    )
+    .height(Length::Fixed(FX_HEADER_H * scale))
+    .align_y(iced::Alignment::Center)
+    .padding([0.0, theme::SPACE_SM * scale])
+    .width(Length::Fill)
+    .style(theme::fx_header)
+    .into()
+}
+
+/// The `type` row: a caption at the left edge, then the algorithm pick list
+/// filling the rest of the row.
+fn fx_type_row(picker: Element<'static, Message>, scale: f32) -> Element<'static, Message> {
+    container(
+        row![
+            text("type")
+                .size(theme::TEXT_XS * scale)
+                .color(theme::TEXT_SEC),
+            picker,
+        ]
+        .spacing(theme::SPACE_SM * scale)
+        .align_y(iced::Alignment::Center)
+        .width(Length::Fill),
+    )
+    .height(Length::Fixed(FX_TYPE_H * scale))
+    .align_y(iced::Alignment::Center)
+    .padding([0.0, theme::SPACE_SM * scale])
+    .width(Length::Fill)
+    .into()
+}
+
+/// One knob with its label underneath, the label centred on the knob. The
+/// two function pointers build the bus message, so Reverb and Echo share
+/// this instead of keeping a copy each.
+#[allow(clippy::too_many_arguments)]
+fn fx_knob_cell<'a, T: Copy + 'static>(
+    label: &'static str,
+    value: f32,
+    range: (f32, f32),
+    value_text: String,
+    colour: Color,
+    log: bool,
+    reset: f32,
+    base: T,
+    commit: fn(T) -> Message,
+    mutate: fn(&mut T, f32),
+    modifiers: iced::keyboard::Modifiers,
+    scale: f32,
+) -> Element<'a, Message> {
+    let control: Element<'a, Message> = knob(Knob {
+        value,
+        range,
+        label: value_text,
+        arc_from_center: range.0 < 0.0,
+        level_arc_color: Some(colour),
+        interactive: true,
+        log_scale: log,
+        modifiers,
+        scale: FX_KNOB * scale,
+        on_change: Box::new(move |v| {
+            let mut next = base;
+            mutate(&mut next, v);
+            commit(next)
+        }),
+        on_reset: Box::new(move || {
+            let mut next = base;
+            mutate(&mut next, reset);
+            commit(next)
+        }),
+    })
+    .into();
+    column![
+        container(control)
+            .width(Length::Fill)
+            .center_x(Length::Fill),
+        text(label)
+            .size(theme::TEXT_XS * scale)
+            .color(theme::TEXT_SEC)
+            .width(Length::Fill)
+            .center(),
+    ]
+    .spacing(theme::KNOB_LABEL_GAP * scale)
+    .align_x(iced::Alignment::Center)
+    .width(Length::Fill)
+    .into()
+}
+
+/// The FX volume fader: TotalMix draws a short vertical fader here rather
+/// than a knob, with its value below it and `volume` under that.
+fn fx_fader(
+    bus: FxBus,
+    volume_db: f32,
+    reset_db: f32,
+    colour: Color,
+    height: f32,
+    modifiers: iced::keyboard::Modifiers,
+    scale: f32,
+) -> Element<'static, Message> {
+    fader::fader(fader::Fader {
+        value: db_to_vol(volume_db),
+        // The bus volume runs -30..+6 dB; the widget speaks linear position.
+        range: (db_to_vol(-30.0), db_to_vol(6.0)),
+        default_value: db_to_vol(reset_db),
+        meter: fader::MeterFrame::still(0.0),
+        meter_available: false,
+        meter2: None,
+        meter2_available: false,
+        height,
+        show_meter: false,
+        fill: theme::FADER,
+        reserved_right: 0.0,
+        modifiers,
+        scale,
+        show_track: true,
+        label: None,
+        label_color: colour,
+        compact_width: 18.0,
+        on_press: Box::new(move |v, _| Message::FxVolume(bus, v)),
+        on_drag: Box::new(move |v| Message::FxVolume(bus, v)),
+        on_release: Box::new(move || Message::FxVolumeReleased(bus)),
+        on_reset: Box::new(move || Message::FxVolume(bus, db_to_vol(reset_db))),
+    })
+    .into()
+}
+
+/// A fader column: the fader, its value, then the `volume` label. Heights
+/// place the value and label at the measured line centres (126.6 and 149 px
+/// from the top of the controls band).
+fn fx_fader_column(
+    bus: FxBus,
+    volume_db: f32,
+    reset_db: f32,
+    colour: Color,
+    scale: f32,
+    modifiers: iced::keyboard::Modifiers,
+) -> Element<'static, Message> {
+    column![
+        fx_fader(
+            bus,
+            volume_db,
+            reset_db,
+            colour,
+            112.0 * scale,
+            modifiers,
+            scale
+        ),
+        iced::widget::Space::new().height(Length::Fixed(8.0 * scale)),
+        text(format!("{volume_db:+.1}"))
+            .size(theme::TEXT_XS * scale)
+            .color(theme::TEXT_SEC)
+            .width(Length::Fill)
+            .center(),
+        iced::widget::Space::new().height(Length::Fixed(11.0 * scale)),
+        text("volume")
+            .size(theme::TEXT_XS * scale)
+            .color(theme::TEXT_SEC)
+            .width(Length::Fill)
+            .center(),
+    ]
+    .spacing(0.0)
+    .align_x(iced::Alignment::Center)
+    .width(Length::Fill)
+    .into()
+}
+
+/// One fixed-pitch row of the controls band.
+fn fx_row<'a>(
+    left: Element<'a, Message>,
+    right: Element<'a, Message>,
+    scale: f32,
+) -> Element<'a, Message> {
+    container(
+        row![left, right]
+            .width(Length::Fill)
+            .height(Length::Fixed(FX_ROW_H * scale)),
+    )
+    .height(Length::Fixed(FX_ROW_H * scale))
+    .align_y(iced::Alignment::Start)
+    .width(Length::Fill)
+    .into()
+}
+
+/// The knob block and the fader column of one panel's controls band.
+///
+/// `knobs_w` is the width of the knob columns before the fader: 120 px for
+/// Reverb (two columns, fader at the right edge) and 60 px for Echo (one
+/// column, fader in the second column, the third left empty where the FX
+/// in/out meters would be).
+fn fx_controls(
+    rows: Element<'static, Message>,
+    fader_col: Element<'static, Message>,
+    knobs_w: f32,
+    height: f32,
+    top_pad: f32,
+    scale: f32,
+) -> Element<'static, Message> {
+    let filler = FX_W - theme::SPACE_SM - knobs_w - FX_FADER_W;
+    let mut band = row![
+        container(rows).width(Length::Fixed(knobs_w * scale)),
+        container(fader_col).width(Length::Fixed(FX_FADER_W * scale)),
+    ];
+    if filler > 0.0 {
+        band = band.push(iced::widget::Space::new().width(Length::Fixed(filler * scale)));
+    }
+    container(
+        band
+        // Inset on the left only: the columns add up to the panel width.
+        .padding(iced::Padding {
+            top: top_pad * scale,
+            left: theme::SPACE_SM * scale,
+            right: 0.0,
+            bottom: 0.0,
+        }),
+    )
+    .height(Length::Fixed(height * scale))
+    .align_y(iced::Alignment::Start)
+    .width(Length::Fill)
+    .style(theme::fx_controls)
+    .into()
+}
+
+/// A fixed-pitch row holding a single knob, for the panels whose fader sits
+/// in the next column over.
+fn fx_row_one<'a>(
+    cell: Element<'a, Message>,
+    scale: f32,
+) -> Element<'a, Message> {
+    container(
+        container(cell)
+            .width(Length::Fill)
+            .height(Length::Fixed(FX_ROW_H * scale)),
+    )
+    .height(Length::Fixed(FX_ROW_H * scale))
+    .align_y(iced::Alignment::Start)
+    .width(Length::Fill)
+    .into()
+}
+
+/// The selected Reverb type's own parameters, side by side in the tail
+/// band under the knob rows.
+fn fx_param_row<'a>(cells: Vec<Element<'a, Message>>, scale: f32) -> Element<'a, Message> {
+    let mut r = row![].spacing(0.0).width(Length::Fill);
+    for cell in cells {
+        r = r.push(cell);
+    }
+    container(r)
+        .height(Length::Fixed(FX_REV_TAIL_H * scale))
+        .align_y(iced::Alignment::Start)
+        .padding([theme::SPACE_SM * scale, theme::SPACE_SM * scale])
+        .width(Length::Fill)
+        .into()
+}
+
+fn reverb_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
+    let r = state.device.settings().reverb.unwrap_or_default();
+    let modifiers = state.modifiers;
+    let colour = theme::KNOB_BLUE;
+
+    let header = fx_header_row(
+        "reverb",
+        r.on,
+        Message::ReverbChanged(Reverb { on: !r.on, ..r }),
+        scale,
+    );
+    let type_row = fx_type_row(
+        pick_list(
+            REVERB_TYPES.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            Some(reverb_type_name(r.kind).to_string()),
+            move |name| {
+                let kind = REVERB_TYPES
+                    .iter()
+                    .position(|n| *n == name)
+                    .unwrap_or(0) as u8;
+                Message::ReverbChanged(Reverb { kind, ..r })
+            },
+        )
+        .style(theme::pick_list)
+        .menu_style(theme::menu)
+        .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+        .text_size(theme::TEXT_XS * scale)
+        .width(Length::Fill)
+        .into(),
+        scale,
+    );
+
+    let row1 = fx_row(
+        fx_knob_cell(
+            "pre delay",
+            r.pre_delay_ms as f32,
+            (0.0, 999.0),
+            format!("{}", r.pre_delay_ms),
+            colour,
+            false,
+            22.0,
+            r,
+            Message::ReverbChanged,
+            |r, v| r.pre_delay_ms = v.round() as u16,
+            modifiers,
+            scale,
+        ),
+        fx_knob_cell(
+            "room scale",
+            r.room_scale,
+            (0.5, 3.0),
+            format!("{:.2}", r.room_scale),
+            colour,
+            false,
+            1.5,
+            r,
+            Message::ReverbChanged,
+            |r, v| r.room_scale = v,
+            modifiers,
+            scale,
+        ),
+        scale,
+    );
+    let row2 = fx_row(
+        fx_knob_cell(
+            "low cut",
+            r.low_cut_hz as f32,
+            (20.0, 500.0),
+            format!("{}", r.low_cut_hz),
+            colour,
+            true,
+            49.0,
+            r,
+            Message::ReverbChanged,
+            |r, v| r.low_cut_hz = v.round() as u16,
+            modifiers,
+            scale,
+        ),
+        fx_knob_cell(
+            "high cut",
+            r.high_cut_hz as f32,
+            (5_000.0, 20_000.0),
+            format!("{}", r.high_cut_hz),
+            colour,
+            true,
+            11_900.0,
+            r,
+            Message::ReverbChanged,
+            |r, v| r.high_cut_hz = v.round() as u16,
+            modifiers,
+            scale,
+        ),
+        scale,
+    );
+    let row3 = fx_row(
+        fx_knob_cell(
+            "smooth",
+            r.smoothness as f32,
+            (0.0, 100.0),
+            format!("{}", r.smoothness),
+            colour,
+            false,
+            93.0,
+            r,
+            Message::ReverbChanged,
+            |r, v| r.smoothness = v.round() as u8,
+            modifiers,
+            scale,
+        ),
+        fx_knob_cell(
+            "width",
+            r.width,
+            (0.0, 100.0),
+            format!("{:.0}", r.width),
+            colour,
+            false,
+            52.0,
+            r,
+            Message::ReverbChanged,
+            |r, v| r.width = v,
+            modifiers,
+            scale,
+        ),
+        scale,
+    );
+
+    let rows = column![row1, row2, row3].spacing(0.0).width(Length::Fill);
+    let controls = fx_controls(
+        rows.into(),
+        fx_fader_column(
+            FxBus::Reverb,
+            r.volume_db,
+            -15.8,
+            colour,
+            scale,
+            modifiers,
+        ),
+        FX_KNOBS_W,
+        FX_REV_CONTROLS_H,
+        3.5,
+        scale,
+    );
+
+    // The band under the knob rows carries the selected type's own
+    // parameters: Attack/Hold/Release for Envelope (`0x3c05..0x3c07`),
+    // Hold/Release for Gated, Reverb Time/High Damp for Space
+    // (`0x3c09`, `0x3c0a`).
+    let tail: Element<'static, Message> = match r.kind {
+        12 => fx_param_row(
+            vec![
+                fx_knob_cell(
+                    "attack",
+                    r.attack_ms as f32,
+                    (5.0, 400.0),
+                    format!("{}", r.attack_ms),
+                    colour,
+                    false,
+                    20.0,
+                    r,
+                    Message::ReverbChanged,
+                    |r, v| r.attack_ms = v.round().clamp(5.0, 400.0) as u16,
+                    modifiers,
+                    scale,
+                ),
+                fx_knob_cell(
+                    "hold",
+                    r.hold_ms as f32,
+                    (5.0, 400.0),
+                    format!("{}", r.hold_ms),
+                    colour,
+                    false,
+                    40.0,
+                    r,
+                    Message::ReverbChanged,
+                    |r, v| r.hold_ms = v.round().clamp(5.0, 400.0) as u16,
+                    modifiers,
+                    scale,
+                ),
+                fx_knob_cell(
+                    "release",
+                    r.release_ms as f32,
+                    (5.0, 500.0),
+                    format!("{}", r.release_ms),
+                    colour,
+                    false,
+                    100.0,
+                    r,
+                    Message::ReverbChanged,
+                    |r, v| r.release_ms = v.round().clamp(5.0, 500.0) as u16,
+                    modifiers,
+                    scale,
+                ),
+            ],
+            scale,
+        ),
+        13 => fx_param_row(
+            vec![
+                fx_knob_cell(
+                    "hold",
+                    r.hold_ms as f32,
+                    (5.0, 400.0),
+                    format!("{}", r.hold_ms),
+                    colour,
+                    false,
+                    40.0,
+                    r,
+                    Message::ReverbChanged,
+                    |r, v| r.hold_ms = v.round().clamp(5.0, 400.0) as u16,
+                    modifiers,
+                    scale,
+                ),
+                fx_knob_cell(
+                    "release",
+                    r.release_ms as f32,
+                    (5.0, 500.0),
+                    format!("{}", r.release_ms),
+                    colour,
+                    false,
+                    100.0,
+                    r,
+                    Message::ReverbChanged,
+                    |r, v| r.release_ms = v.round().clamp(5.0, 500.0) as u16,
+                    modifiers,
+                    scale,
+                ),
+            ],
+            scale,
+        ),
+        14 => fx_param_row(
+            vec![
+                fx_knob_cell(
+                    "reverb time",
+                    r.reverb_time_ds as f32 / 10.0,
+                    (0.1, 9.9),
+                    format!("{:.1}", r.reverb_time_ds as f32 / 10.0),
+                    colour,
+                    false,
+                    2.0,
+                    r,
+                    Message::ReverbChanged,
+                    |r, v| r.reverb_time_ds = (v * 10.0).round().clamp(1.0, 99.0) as u16,
+                    modifiers,
+                    scale,
+                ),
+                fx_knob_cell(
+                    "high damp",
+                    r.high_damp_hz as f32,
+                    (200.0, 20_000.0),
+                    format!("{}", r.high_damp_hz),
+                    colour,
+                    true,
+                    12_000.0,
+                    r,
+                    Message::ReverbChanged,
+                    |r, v| r.high_damp_hz = v.round().clamp(200.0, 20_000.0) as u16,
+                    modifiers,
+                    scale,
+                ),
+            ],
+            scale,
+        ),
+        _ => container(iced::widget::Space::new())
+            .height(Length::Fixed(FX_REV_TAIL_H * scale))
+            .width(Length::Fill)
+            .into(),
+    };
+
+    container(column![header, type_row, controls, tail].spacing(0.0).width(Length::Fill))
+        .width(Length::Fixed(FX_W * scale))
+        .style(theme::panel)
+        .clip(true)
+        .into()
+}
+
+fn echo_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
+    let e = state.device.settings().echo.unwrap_or_default();
+    let modifiers = state.modifiers;
+    let colour = theme::KNOB_GREEN;
+
+    let header = fx_header_row(
+        "echo",
+        e.on,
+        Message::EchoChanged(Echo { on: !e.on, ..e }),
+        scale,
+    );
+    let echo_type = match e.kind {
+        0 => "Stereo Echo",
+        1 => "Stereo Cross",
+        _ => "Pong Echo",
+    };
+    let type_row = fx_type_row(
+        pick_list(
+            ECHO_TYPES.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            Some(echo_type.to_string()),
+            move |name| {
+                let kind = ECHO_TYPES
+                    .iter()
+                    .position(|n| *n == name)
+                    .unwrap_or(0) as u8;
+                Message::EchoChanged(Echo { kind, ..e })
+            },
+        )
+        .style(theme::pick_list)
+        .menu_style(theme::menu)
+        .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+        .text_size(theme::TEXT_XS * scale)
+        .width(Length::Fill)
+        .into(),
+        scale,
+    );
+
+    let row1 = fx_row_one(
+        fx_knob_cell(
+            "delay time",
+            e.delay_ms as f32,
+            (10.0, 2_000.0),
+            format!("{}", e.delay_ms),
+            colour,
+            true,
+            600.0,
+            e,
+            Message::EchoChanged,
+            |e, v| e.delay_ms = v.round() as u16,
+            modifiers,
+            scale,
+        ),
+        scale,
+    );
+    // BPM has no register of its own: TotalMix recomputes the delay time
+    // and writes only `0x3C22` (capture H41). 60 / delay_s reproduces the
+    // panel's own reading (105 BPM against 0.57 s).
+    let bpm = 60_000.0 / e.delay_ms.max(1) as f32;
+    let row2 = fx_row_one(
+        fx_knob_cell(
+            "delay bpm",
+            bpm.clamp(30.0, 300.0),
+            (30.0, 300.0),
+            format!("{:.0}", bpm.clamp(30.0, 300.0)),
+            colour,
+            false,
+            105.0,
+            e,
+            Message::EchoChanged,
+            |e, v| {
+                e.delay_ms = (60_000.0 / v.clamp(30.0, 300.0))
+                    .round()
+                    .clamp(10.0, 2_000.0) as u16
+            },
+            modifiers,
+            scale,
+        ),
+        scale,
+    );
+    let row3 = fx_row_one(
+        fx_knob_cell(
+            "feedback",
+            e.feedback as f32,
+            (0.0, 100.0),
+            format!("{}", e.feedback),
+            colour,
+            false,
+            20.0,
+            e,
+            Message::EchoChanged,
+            |e, v| e.feedback = v.round() as u8,
+            modifiers,
+            scale,
+        ),
+        scale,
+    );
+    let high_cut = container(
+        row![
+            pick_list(
+                (0u8..=20).map(|i| i.to_string()).collect::<Vec<_>>(),
+                Some(e.high_cut.to_string()),
+                move |value: String| Message::EchoChanged(Echo {
+                    high_cut: value.parse().unwrap_or(0),
+                    ..e
+                }),
+            )
+            .style(theme::pick_list)
+            .menu_style(theme::menu)
+            .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
+            .text_size(theme::TEXT_XS * scale)
+            .width(Length::Fixed(50.0 * scale)),
+            text("high cut")
+                .size(theme::TEXT_XS * scale)
+                .color(theme::TEXT_SEC),
+        ]
+        .spacing(theme::SPACE_SM * scale)
+        .align_y(iced::Alignment::Center),
+    )
+    .height(Length::Fixed(24.0 * scale))
+    .align_y(iced::Alignment::Center)
+    .padding([0.0, theme::SPACE_SM * scale])
+    .width(Length::Fill);
+    let row4 = fx_row_one(
+        fx_knob_cell(
+            "width",
+            e.width,
+            (0.0, 100.0),
+            format!("{:.0}", e.width),
+            colour,
+            false,
+            100.0,
+            e,
+            Message::EchoChanged,
+            |e, v| e.width = v,
+            modifiers,
+            scale,
+        ),
+        scale,
+    );
+
+    let rows = column![row1, row2, row3, high_cut, row4]
+        .spacing(0.0)
+        .width(Length::Fill);
+    let controls = fx_controls(
+        rows.into(),
+        fx_fader_column(FxBus::Echo, e.volume_db, -10.0, colour, scale, modifiers),
+        FX_KNOBS_W / 2.0,
+        FX_ECHO_CONTROLS_H,
+        4.0,
+        scale,
+    );
+
+    container(column![header, type_row, controls].spacing(0.0).width(Length::Fill))
+        .width(Length::Fixed(FX_W * scale))
+        .style(theme::panel)
+        .clip(true)
+        .into()
+}
+
+/// The Assign menu: a card anchored at the Control Room panel's left edge,
+/// with the destination list on the right and the selected destination's
+/// output list beside it. Opened by the `assign` button, closed by choosing
+/// an output or a click anywhere else.
+fn assign_menu_layer(state: &TuxMix) -> Element<'_, Message> {
+    let scale = state.ui_scale;
+    let gap = theme::SPACE_SM * scale;
+    let bold = iced::Font {
+        weight: iced::font::Weight::Bold,
+        ..iced::Font::DEFAULT
+    };
+    let entry = |label: String, strong: bool, message: Message| -> Element<'static, Message> {
+        iced::widget::button(
+            text(label)
+                .size(theme::TEXT_MD * scale)
+                .font(if strong { bold } else { iced::Font::DEFAULT }),
+        )
+        .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+        .style(theme::ghost_button)
+        .on_press(message)
+        .into()
+    };
+
+    let labels = state.display_pair_labels();
+    let order = state.device.output_display_order();
+    let mut cards = row![].spacing(gap).align_y(iced::Alignment::Start);
+
+    // Second level first: it sits to the left of the destination list.
+    if let AssignMenu::Outputs(dest) = state.assign_menu {
+        let current = state.assign.get(dest).copied().flatten();
+        let mut col = column![].spacing(0.0);
+        col = col.push(entry("None".to_string(), current.is_none(), Message::AssignOutput(dest, None)));
+        for (display, label) in labels.iter().enumerate() {
+            let internal = order.get(display).copied().unwrap_or(display);
+            col = col.push(entry(
+                label.clone(),
+                current == Some(internal),
+                Message::AssignOutput(dest, Some(internal)),
+            ));
+        }
+        cards = cards.push(
+            container(col)
+                .padding(theme::SPACE_SM * scale)
+                .style(theme::dialog),
+        );
+    }
+
+    // First level: the destinations, each showing what it holds.
+    let mut col = column![].spacing(0.0);
+    for (dest, name) in ASSIGN_DESTS.iter().enumerate() {
+        // Hovering opens that destination's output list, so the whole menu
+        // reads at a glance; a click fixes it open until a leaf is chosen.
+        col = col.push(
+            iced::widget::mouse_area(
+                iced::widget::button(text(*name).size(theme::TEXT_MD * scale))
+                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                    .style(theme::ghost_button)
+                    .on_press(Message::AssignDestinations(dest)),
+            )
+            .on_enter(Message::AssignDestinations(dest)),
+        );
+    }
+    cards = cards.push(
+        container(col)
+            .padding(theme::SPACE_SM * scale)
+            .style(theme::dialog),
+    );
+
+    // The cards open immediately left of the assign button and over the
+    // Control Room channels, which they obscure rather than displace.
+    opaque(
+        mouse_area(
+            container(opaque(container(cards)))
+                .align_x(iced::Alignment::End)
+                .align_y(iced::Alignment::Start)
+                .padding(iced::Padding {
+                    top: 0.0,
+                    // Inside the panel's own padding, the assign column's
+                    // left edge.
+                    right: theme::SPACE_SM * scale + CONTROL_ROOM_W * scale + gap,
+                    bottom: 0.0,
+                    left: 0.0,
+                })
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::CloseAssign),
+    )
+}
+
+/// Width of the Control Room section: its button column plus one strip per
+/// assigned monitoring output.
+fn control_room_width(state: &TuxMix, scale: f32) -> f32 {
+    let assigned = state.assign.iter().flatten().count() as f32;
+    CONTROL_ROOM_W * scale
+        + assigned * (strip::STRIP_W + theme::SPACE_MD) * scale
+        + 2.0 * theme::SPACE_SM * scale
+}
+
+/// Options > Reset Mix (manual 25.10): rewrite the captured scene, then push
+/// it in one go. Every entry writes the whole mixer, which is what makes this
+/// cheaper than clicking a matrix cell at a time.
+fn apply_reset_mix(state: &mut TuxMix, kind: ResetMix) {
+    if kind == ResetMix::ResetNames {
+        state.labels.clear();
+        state.editing = None;
+        state.notice = Some(("Channel names reset".into(), std::time::Instant::now()));
+        return;
+    }
+    let mut scene = state.device.capture_scene();
+    let main_pair = scene.settings.main_out.unwrap_or(0);
+    let b_pair = scene.settings.main_b_out;
+    let pairs = (state.device.outputs().len() / 2).max(1);
+
+    let silence = |vols: &mut Vec<f32>| vols.iter_mut().for_each(|v| *v = 0.0);
+
+    match kind {
+        ResetMix::StraightPlayback | ResetMix::StraightToMain | ResetMix::TotalReset => {
+            for (i, pb) in scene.playbacks.iter_mut().enumerate() {
+                silence(&mut pb.volumes);
+                let pair = (i / 2).min(pairs - 1);
+                if let Some(v) = pb.volumes.get_mut(pair) {
+                    *v = 1.0;
+                }
+            }
+            if kind != ResetMix::StraightPlayback {
+                for pb in scene.playbacks.iter_mut() {
+                    if let Some(v) = pb.volumes.get_mut(main_pair) {
+                        *v = 1.0;
+                    }
+                }
+            }
+            if kind == ResetMix::TotalReset {
+                clear_effects(&mut scene);
+                set_output_volumes(&mut scene, main_pair, b_pair);
+            }
+        }
+        ResetMix::ClearSubmixes => {
+            for pb in scene.playbacks.iter_mut() {
+                silence(&mut pb.volumes);
+            }
+            for inp in scene.inputs.iter_mut() {
+                silence(&mut inp.volumes);
+            }
+            scene.matrix_overrides.clear();
+        }
+        ResetMix::ClearEffects => clear_effects(&mut scene),
+        ResetMix::SetOutputVolumes => set_output_volumes(&mut scene, main_pair, b_pair),
+        ResetMix::AllMono | ResetMix::AllStereo | ResetMix::InputsMonoOutputsStereo => {
+            let (inputs_linked, outputs_linked) = match kind {
+                ResetMix::AllMono => (false, false),
+                ResetMix::AllStereo => (true, true),
+                _ => (false, true),
+            };
+            for pair in 0..(state.device.inputs().len() / 2).max(1) {
+                let _ = state.device.set_input_pair_linked(pair, inputs_linked);
+            }
+            for pair in 0..pairs {
+                let _ = state.device.set_output_linked(pair, outputs_linked);
+            }
+            state.notice = Some((
+                "Channel stereo/mono reset".into(),
+                std::time::Instant::now(),
+            ));
+            return;
+        }
+        ResetMix::ResetNames => return,
+    }
+
+    if let Err(e) = state.device.apply_scene(&scene) {
+        fail(state, "reset_mix", &e);
+        return;
+    }
+    state.notice = Some((
+        RESET_MIX
+            .iter()
+            .find(|(_, k)| *k == kind)
+            .map(|(name, _)| format!("Reset Mix: {name}"))
+            .unwrap_or_else(|| "Reset Mix".into()),
+        std::time::Instant::now(),
+    ));
+}
+
+fn clear_effects(scene: &mut tuxmix_core::Scene) {
+    for ch in scene.inputs.iter_mut() {
+        off_eq(&mut ch.eq);
+        off_dynamics(&mut ch.dynamics);
+    }
+    for ch in scene.outputs.iter_mut() {
+        off_eq(&mut ch.eq);
+        off_dynamics(&mut ch.dynamics);
+    }
+    if let Some(r) = scene.settings.reverb.as_mut() {
+        r.on = false;
+    }
+    if let Some(e) = scene.settings.echo.as_mut() {
+        e.on = false;
+    }
+    scene.settings.width = 0.0;
+}
+
+fn off_eq(eq: &mut Option<tuxmix_core::channel::InputEq>) {
+    if let Some(eq) = eq.as_mut() {
+        eq.enabled = false;
+        eq.low_cut_enabled = false;
+        for band in eq.bands.iter_mut() {
+            band.band_type = tuxmix_core::channel::EqBandType::Off;
+        }
+    }
+}
+
+fn off_dynamics(d: &mut Option<tuxmix_core::Dynamics>) {
+    if let Some(d) = d.as_mut() {
+        d.on = false;
+        d.auto_level = false;
+    }
+}
+
+fn set_output_volumes(scene: &mut tuxmix_core::Scene, main_pair: usize, b_pair: Option<usize>) {
+    for (i, out) in scene.outputs.iter_mut().enumerate() {
+        let pair = i / 2;
+        out.volume = if pair == main_pair || Some(pair) == b_pair {
+            0.316   // -10 dB
+        } else {
+            1.0
+        };
+    }
+}
+
+/// TotalMix's Control Room, beside the output strips it monitors (manual
+/// 25.4): Assign picks the Main Out, and Dim, Recall, Mono, Speaker B,
+/// External Input, Mute FX and Talkback all apply to that output.
+///
+/// `assign`, `ext. input` and `talkback` are drawn without a press handler,
+/// which iced renders dimmed: the assign register, the external-input level
+/// and the talkback source are unmeasured (`docs/work/UCX-OPEN-ITEMS.md`).
+/// The buttons below them carry TotalMix's own order and background groups.
+/// At least as wide as its own `CONTROL ROOM` header, which must not wrap.
+const CONTROL_ROOM_W: f32 = 136.0;
+
+fn control_room_panel(
+    state: &TuxMix,
+    scale: f32,
+    anim_now: std::time::Instant,
+) -> Element<'_, Message> {
+    let settings = state.device.settings();
+    // Monitoring outputs that are assigned live here rather than in the
+    // hardware-output row, renamed for their destination (manual 25.4:
+    // "the channel will be shifted from the Hardware Outputs into the
+    // Control Room section, and renamed Main").
+    let mut strips = row![].spacing(theme::SPACE_MD * scale);
+    for dest in [2usize, 3, 4, 5, 1, 0] {
+        let Some(pair) = state.assign.get(dest).copied().flatten() else {
+            continue;
+        };
+        if pair * 2 + 1 >= state.device.outputs().len() {
+            continue;
+        }
+        let cid = ChannelId::Output(pair * 2);
+        let mut params = strip_params(state, cid, state.sel_out);
+        params.name = match dest {
+            0 => "Main".to_string(),
+            1 => "Speaker B".to_string(),
+            d => ASSIGN_DESTS[d].to_string(),
+        };
+        let strip_w = strip::STRIP_W * scale;
+        let mut item: Element<'_, Message> = strip::strip(finish_params(state, params));
+        // A slideout always opens to the right of its channel. The Control
+        // Room is pinned to the window's right edge, so it shifts its own
+        // channels left by one slot to make room; its left edge may
+        // overlap the channel row, which never moves.
+        for (kind, width) in [
+            (strip::FlyoutKind::Settings, strip_w),
+            (strip::FlyoutKind::Eq, strip::EQ_FLYOUT_W * scale),
+            (strip::FlyoutKind::Dynamics, strip::DYN_FLYOUT_W * scale),
+        ] {
+            let Some(panel_w) = flyout_slot(state, cid, kind, width, anim_now) else {
+                continue;
+            };
+            let panel = match kind {
+                strip::FlyoutKind::Settings => settings_popover(state, cid, panel_w, scale),
+                strip::FlyoutKind::Eq => eq_popover(state, cid, panel_w, scale),
+                strip::FlyoutKind::Dynamics => dynamics_popover(state, cid, panel_w, scale),
+                _ => continue,
+            };
+            item = row![item, panel].spacing(0.0).into();
+            break;
+        }
+        strips = strips.push(item);
+    }
+    let cell = |label: &'static str, active: bool, msg: Option<Message>| -> Element<'static, Message> {
+        button(text(label).size(theme::TEXT_MD * scale).center())
+            .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
+            .style(theme::toggle_button(active, theme::ACCENT))
+            .on_press_maybe(msg)
+            .into()
+    };
+    // The Assign button opens the menu card beside the panel.
+    let assign = iced::widget::button(
+        row![
+            text("assign").size(theme::TEXT_XS * scale),
+            text("\u{25be}").size(theme::TEXT_XS * scale),
+        ]
+        .spacing(theme::SPACE_SM * scale),
+    )
+    .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
+    .style(theme::ghost_button)
+    // The menu writes the UC/UCX Main Out bit; a unit without that path
+    // shows the button dimmed rather than opening a menu that cannot apply.
+    .on_press_maybe(state.device.is_uc_family().then_some(Message::ToggleAssign));
+
+    let group = |cells: Vec<Element<'static, Message>>| -> Element<'static, Message> {
+        container(column(cells).spacing(theme::SPACE_SM * scale).align_x(iced::Alignment::Start))
+            .padding(theme::SPACE_SM * scale)
+            .style(theme::fx_controls)
+            .into()
+    };
+
+    let body = column![
+        group(vec![assign.into()]),
+        group(vec![
+            cell("dim", settings.dim, Some(Message::Dim(!settings.dim))),
+            cell("recall", false, Some(Message::ControlRoomRecall)),
+        ]),
+        group(vec![
+            cell("mono", settings.mono, Some(Message::ControlRoomMono(!settings.mono))),
+            cell(
+                "speaker B",
+                settings.speaker_b,
+                // Speaker B is a UC/UCX register; other units show it
+                // dimmed instead of failing on press.
+                state
+                    .device
+                    .is_uc_family()
+                    .then_some(Message::SpeakerB(!settings.speaker_b)),
+            ),
+            cell("ext. input", false, None),
+            cell(
+                "mute FX",
+                settings.mute_fx,
+                state
+                    .device
+                    .is_uc_family()
+                    .then_some(Message::ControlRoomMuteFx(!settings.mute_fx)),
+            ),
+        ]),
+        group(vec![cell("talkback", false, None)]),
+    ]
+    .spacing(theme::SPACE_MD * scale)
+    .padding(theme::SPACE_SM * scale)
+    .width(Length::Fill);
+
+    let buttons = container(column![body].width(Length::Fixed(CONTROL_ROOM_W * scale)))
+        .width(Length::Fixed(CONTROL_ROOM_W * scale))
+        .height(Length::Fixed(strip::STRIP_H * scale));
+
+    container(row![strips, buttons].spacing(theme::SPACE_MD * scale))
+        .padding(theme::SPACE_SM * scale)
+        .style(theme::panel)
+        .into()
+}
+
 fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
+    // Snapshot once for all three inline-panel width tweens.
+    let anim_now = Instant::now();
     // Grouped by pair, TotalMix-style: a linked pair (the default) shows
     // as ONE strip driving both channels; a split pair shows its two
     // channels independently — see `RmeDevice::input_pair_linked`. Pairs
@@ -5026,21 +10227,28 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
     let mut input_strips = row![].spacing(theme::SPACE_MD);
     let mut input_width = 0.0f32;
     let mut input_item_count = 0usize;
-    let mut input_open_x: Option<f32> = None;
+    let mut input_open_x: Option<(ChannelId, f32)> = None;
     let n_input_pairs = state.device.inputs().len() / 2;
     for pair in 0..n_input_pairs {
         let l = pair * 2;
         let linked = state.device.input_pair_linked(pair);
-        let pair_channels = [l, l + 1];
-        let shown: &[usize] = if linked {
-            &pair_channels[..1]
-        } else {
-            &pair_channels[..]
-        };
-        for &ch_idx in shown {
+        let full_right = rendered_strip_width(state, ChannelId::Input(l + 1));
+        let extra = stereo_extra_width(
+            state,
+            ChannelId::Input(l),
+            linked,
+            full_right,
+            anim_now,
+        );
+        let mut channels = vec![l];
+        if extra > 0.0 {
+            channels.push(l + 1);
+        }
+        for &ch_idx in &channels {
             let cid = ChannelId::Input(ch_idx);
+            let right_anim = ch_idx == l + 1 && extra < full_right - 0.5;
             let mut params = strip_params(state, cid, state.sel_out);
-            if linked {
+            if linked && ch_idx == l {
                 // Combined "AN1/2"-style label for the linked bus. EQ
                 // (idx < 4 only) still only reaches this representative
                 // (left) channel while shown combined — split the pair
@@ -5056,57 +10264,93 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
                 params.meter2 = state.input_meters.get(l + 1).map(MeterAnim::frame);
                 params.meter2_available = state.device.has_input_meter(l + 1);
             }
-            let strip_widget = strip::strip(finish_params(state, params));
-            let mut item_width = rendered_strip_width(state, cid);
+            let strip_widget: Element<'_, Message> = if right_anim {
+                container(strip::strip(finish_params(state, params)))
+                    .width(Length::Fixed(extra.max(0.0)))
+                    .clip(true)
+                    .into()
+            } else {
+                strip::strip(finish_params(state, params))
+            };
+            let mut item_width = if right_anim {
+                extra.max(0.0)
+            } else {
+                rendered_strip_width(state, cid)
+            };
             // Settings/EQ push the row instead of overlaying it (see
             // `with_flyout`'s doc comment for why) — done here, by
             // widening this loop iteration's own item, rather than in
             // `with_flyout`, since ordinary `row!` layout already pushes
             // every later sibling over for free once this one item is
             // wider.
-            if state.flyout_open.contains(&(cid, strip::FlyoutKind::Settings)) {
-                // Same width as the strip itself (see the reference
-                // design), not the Route flyout's own fixed `FLYOUT_W` —
-                // a dropdown list of bus names and a settings panel of
-                // knobs/buttons don't need to match each other's width,
-                // just their own strip's.
-                let panel_w = item_width;
+            if right_anim {
+                input_strips = input_strips.push(strip_widget);
+            } else if let Some(panel_w) = flyout_slot(
+                state,
+                cid,
+                strip::FlyoutKind::Settings,
+                item_width,
+                anim_now,
+            ) {
+                // Settings matches the strip's own width.  The width is
+                // animated, so the panel slides out and every later strip
+                // is pushed right a frame at a time.
                 input_strips = input_strips.push(
                     row![strip_widget, settings_popover(state, cid, panel_w, state.ui_scale)]
-                        .spacing(theme::SPACE_MD),
+                        .spacing(0.0),
                 );
-                item_width += panel_w + theme::SPACE_MD;
-            } else if state.flyout_open.contains(&(cid, strip::FlyoutKind::Eq)) {
-                // Unlike Settings, sized to fit the three-column band
-                // matrix rather than matching the (much narrower) strip
-                // width. `EQ_FLYOUT_W` is the width at scale 1.0, so the
-                // manual zoom scales the panel with its contents.
-                let panel_w = strip::EQ_FLYOUT_W * state.ui_scale;
+                item_width += panel_w;
+            } else if let Some(panel_w) = flyout_slot(
+                state,
+                cid,
+                strip::FlyoutKind::Eq,
+                strip::EQ_FLYOUT_W * state.ui_scale,
+                anim_now,
+            ) {
                 input_strips = input_strips.push(
-                    row![strip_widget, eq_popover(state, cid, panel_w, state.ui_scale)].spacing(theme::SPACE_MD),
+                    row![strip_widget, eq_popover(state, cid, panel_w, state.ui_scale)]
+                        .spacing(0.0),
                 );
-                item_width += panel_w + theme::SPACE_MD;
-            } else if state.flyout_open.contains(&(cid, strip::FlyoutKind::Trim)) {
-                // One knob — reuses the Route flyout's own fixed width
-                // rather than a third bespoke constant; Settings' "match
-                // the strip's own width" doesn't apply here since there's
-                // no strip-width-scaling content (no button rows) to fit.
-                let panel_w = strip::FLYOUT_W;
+                item_width += panel_w;
+            } else if let Some(panel_w) = flyout_slot(
+                state,
+                cid,
+                strip::FlyoutKind::Dynamics,
+                strip::DYN_FLYOUT_W * state.ui_scale,
+                anim_now,
+            ) {
+                input_strips = input_strips.push(
+                    row![strip_widget, dynamics_popover(state, cid, panel_w, state.ui_scale)]
+                        .spacing(0.0),
+                );
+                item_width += panel_w;
+            } else if let Some(panel_w) = flyout_slot(
+                state,
+                cid,
+                strip::FlyoutKind::Trim,
+                strip::FLYOUT_W,
+                anim_now,
+            ) {
                 input_strips = input_strips.push(
                     row![strip_widget, trim_popover(state, cid, panel_w, state.ui_scale)]
-                        .spacing(theme::SPACE_MD),
+                        .spacing(0.0),
                 );
-                item_width += panel_w + theme::SPACE_MD;
+                item_width += panel_w;
             } else {
                 input_strips = input_strips.push(strip_widget);
             }
             input_width += item_width;
             input_item_count += 1;
-            if state.flyout_open.contains(&(cid, strip::FlyoutKind::Route)) {
+            if state.flyout_open.contains(&(cid, strip::FlyoutKind::Route))
+                || route_visible(state, cid, anim_now)
+            {
                 // Gaps placed so far (`item_count - 1`, spacing is between
                 // items) plus the content accumulated up to and including this
                 // strip is exactly its right edge on screen.
-                input_open_x = Some(input_width + (input_item_count - 1) as f32 * theme::SPACE_MD);
+                input_open_x = Some((
+                    cid,
+                    input_width + (input_item_count - 1) as f32 * theme::SPACE_MD,
+                ));
             }
         }
     }
@@ -5116,43 +10360,73 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
     let mut pb_strips = row![].spacing(theme::SPACE_MD);
     let mut pb_width = 0.0f32;
     let mut pb_item_count = 0usize;
-    let mut pb_open_x: Option<f32> = None;
+    let mut pb_open_x: Option<(ChannelId, f32)> = None;
     let n_pb_pairs = state.device.playbacks().len() / 2;
     for pair in 0..n_pb_pairs {
         let l = pair * 2;
         let linked = state.device.playback_linked(pair);
-        let pair_channels = [l, l + 1];
-        let shown: &[usize] = if linked {
-            &pair_channels[..1]
-        } else {
-            &pair_channels[..]
-        };
-        for &ch_idx in shown {
+        let full_right = rendered_strip_width(state, ChannelId::Playback(l + 1));
+        let extra = stereo_extra_width(
+            state,
+            ChannelId::Playback(l),
+            linked,
+            full_right,
+            anim_now,
+        );
+        let mut channels = vec![l];
+        if extra > 0.0 {
+            channels.push(l + 1);
+        }
+        for &ch_idx in &channels {
             let cid = ChannelId::Playback(ch_idx);
+            let right_anim = ch_idx == l + 1 && extra < full_right - 0.5;
             let mut params = strip_params(state, cid, state.sel_out);
-            if linked {
+            if linked && ch_idx == l {
                 if let Some(right) = state.device.playbacks().get(l + 1) {
                     params.name = pair_bus_label(&params.name, &right.name);
                 }
                 params.meter2 = state.playback_meters.get(l + 1).map(MeterAnim::frame);
                 params.meter2_available = playback_meter_available(state, l + 1);
             }
-            let strip_widget = strip::strip(finish_params(state, params));
-            let mut item_width = rendered_strip_width(state, cid);
-            if state.flyout_open.contains(&(cid, strip::FlyoutKind::Settings)) {
-                let panel_w = item_width;
+            let strip_widget: Element<'_, Message> = if right_anim {
+                container(strip::strip(finish_params(state, params)))
+                    .width(Length::Fixed(extra.max(0.0)))
+                    .clip(true)
+                    .into()
+            } else {
+                strip::strip(finish_params(state, params))
+            };
+            let mut item_width = if right_anim {
+                extra.max(0.0)
+            } else {
+                rendered_strip_width(state, cid)
+            };
+            if right_anim {
+                pb_strips = pb_strips.push(strip_widget);
+            } else if let Some(panel_w) = flyout_slot(
+                state,
+                cid,
+                strip::FlyoutKind::Settings,
+                item_width,
+                anim_now,
+            ) {
                 pb_strips = pb_strips.push(
                     row![strip_widget, settings_popover(state, cid, panel_w, state.ui_scale)]
-                        .spacing(theme::SPACE_MD),
+                        .spacing(0.0),
                 );
-                item_width += panel_w + theme::SPACE_MD;
+                item_width += panel_w;
             } else {
                 pb_strips = pb_strips.push(strip_widget);
             }
             pb_width += item_width;
             pb_item_count += 1;
-            if state.flyout_open.contains(&(cid, strip::FlyoutKind::Route)) {
-                pb_open_x = Some(pb_width + (pb_item_count - 1) as f32 * theme::SPACE_MD);
+            if state.flyout_open.contains(&(cid, strip::FlyoutKind::Route))
+                || route_visible(state, cid, anim_now)
+            {
+                pb_open_x = Some((
+                    cid,
+                    pb_width + (pb_item_count - 1) as f32 * theme::SPACE_MD,
+                ));
             }
         }
     }
@@ -5167,34 +10441,87 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
     let mut out_strips = row![].spacing(theme::SPACE_MD);
     let mut out_width = 0.0f32;
     let mut out_item_count = 0usize;
-    for pair in 0..state.device.output_pair_count() {
+    for pair in state.device.output_display_order() {
+        // Assigned monitoring outputs are rendered inside the Control Room.
+        if state.assign.iter().flatten().any(|p| *p == pair) {
+            continue;
+        }
         let l = pair * 2;
         let linked = state.device.output_linked(pair);
-        let pair_channels = [l, l + 1];
-        let shown: &[usize] = if linked {
-            &pair_channels[..1]
-        } else {
-            &pair_channels[..]
-        };
-        for &ch_idx in shown {
+        let full_right = rendered_strip_width(state, ChannelId::Output(l + 1));
+        let extra = stereo_extra_width(
+            state,
+            ChannelId::Output(l),
+            linked,
+            full_right,
+            anim_now,
+        );
+        let mut channels = vec![l];
+        if extra > 0.0 {
+            channels.push(l + 1);
+        }
+        for &ch_idx in &channels {
             let cid = ChannelId::Output(ch_idx);
+            let right_anim = ch_idx == l + 1 && extra < full_right - 0.5;
             let mut params = strip_params(state, cid, state.sel_out);
-            if linked {
+            if linked && ch_idx == l {
                 if let Some(right) = state.device.outputs().get(l + 1) {
                     params.name = pair_bus_label(&params.name, &right.name);
                 }
                 params.meter2 = state.output_meters.get(l + 1).map(MeterAnim::frame);
                 params.meter2_available = output_meter_available(state, l + 1);
             }
-            let strip_widget = strip::strip(finish_params(state, params));
-            let mut item_width = rendered_strip_width(state, cid);
-            if state.flyout_open.contains(&(cid, strip::FlyoutKind::Settings)) {
-                let panel_w = item_width;
+            let strip_widget: Element<'_, Message> = if right_anim {
+                container(strip::strip(finish_params(state, params)))
+                    .width(Length::Fixed(extra.max(0.0)))
+                    .clip(true)
+                    .into()
+            } else {
+                strip::strip(finish_params(state, params))
+            };
+            let mut item_width = if right_anim {
+                extra.max(0.0)
+            } else {
+                rendered_strip_width(state, cid)
+            };
+            if right_anim {
+                out_strips = out_strips.push(strip_widget);
+            } else if let Some(panel_w) = flyout_slot(
+                state,
+                cid,
+                strip::FlyoutKind::Settings,
+                item_width,
+                anim_now,
+            ) {
                 out_strips = out_strips.push(
                     row![strip_widget, settings_popover(state, cid, panel_w, state.ui_scale)]
-                        .spacing(theme::SPACE_MD),
+                        .spacing(0.0),
                 );
-                item_width += panel_w + theme::SPACE_MD;
+                item_width += panel_w;
+            } else if let Some(panel_w) = flyout_slot(
+                state,
+                cid,
+                strip::FlyoutKind::Eq,
+                strip::EQ_FLYOUT_W * state.ui_scale,
+                anim_now,
+            ) {
+                out_strips = out_strips.push(
+                    row![strip_widget, eq_popover(state, cid, panel_w, state.ui_scale)]
+                        .spacing(0.0),
+                );
+                item_width += panel_w;
+            } else if let Some(panel_w) = flyout_slot(
+                state,
+                cid,
+                strip::FlyoutKind::Dynamics,
+                strip::DYN_FLYOUT_W * state.ui_scale,
+                anim_now,
+            ) {
+                out_strips = out_strips.push(
+                    row![strip_widget, dynamics_popover(state, cid, panel_w, state.ui_scale)]
+                        .spacing(0.0),
+                );
+                item_width += panel_w;
             } else {
                 out_strips = out_strips.push(strip_widget);
             }
@@ -5204,24 +10531,55 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
     }
     out_width += out_item_count.saturating_sub(1) as f32 * theme::SPACE_MD;
 
-    // `page()`'s own horizontal padding, plus a small safety margin so a
-    // borderline-fitting row biases toward scrolling instead of clipping.
-    // The sidebar's width comes off too: the mixer only gets what is left
-    // of the window beside it (this used to measure against the whole
-    // window, so a row could overflow under the sidebar without ever
-    // switching to its scrolling form).
-    let sidebar_w = sidebar_px(state);
-    let available_width =
-        (state.window_width - sidebar_w - 2.0 * theme::SPACE_XL - 4.0).max(0.0);
-
+    // The Control Room is flush with the right edge of the mixer area, the
+    // way TotalMix keeps it against the Control Strip, rather than packed
+    // after the last output strip. When the strips are wider than the
+    // window it stays at the end of the row and the page scrolls.
     let scale = state.ui_scale;
-    let submix_hint = || {
-        text(format!(
-            "Submix: {} \u{00b7} Tab for Matrix",
-            OUT_LABELS[state.sel_out]
-        ))
-        .color(theme::TEXT_SEC)
-        .size(theme::TEXT_XS * scale)
+    // Width of the channel strips alone, so the HARDWARE OUTPUTS rule stops
+    // at the last channel instead of running into the Control Room.
+    let mut strips_width = 0.0f32;
+    let out_row: Element<'_, Message> = if state.device.capabilities().protocol_features {
+        let side = sidebar_px(state);
+        let fx = if state.show_fx_panel && state.device.capabilities().fx {
+            FX_W * scale + theme::SPACE_MD * scale
+        } else {
+            0.0
+        };
+        let cr_w = control_room_width(state, scale);
+        strips_width = out_width;
+        let available = state.window_width - side - fx - 2.0 * theme::SPACE_XL * scale;
+        let natural = out_width + theme::SPACE_MD + cr_w;
+        out_width = natural.max(available);
+        // The strips are the row; the Control Room rides above them, pinned
+        // to the right edge, so a slideout widening the panel eats into the
+        // channel row instead of pushing it.
+        let row = iced::widget::Stack::new()
+            .push(
+                row![out_strips]
+                    .width(Length::Fixed(out_width))
+                    .height(Length::Fixed(strip::STRIP_H * scale)),
+            )
+            .push(
+                container(control_room_panel(state, scale, anim_now))
+                    .width(Length::Fill)
+                    .height(Length::Fixed(strip::STRIP_H * scale))
+                    .align_x(iced::Alignment::End)
+                    .align_y(iced::Alignment::Start),
+            )
+            .width(Length::Fixed(out_width));
+        // The Assign menu opens inside this row, so it stays anchored to
+        // the Control Room panel whatever the window size or scroll is.
+        if matches!(state.assign_menu, AssignMenu::Closed) {
+            row.into()
+        } else {
+            iced::widget::Stack::new()
+                .push(row)
+                .push(assign_menu_layer(state))
+                .into()
+        }
+    } else {
+        out_strips.into()
     };
     // TotalMix's "2 Row" (Options panel): inputs and playbacks side by
     // side, outputs underneath. Always honored once chosen: when the two
@@ -5230,59 +10588,72 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
     // layout instead, so on a narrower window the switch lit up and
     // nothing changed.)
     let side_gap = theme::SPACE_XXL * scale;
-    let side_by_side_width = input_width + side_gap + pb_width;
     let two_rows = match state.row_mode {
         RowMode::Two => true,
         RowMode::Three => false,
-        RowMode::Auto => side_by_side_width <= available_width,
+        // Retired Auto prefs open in the manual's default 3-row layout.
+        RowMode::Auto => false,
     };
     let sources: Element<'_, Message> = if two_rows {
         let side_by_side = row![
             column![
-                section_header("HARDWARE INPUTS", scale),
-                submix_hint(),
+                container(section_header("HARDWARE INPUTS", scale))
+                    .width(Length::Fixed(input_width)),
                 with_flyout(state, input_strips.into(), input_open_x),
             ]
             .spacing(theme::SPACE_LG)
             .width(Length::Fixed(input_width)),
             column![
-                section_header("SOFTWARE PLAYBACK", scale),
-                // Keeps the playback strips level with the input strips,
-                // which have the submix hint above them.
-                text(" ").size(theme::TEXT_XS * scale),
+                container(section_header("SOFTWARE PLAYBACK", scale))
+                    .width(Length::Fixed(pb_width)),
                 with_flyout(state, pb_strips.into(), pb_open_x),
             ]
             .spacing(theme::SPACE_LG)
             .width(Length::Fixed(pb_width)),
         ]
         .spacing(side_gap);
-        responsive_row(side_by_side.into(), side_by_side_width, available_width)
+        side_by_side.into()
     } else {
+        // Every section title spans its own strips, the way the Control
+        // Room's does, so a break appears wherever the row has slack.
         column![
-            section_header("HARDWARE INPUTS", scale),
-            submix_hint(),
-            with_flyout(
-                state,
-                responsive_row(input_strips.into(), input_width, available_width),
-                input_open_x,
-            ),
-            section_header("SOFTWARE PLAYBACK", scale),
-            with_flyout(
-                state,
-                responsive_row(pb_strips.into(), pb_width, available_width),
-                pb_open_x,
-            ),
+            container(section_header("HARDWARE INPUTS", scale))
+                .width(Length::Fixed(input_width)),
+            with_flyout(state, input_strips.into(), input_open_x),
+            container(section_header("SOFTWARE PLAYBACK", scale))
+                .width(Length::Fixed(pb_width)),
+            with_flyout(state, pb_strips.into(), pb_open_x),
         ]
         .spacing(theme::SPACE_LG)
         .into()
     };
-    let body = column![
-        sources,
-        section_header("HARDWARE OUTPUTS", scale),
-        responsive_row(out_strips.into(), out_width, available_width),
-    ]
+    // Two section titles share this line: HARDWARE OUTPUTS over the channel
+    // strips, `control room` starting at the section's leftmost channel.
+    let outputs_header: Element<'_, Message> = if state.device.capabilities().protocol_features {
+        let cr_w = control_room_width(state, scale);
+        // The title starts exactly at the section's left edge — the panel's
+        // own left edge — so the two line up at any window width. The slack
+        // between the strips and the section is the break in the line.
+        let break_w = (out_width - cr_w - strips_width).max(0.0);
+        row![
+            container(section_header("HARDWARE OUTPUTS", scale))
+                .width(Length::Fixed(strips_width)),
+            iced::widget::Space::new().width(Length::Fixed(break_w)),
+            container(section_header("CONTROL ROOM", scale))
+                .width(Length::Fixed(cr_w)),
+        ]
+        .spacing(0.0)
+        .width(Length::Fixed(out_width))
+        .into()
+    } else {
+        section_header("HARDWARE OUTPUTS", scale)
+    };
+    let body = column![sources, outputs_header, out_row]
     .spacing(theme::SPACE_LG)
-    .width(Length::Fill);
+    // Give the page's bidirectional scrollable the real row width, so a
+    // row wider than the window scrolls instead of clipping its right-hand
+    // strips or making the last visible strip look narrower.
+    .width(Length::Fixed(input_width.max(pb_width).max(out_width)));
 
     page(body)
 }
@@ -5302,7 +10673,16 @@ fn matrix_view(state: &TuxMix) -> Element<'_, Message> {
     .size(theme::TEXT_XS * scale);
     let body = column![
         section_header("MATRIX MIXER", scale),
-        caption,
+        row![
+            caption,
+            iced::widget::Space::new().width(Length::Fill),
+            iced::widget::button(text("MONO MODE").size(theme::TEXT_XS * scale))
+                .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                .style(theme::toggle_button(state.matrix_mono, theme::ACCENT))
+                .on_press(Message::ToggleMatrixMono),
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(theme::SPACE_MD),
         matrix::view(state),
     ]
     .spacing(theme::SPACE_LG)
@@ -5390,22 +10770,37 @@ fn quick_block<'a>(
     strip_w: f32,
     big_scale: f32,
 ) -> Element<'a, Message> {
-    use strip::FlyoutKind::{Eq, Route, Settings, Trim};
-    let open = |k| state.flyout_open.contains(&(cid, k));
-    let panel = if open(Settings) {
-        Some((settings_popover(state, cid, strip_w, big_scale), strip_w))
-    } else if open(Eq) {
-        let w = strip::EQ_FLYOUT_W * big_scale;
-        Some((eq_popover(state, cid, w, big_scale), w))
-    } else if open(Trim) {
-        let w = strip::FLYOUT_W * big_scale;
-        Some((trim_popover(state, cid, w, big_scale), w))
-    } else if open(Route) {
-        let w = strip::FLYOUT_W * big_scale;
-        Some((route_popover(state, w, big_scale), w))
-    } else {
-        None
-    };
+    use strip::FlyoutKind::{Dynamics, Eq, Route, Settings, Trim};
+    let now = Instant::now();
+    let mut panel: Option<(Element<'a, Message>, f32)> = None;
+    let candidates = [
+        (Settings, strip_w),
+        (Eq, strip::EQ_FLYOUT_W * big_scale),
+        (Dynamics, strip::DYN_FLYOUT_W * big_scale),
+        (Trim, strip::FLYOUT_W * big_scale),
+        (Route, strip::FLYOUT_W * big_scale),
+    ];
+    for (kind, full_view) in candidates {
+        let full_state = flyout_width(state, cid, kind);
+        let Some(w) = flyout_slot(state, cid, kind, full_state, now) else {
+            continue;
+        };
+        let ratio = if full_state > 0.0 {
+            (w / full_state).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let panel_w = full_view * ratio;
+        let content = match kind {
+            Settings => settings_popover(state, cid, panel_w, big_scale),
+            Eq => eq_popover(state, cid, panel_w, big_scale),
+            Dynamics => dynamics_popover(state, cid, panel_w, big_scale),
+            Trim => trim_popover(state, cid, panel_w, big_scale),
+            Route => route_popover(state, panel_w, big_scale),
+        };
+        panel = Some((content, panel_w));
+        break;
+    }
     let gap = theme::SPACE_MD * state.ui_scale;
     let head = container(column![heading, picker].spacing(gap).align_x(iced::Alignment::Center))
         .width(Length::Fixed(strip_w))
@@ -5446,17 +10841,22 @@ fn quick_view(state: &TuxMix) -> Element<'_, Message> {
     // The destination picker lists the submix buses by the same names the
     // rest of the UI uses for them (a user label on an output strip
     // included), and selecting one is exactly the top bar's Submix field.
-    let dest_labels: Vec<String> = (0..OUT_LABELS.len())
-        .map(|i| {
+    let out_labels = state.pair_labels();
+    let display_order = state.device.output_display_order();
+    let dest_labels: Vec<String> = display_order
+        .iter()
+        .map(|&i| {
             user_label(state, ChannelId::Output(i * 2))
-                .unwrap_or(OUT_LABELS[i])
-                .to_string()
+                .map(str::to_string)
+                .unwrap_or_else(|| out_labels.get(i).cloned().unwrap_or_default())
         })
         .collect();
+    let selected_display = state.device.display_pair_index(sel_out);
 
     let build_content = move |big_scale: f32| -> Element<'_, Message> {
         let labels_for_pick = labels.clone();
         let cids = cids.clone();
+        let display_order_for_pick = display_order.clone();
         let strip_w = strip::STRIP_W * big_scale;
         fn styled<'p>(
             p: iced::widget::PickList<'p, String, Vec<String>, String, Message>,
@@ -5483,10 +10883,18 @@ fn quick_view(state: &TuxMix) -> Element<'_, Message> {
         let dest_for_pick = dest_labels.clone();
         let dest_picker = picker_style(pick_list(
             dest_labels.clone(),
-            dest_labels.get(sel_out).cloned(),
+            dest_labels.get(selected_display).cloned(),
             move |label| {
-                let idx = dest_for_pick.iter().position(|l| *l == label).unwrap_or(0);
-                Message::SelectOutput(idx)
+                let display = dest_for_pick
+                    .iter()
+                    .position(|l| *l == label)
+                    .unwrap_or(0);
+                Message::SelectOutput(
+                    display_order_for_pick
+                        .get(display)
+                        .copied()
+                        .unwrap_or(display),
+                )
             },
         ));
 
@@ -5600,8 +11008,14 @@ fn quick_view(state: &TuxMix) -> Element<'_, Message> {
 mod tests {
     use super::{
         any_channel_muted, any_channel_soloed, apply_pending_resize,
-        apply_prefs, channel_is_muted, channel_is_soloed, is_undoable, new, prefs_of,
-        mute_armed, power_sum_output_meters, update, zoom, ChannelId, EditField, MeterAnim, Message, RowMode, View, ZOOM_STEP,
+        apply_prefs, channel_is_muted, channel_is_soloed, choose_startup_kind,
+        choose_startup_target,
+        frames_ms, is_undoable, new, new_with_device, apply_startup_sync, prefs_of,
+        mute_armed, power_sum_output_meters, reorder_pair_volumes,
+        uc_min_buffer_frames, uc_usb_frames, update, zoom, ChannelId, DeviceKind,
+        DeviceTarget, EditField, MeterAnim, Message, RowMode, View, ZOOM_STEP,
+        FX_ECHO_CONTROLS_H, FX_FADER_W, FX_HEADER_H, FX_KNOBS_W, FX_REV_CONTROLS_H,
+        FX_REV_TAIL_H, FX_ROW_H, FX_TYPE_H, FX_W,
     };
     use crate::sidebar;
     use crate::theme;
@@ -5609,6 +11023,163 @@ mod tests {
     use std::collections::HashSet;
     use std::time::{Duration, Instant};
     use tuxmix_core::RmeDevice;
+
+    #[test]
+    fn osc_commands_go_through_the_host_scene_merge() {
+        let mut state = new(true, None, None);
+        state.host_scene = Some(state.device.capture_scene());
+        let _ = update(
+            &mut state,
+            Message::OscCommand(crate::osc::OscCommand::Volume(ChannelId::Input(0), 0, 0.5)),
+        );
+        assert_eq!(
+            state.host_scene.as_ref().unwrap().inputs[0].volumes[0], 0.5,
+            "an OSC fader move must reach the saved host scene"
+        );
+        let _ = update(
+            &mut state,
+            Message::OscCommand(crate::osc::OscCommand::LowCutEnabled(ChannelId::Input(0), true)),
+        );
+        assert!(
+            state.host_scene.as_ref().unwrap().inputs[0]
+                .eq
+                .unwrap()
+                .low_cut_enabled,
+            "an OSC low-cut switch must reach the saved host scene"
+        );
+    }
+
+    #[test]
+    fn uc_latency_chain_counts_queue_and_endpoint() {
+        assert_eq!(uc_usb_frames(44_100, (48, 2)), (96, 48));
+        assert_eq!(uc_usb_frames(96_000, (48, 2)), (192, 96));
+        assert_eq!(uc_min_buffer_frames(44_100, (48, 2)), 192);
+        assert!((frames_ms(256, 44_100) - 5.805).abs() < 0.01);
+    }
+
+    #[test]
+    #[ignore = "requires both Fireface UC and UCX connected"]
+    fn manual_switch_between_connected_units() {
+        let targets = super::DeviceHandle::available_targets();
+        let uc = targets
+            .iter()
+            .find(|target| target.kind == DeviceKind::Uc)
+            .cloned()
+            .expect("connect the Fireface UC");
+        let ucx = targets
+            .iter()
+            .find(|target| target.kind == DeviceKind::Ucx)
+            .cloned()
+            .expect("connect the Fireface UCX");
+
+        let mut state = new_with_device(
+            false,
+            None,
+            None,
+            Some(DeviceKind::Ucx),
+            ucx.serial.clone(),
+        );
+        assert_eq!(state.device_target.as_ref(), Some(&ucx));
+        assert_eq!(state.device.canonical_model(), "Fireface UCX");
+
+        super::switch_device(&mut state, uc.clone()).expect("switch to UC");
+        assert_eq!(state.device_target.as_ref(), Some(&uc));
+        assert_eq!(state.device.canonical_model(), "Fireface UC");
+        assert_eq!(state.device.inputs().len(), 18);
+        assert!(state.host_scene.is_some());
+
+        super::switch_device(&mut state, ucx.clone()).expect("switch back to UCX");
+        assert_eq!(state.device_target.as_ref(), Some(&ucx));
+        assert_eq!(state.device.canonical_model(), "Fireface UCX");
+        assert_eq!(state.device.inputs().len(), 18);
+    }
+
+    #[test]
+    fn serial_selects_the_exact_unit_not_just_the_model() {
+        let a = DeviceTarget {
+            kind: DeviceKind::Ucx,
+            serial: Some("A".into()),
+        };
+        let b = DeviceTarget {
+            kind: DeviceKind::Ucx,
+            serial: Some("B".into()),
+        };
+        let available = vec![a.clone(), b.clone()];
+        assert_eq!(
+            choose_startup_target(&available, Some(DeviceKind::Ucx), Some("B")),
+            Some(b.clone())
+        );
+        assert_eq!(
+            choose_startup_target(&available, Some(DeviceKind::Ucx), Some("missing")),
+            Some(a)
+        );
+    }
+
+    #[test]
+    fn one_connected_device_beats_a_stale_device_preference() {
+        // The saved prefs still said Babyface, but only the UC is present.
+        assert_eq!(
+            choose_startup_kind(&[DeviceKind::Uc], Some(DeviceKind::Babyface)),
+            Some(DeviceKind::Uc)
+        );
+    }
+
+    #[test]
+    fn explicit_preference_wins_when_it_is_still_connected() {
+        assert_eq!(
+            choose_startup_kind(
+                &[DeviceKind::Uc, DeviceKind::Ucx],
+                Some(DeviceKind::Ucx)
+            ),
+            Some(DeviceKind::Ucx)
+        );
+    }
+
+    #[test]
+    fn existing_device_is_kept_when_another_one_appears() {
+        // Startup policy is only chosen when the current device is absent;
+        // when both are present, the saved/current model wins.
+        assert_eq!(
+            choose_startup_kind(
+                &[DeviceKind::Uc, DeviceKind::Ucx],
+                Some(DeviceKind::Uc)
+            ),
+            Some(DeviceKind::Uc)
+        );
+    }
+
+    #[test]
+    fn only_one_device_is_selected_even_without_prefs() {
+        assert_eq!(
+            choose_startup_kind(&[DeviceKind::Ucx], None),
+            Some(DeviceKind::Ucx)
+        );
+    }
+
+    #[test]
+    fn explicit_simulation_is_not_replaced_by_a_real_device() {
+        assert_eq!(
+            choose_startup_kind(&[DeviceKind::Uc], Some(DeviceKind::Mock)),
+            Some(DeviceKind::Mock)
+        );
+    }
+
+    #[test]
+    fn output_meter_reorder_moves_pairs_not_playback_channels() {
+        // UC matrix/display order: AN1/2, AN3/4, AN5/6, Phones, ...
+        let order = [1usize, 2, 3, 0, 4, 5, 6, 7, 8];
+        // Playback 1/2 (channels 0 and 1) routed to Phones (display pair 3).
+        let mut channels = vec![vec![0.0f32; 9]; 2];
+        channels[0][3] = 1.0;
+        channels[1][3] = 1.0;
+        reorder_pair_volumes(&mut channels, &order);
+        assert_eq!(channels.len(), 2, "playback channels must not move");
+        // Phones is internal pair 0; AN5/6 (internal pair 3) must stay dark.
+        assert_eq!(channels[0][0], 1.0);
+        assert_eq!(channels[1][0], 1.0);
+        assert_eq!(channels[0][3], 0.0);
+        assert_eq!(channels[1][3], 0.0);
+    }
 
     #[test]
     fn output_meters_reads_the_right_pair_for_every_individual_channel() {
@@ -5749,35 +11320,70 @@ mod tests {
     }
 
     #[test]
-    fn release_decelerates_over_time() {
+    fn release_falls_at_least_four_times_faster() {
         let mut m = MeterAnim::new();
         m.step(1.0); // reach a peak first
         let peak = m.frame().value;
-
         m.step(0.0);
-        let drop_1 = peak - m.frame().value;
-
-        for _ in 0..10 {
-            m.step(0.0);
-        }
-        let before_late = m.frame().value;
-        m.step(0.0);
-        let drop_late = before_late - m.frame().value;
-
+        let drop = peak - m.frame().value;
+        let old_first_drop = peak * 0.22;
         assert!(
-            drop_1 > drop_late,
-            "first release tick should fall faster than a tick late into the release: {drop_1} vs {drop_late}"
+            drop >= old_first_drop * 4.0,
+            "one release tick should drop at least 4x the old first tick: {drop} vs {old_first_drop}"
         );
     }
 
     #[test]
-    fn rising_mid_release_cancels_it_and_resets_the_curve() {
+    fn peak_is_held_for_two_seconds() {
+        let mut m = MeterAnim::new();
+        m.step(1.0);
+        for _ in 0..39 {
+            m.step(0.0); // ~1.95 s at the 50 ms nominal tick
+        }
+        assert!(
+            m.frame().peak > 0.99,
+            "peak should still be held after ~1.95 s: {}",
+            m.frame().peak
+        );
+        for _ in 0..5 {
+            m.step(0.0);
+        }
+        assert!(
+            m.frame().peak < 0.99,
+            "peak should start falling after the 2 s hold: {}",
+            m.frame().peak
+        );
+    }
+
+    #[test]
+    fn a_new_peak_restarts_the_hold() {
         let mut m = MeterAnim::new();
         m.step(1.0);
         m.step(0.0);
         m.step(0.0);
-        m.step(1.0); // new peak — release curve should restart from here
-        assert_eq!(m.release_elapsed_ms, 0.0);
+        m.step(1.0);
+        assert_eq!(m.peak_hold_ms, 0.0);
+        assert_eq!(m.peak_release_ms, 0.0);
+    }
+
+    #[test]
+    fn the_peak_glides_down_after_the_hold() {
+        let mut m = MeterAnim::new();
+        m.step(1.0);
+        for _ in 0..41 {
+            m.step(0.0); // pass the 2 s hold
+        }
+        let before_peak = m.frame().peak;
+        m.step(0.0);
+        let peak_drop = before_peak - m.frame().peak;
+        assert!(
+            peak_drop > 0.0 && peak_drop < before_peak * 0.5,
+            "peak marker should glide down, not snap: {peak_drop} of {before_peak}"
+        );
+        assert!(
+            m.frame().value < 0.001,
+            "the bar itself should already have snapped to zero"
+        );
     }
 
     // ── Right sidebar: Undo/Redo, Groups, Layout ──────────────────────
@@ -5973,7 +11579,7 @@ mod tests {
         state.device.set_protocol_features(false);
         let _ = update(&mut state, Message::TrimChanged(0, -3.0));
         assert_eq!(state.device.inputs()[0].trim, 6.0, "trim must not move");
-        let _ = update(&mut state, Message::EqEnabled(0, true));
+        let _ = update(&mut state, Message::EqEnabled(ChannelId::Input(0), true));
         assert!(
             !state.device.inputs()[0].eq.as_ref().unwrap().enabled,
             "the EQ must not engage behind a hidden button"
@@ -6009,6 +11615,29 @@ mod tests {
     }
 
     #[test]
+    fn the_old_default_sidebar_width_migrates_to_the_new_one() {
+        let mut state = new(true, None, None);
+        apply_prefs(
+            &mut state,
+            crate::prefs::Prefs {
+                sidebar_width: Some(sidebar::OLD_DEFAULT_WIDTH),
+                ..Default::default()
+            },
+        );
+        assert_eq!(state.sidebar_width, sidebar::DEFAULT_WIDTH);
+
+        let mut custom = new(true, None, None);
+        apply_prefs(
+            &mut custom,
+            crate::prefs::Prefs {
+                sidebar_width: Some(250.0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(custom.sidebar_width, 250.0);
+    }
+
+    #[test]
     fn sidebar_resize_clamps_and_is_not_undoable() {
         let mut state = new(true, None, None);
         assert_eq!(state.sidebar_width, sidebar::DEFAULT_WIDTH);
@@ -6035,7 +11664,7 @@ mod tests {
     #[test]
     fn eq_plot_drag_updates_frequency_and_gain_together() {
         let mut state = new(true, None, None);
-        let _ = update(&mut state, Message::EqBandPoint(0, 0, 2_500, 6.5));
+        let _ = update(&mut state, Message::EqBandPoint(ChannelId::Input(0), 0, 2_500, 6.5));
         let eq = state.device.inputs()[0].eq.unwrap();
         assert_eq!(eq.bands[0].freq_hz, 2_500);
         assert!((eq.bands[0].gain_db - 6.5).abs() < 0.01);
@@ -6044,9 +11673,9 @@ mod tests {
     #[test]
     fn eq_plot_double_click_resets_the_band() {
         let mut state = new(true, None, None);
-        let _ = update(&mut state, Message::EqBandPoint(0, 0, 2_500, 6.5));
-        let _ = update(&mut state, Message::EqBandQ(0, 0, 3.0));
-        let _ = update(&mut state, Message::EqBandReset(0, 0));
+        let _ = update(&mut state, Message::EqBandPoint(ChannelId::Input(0), 0, 2_500, 6.5));
+        let _ = update(&mut state, Message::EqBandQ(ChannelId::Input(0), 0, 3.0));
+        let _ = update(&mut state, Message::EqBandReset(ChannelId::Input(0), 0));
         let eq = state.device.inputs()[0].eq.unwrap();
         assert_eq!(eq.bands[0].freq_hz, 1_000);
         assert!(eq.bands[0].gain_db.abs() < 0.01);
@@ -6160,6 +11789,10 @@ mod tests {
         let _ = update(&mut state, Message::StereoLinkChanged(cid, false));
         assert!(state.device.playbacks()[0].split);
         assert!(state.device.playbacks()[1].split, "split mirrors across both channels of the pair");
+        assert!(
+            state.stereo_anim.contains_key(&ChannelId::Playback(0)),
+            "the split must animate the rest of the row instead of snapping"
+        );
 
         let _ = update(&mut state, Message::StereoLinkChanged(cid, true));
         assert!(!state.device.playbacks()[0].split);
@@ -6194,14 +11827,25 @@ mod tests {
         let a = ChannelId::Input(0);
         let b = ChannelId::Input(2);
 
-        // Settings then EQ on the SAME strip: only one inline panel can
-        // render per strip (the render loop is an if/else-if chain), so
-        // the second replaces the first rather than both lingering
-        // unrendered in the set.
+        // Settings then EQ on the SAME strip: the width morphs directly
+        // from the Settings width to the EQ width, without a full
+        // slide-out then slide-in.
         let _ = update(&mut state, Message::ToggleFlyout(a, strip::FlyoutKind::Settings));
         let _ = update(&mut state, Message::ToggleFlyout(a, strip::FlyoutKind::Eq));
         assert!(!state.flyout_open.contains(&(a, strip::FlyoutKind::Settings)));
         assert!(state.flyout_open.contains(&(a, strip::FlyoutKind::Eq)));
+        let eq_anim = state
+            .flyout_anim
+            .get(&(a, strip::FlyoutKind::Eq))
+            .expect("EQ keeps an in-flight width tween");
+        assert!(
+            eq_anim.prev > 0.0,
+            "EQ starts from the Settings width, not zero"
+        );
+        assert!(
+            eq_anim.value > eq_anim.prev,
+            "EQ target is wider than the Settings panel it replaces"
+        );
 
         // Route stays exclusive with itself across DIFFERENT strips too
         // (the Stack overlay only positions one popover) — but doesn't
@@ -6430,8 +12074,43 @@ mod tests {
         assert_eq!(state.row_mode, RowMode::Two);
         let old: crate::prefs::Prefs = serde_json::from_str(r#"{ "two_row": false }"#).unwrap();
         apply_prefs(&mut state, old);
-        assert_eq!(state.row_mode, RowMode::Auto, "false was only the old default");
+        assert_eq!(state.row_mode, RowMode::Three, "false was only the old default");
         assert!(!serde_json::to_string(&prefs_of(&state)).unwrap().contains("two_row"));
+    }
+
+    #[test]
+    fn the_fx_column_keeps_the_measured_proportions() {
+        // 160 px column at RME scale, mapped at the 90/80 strip ratio.
+        assert!((FX_W - 160.0 * 1.125).abs() < 0.01);
+        // The inset plus the knob block and the fader column fill the width.
+        assert!((theme::SPACE_SM + FX_KNOBS_W + FX_FADER_W - FX_W).abs() < 0.01);
+        // Each band is the measured height at the same ratio.
+        assert!((FX_HEADER_H - 32.0 * 1.125).abs() < 0.01);
+        assert!((FX_TYPE_H - 28.0 * 1.125).abs() < 0.01);
+        assert!((FX_REV_CONTROLS_H - 220.0 * 1.125).abs() < 0.01);
+        assert!((FX_REV_TAIL_H - 87.0 * 1.125).abs() < 0.2);
+        assert!((FX_ECHO_CONTROLS_H - 305.0 * 1.125).abs() < 0.2);
+        // 70 px knob pitch.
+        assert!((FX_ROW_H - 70.0 * 1.125).abs() < 0.01);
+    }
+
+    #[test]
+    fn fx_knob_rows_fit_their_control_bands() {
+        // Reverb: 3.5 px top pad, three rows.
+        assert!(3.5 + 3.0 * FX_ROW_H <= FX_REV_CONTROLS_H + 0.01);
+        // Echo: 4 px top pad, four rows and the 24 px high-cut picker row.
+        assert!(4.0 + 4.0 * FX_ROW_H + 24.0 <= FX_ECHO_CONTROLS_H + 0.01);
+    }
+
+    #[test]
+    fn the_fx_panels_build_at_every_zoom() {
+        // Construction only: catches a zero divisor (the BPM derivation) or a
+        // control with no valid range before the panel is ever shown.
+        let state = new(true, None, None);
+        for scale in [0.75, 1.0, 1.5] {
+            let _ = super::reverb_panel(&state, scale);
+            let _ = super::echo_panel(&state, scale);
+        }
     }
 
     #[test]
@@ -6583,6 +12262,28 @@ mod tests {
     }
 
     #[test]
+    fn a_card_rate_change_is_detected_across_a_closed_stream() {
+        assert!(!super::card_rate_changed(None, Some(48_000)));
+        assert!(super::card_rate_changed(Some(48_000), Some(44_100)));
+        assert!(!super::card_rate_changed(Some(48_000), Some(48_000)));
+        assert!(!super::card_rate_changed(Some(48_000), None));
+        // The last rate is retained while closed, so the reopen at a new
+        // rate is detected.
+        assert!(super::card_rate_changed(Some(48_000), Some(44_100)));
+    }
+
+    #[test]
+    fn the_first_observed_rate_reapplies_if_it_differs_from_the_device_model() {
+        // TuxMix opened at 44.1 kHz, then PipeWire opened the card at 48 kHz.
+        assert!(super::first_rate_needs_reapply(None, Some(48_000), 44_100));
+        assert!(super::rate_needs_mixer_reapply(None, Some(48_000), 44_100));
+        // First observation agrees with the model: no reapply yet.
+        assert!(!super::first_rate_needs_reapply(None, Some(44_100), 44_100));
+        // No open stream: nothing to do.
+        assert!(!super::first_rate_needs_reapply(None, None, 44_100));
+    }
+
+    #[test]
     fn the_mock_simulates_the_audio_engine() {
         let mut state = new(true, None, None);
         let e = state.engine.expect("the mock has a simulated engine");
@@ -6653,29 +12354,20 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_window_folds_the_sidebar_and_a_wide_one_brings_it_back() {
+    fn a_narrow_window_never_auto_folds_the_sidebar() {
         let mut state = new(true, None, None);
         let _ = update(&mut state, Message::WindowSize(1400.0, 900.0));
         assert!(state.sidebar_open);
-        let _ = update(&mut state, Message::WindowSize(800.0, 900.0));
-        assert!(!state.sidebar_open && state.auto_folded);
+        let _ = update(&mut state, Message::WindowSize(700.0, 900.0));
+        assert!(state.sidebar_open, "narrow window keeps the right panel visible");
         let _ = update(&mut state, Message::WindowSize(1400.0, 900.0));
-        assert!(state.sidebar_open && !state.auto_folded);
-        // A fold the user made stays folded.
+        assert!(state.sidebar_open);
+        // The user can still collapse it explicitly; resizing never reopens it.
         let _ = update(&mut state, Message::ToggleSidebar);
-        let _ = update(&mut state, Message::WindowSize(800.0, 900.0));
+        assert!(!state.sidebar_open);
+        let _ = update(&mut state, Message::WindowSize(700.0, 900.0));
         let _ = update(&mut state, Message::WindowSize(1400.0, 900.0));
         assert!(!state.sidebar_open, "the user's own fold is respected");
-    }
-
-    #[test]
-    fn the_fold_threshold_follows_the_zoom() {
-        // Everything fits beside the sidebar at 80 % in ~970 px, not at 130 %.
-        let mut state = new(true, None, None);
-        state.ui_scale = 0.8;
-        assert!(!super::sidebar_does_not_fit(&state, 971.0));
-        state.ui_scale = 1.3;
-        assert!(super::sidebar_does_not_fit(&state, 971.0));
     }
 
     #[test]
@@ -6750,17 +12442,20 @@ mod tests {
     }
 
     #[test]
-    fn the_card_line_shows_the_period_only_while_the_card_plays() {
-        use tuxmix_core::pw_clock::CardStream;
+    fn the_card_line_shows_clock_rate_and_buffer() {
         let mut state = new(true, None, None);
-        // Idle: the rate and the clock, never a period (the graph's quantum
-        // is not what the card runs, and the capture stream may be our own
-        // meter's).
-        assert_eq!(crate::sidebar::clock_line(&state, "Internal"), "48 kHz \u{00b7} Internal");
-        state.card_stream = Some(CardStream { rate: 48_000, period: 256, buffer: 768 });
         assert_eq!(
             crate::sidebar::clock_line(&state, "Internal"),
-            "48 kHz \u{00b7} 256 smp \u{00b7} Internal"
+            "Internal, 48 kHz, 256"
+        );
+        state.card_stream = Some(tuxmix_core::pw_clock::CardStream {
+            rate: 44_100,
+            period: 512,
+            buffer: 1536,
+        });
+        assert_eq!(
+            crate::sidebar::clock_line(&state, "Internal"),
+            "Internal, 44.1 kHz, 512"
         );
     }
 
@@ -6824,5 +12519,153 @@ mod tests {
         let _ = update(&mut state, Message::LayoutClicked(1));
         assert_eq!(state.active_layout, Some(1));
         assert!(state.collapsed.contains(&cid));
+    }
+
+    /// Hardware probe for the UC live-rate path.  Ignored by default.
+    /// Run with TuxMix stopped and music playing:
+    /// `cargo test -p tuxmix-gui live_rate_switch_probe -- --ignored --nocapture`
+    /// It enables Phones loopback, captures the RME input before and after a
+    /// 48 → 44.1 kHz switch, and prints the per-channel peak.  A non-zero
+    /// post-switch peak means the UC is still producing audio.
+    #[test]
+    #[ignore]
+    fn live_rate_switch_probe() {
+        use std::process::Command;
+
+        fn peaks(_rate: u32) -> Vec<f32> {
+            let src = Command::new("pactl")
+                .args(["list", "short", "sources"])
+                .output()
+                .ok()
+                .and_then(|out| {
+                    String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
+                        if line.contains("RME") && line.contains("pro-input-0") {
+                            line.split_whitespace().next().map(str::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                });
+            let Some(src) = src else { return vec![] };
+            let out = Command::new("timeout")
+                .args([
+                    "2",
+                    "pw-record",
+                    "--target",
+                    &src,
+                    "--format",
+                    "s32",
+                    "--channels",
+                    "18",
+                    "--raw",
+                    "-",
+                ])
+                .output();
+            let Ok(out) = out else { return vec![] };
+            let mut peaks = vec![0.0f32; 18];
+            for frame in out.stdout.chunks_exact(18 * 4) {
+                for (ch, bytes) in frame.chunks_exact(4).enumerate() {
+                    let sample = i32::from_le_bytes(bytes.try_into().unwrap()).unsigned_abs()
+                        as f32
+                        / 2_147_483_648.0;
+                    if sample > peaks[ch] {
+                        peaks[ch] = sample;
+                    }
+                }
+            }
+            peaks
+        }
+
+        let mut state = new_with_device(false, None, None, None, None);
+        apply_startup_sync(&mut state);
+
+        // Park the existing player if the caller supplied it, then start a
+        // known tone after the scene is in the UC shadow.  The tone starts
+        // the engine and latches the scene.
+        if let (Ok(stream), Some(sink)) = (
+            std::env::var("TUXMIX_PROBE_STREAM"),
+            tuxmix_core::pw_clock::fireface_sink_name(),
+        ) {
+            let _ = Command::new("pactl")
+                .args(["move-sink-input", &stream, &sink])
+                .status();
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let sink_idx = Command::new("pactl")
+            .args(["list", "short", "sinks"])
+            .output()
+            .ok()
+            .and_then(|out| {
+                String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
+                    if line.contains("RME") && line.contains("pro-output-0") {
+                        line.split_whitespace().next().map(str::to_owned)
+                    } else {
+                        None
+                    }
+                })
+            });
+        let mut tone = if std::env::var_os("TUXMIX_PROBE_PLAYER").is_some() {
+            None
+        } else {
+            sink_idx.and_then(|idx| {
+                Command::new("pw-play")
+                    .args([
+                        "--target",
+                        &idx,
+                        "--rate=48000",
+                        "--channels=2",
+                        "/tmp/opencode/tone.wav",
+                    ])
+                    .spawn()
+                    .ok()
+            })
+        };
+        std::thread::sleep(Duration::from_secs(1));
+
+        // The cable is now Phones → input 5.  Set the test fader to 0 dB
+        // after the tone has started; the probe scene is not saved.
+        state
+            .device
+            .set_volume(ChannelId::Output(0), 0, 1.0)
+            .expect("Phones left volume");
+        state
+            .device
+            .set_volume(ChannelId::Output(1), 0, 1.0)
+            .expect("Phones right volume");
+
+        let before_rate = state
+            .card_stream
+            .map(|s| s.rate)
+            .or_else(|| state.engine.map(|e| e.effective_rate()))
+            .filter(|r| *r > 0)
+            .unwrap_or(48_000);
+        println!("probe: before card rate {before_rate}");
+        println!("probe: before peaks {:?}", peaks(before_rate));
+
+        if std::env::var_os("TUXMIX_PROBE_SCENE_ONLY").is_some() {
+            // The caller has parked the player so the UC engine is idle.
+            // Re-write the scene with the test Phones level; the next engine
+            // start (player return) latches it.
+            let scene = state.device.capture_scene();
+            if let Err(e) = state.device.apply_scene(&scene) {
+                log::warn!("probe scene reapply failed: {e:?}");
+            }
+            println!("probe: scene-only mode, skipping rate change");
+        } else {
+            let _ = update(&mut state, Message::EngineRate(44_100));
+            std::thread::sleep(Duration::from_secs(2));
+            let _ = update(&mut state, Message::Tick);
+        }
+
+        let after_rate = tuxmix_core::pw_clock::card_stream(state.device.card_id())
+            .map(|s| s.rate)
+            .or_else(|| state.engine.map(|e| e.effective_rate()))
+            .unwrap_or(0);
+        println!("probe: after card rate {after_rate}");
+        println!("probe: after peaks {:?}", peaks(after_rate));
+        if let Some(child) = tone.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }

@@ -29,8 +29,20 @@ pub struct DeviceProfile {
     pub model_name: &'static str,
     /// One entry per physical hardware input, in channel-id order.
     pub inputs: &'static [InputSpec],
-    /// One entry per physical stereo output pair.
+    /// One entry per physical stereo output pair, in the hardware output
+    /// row's order.
     pub outputs: &'static [OutputPairSpec],
+    /// One entry per software-playback stereo pair, in the order the device
+    /// exposes them.  Playback channel ids are `2*i` / `2*i+1`, so this list
+    /// must be in device order.  The labels can differ from `outputs`: the
+    /// UCX software row starts at AN1/2, puts Phones fourth, and calls the
+    /// first optical pair AS 1/2 when the optical input is SPDIF.
+    pub playback_pairs: &'static [OutputPairSpec],
+    /// Hardware-output display order: entry `i` is the output-pair index
+    /// (into `outputs`, which stays in device block order) shown at
+    /// position `i` in TotalMix's bottom row.  Identity for devices whose
+    /// display order matches the block order.
+    pub output_order: &'static [usize],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -75,7 +87,9 @@ impl DeviceProfile {
 
     pub fn build_playbacks(&self) -> Vec<PlaybackChannel> {
         let mut pbs = Vec::new();
-        for (i, pair) in self.outputs.iter().enumerate() {
+        for (i, pair) in self.playback_pairs.iter().enumerate() {
+            // The id is the real device playback channel, so crosspoints
+            // keep addressing the right source regardless of the labels.
             pbs.push(PlaybackChannel::new(
                 i * 2,
                 &format!("PCM {}", pair.left),

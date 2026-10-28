@@ -46,16 +46,18 @@ const METER_INTERP_MS: f32 = 50.0;
 pub struct MeterFrame {
     pub prev: f32,
     pub value: f32,
+    /// Held peak marker, independent of the bar's fast fall.
+    pub peak: f32,
     pub since: Instant,
 }
 
 impl MeterFrame {
-    /// A meter with no in-flight transition — e.g. outputs, which don't
-    /// have live meter data wired up.
+    /// A meter with no in-flight transition.
     pub fn still(value: f32) -> Self {
         Self {
             prev: value,
             value,
+            peak: value,
             since: Instant::now(),
         }
     }
@@ -199,6 +201,10 @@ pub struct Fader<Message> {
     pub meter2_available: bool,
     pub height: f32,
     pub show_meter: bool,
+    /// The colour of the filled part of the rail, below the cap. The strip's
+    /// main fader uses the default light `FADER`; the thin FX fader uses the
+    /// send/return colour, so raising it colours the channel itself.
+    pub fill: Color,
     /// Extra width (at `scale == 1.0`... no, already-scaled pixels, same
     /// as every other field here) that exists *outside* this canvas's own
     /// bounds but should still count when centering the track — the strip
@@ -498,6 +504,7 @@ impl<Message> canvas::Program<Message> for Fader<Message> {
                         *display = MeterFrame {
                             prev: display.at(*now),
                             value: self.value,
+                            peak: display.peak,
                             since: *now,
                         };
                     }
@@ -534,10 +541,12 @@ impl<Message> canvas::Program<Message> for Fader<Message> {
                 &mut frame,
                 meter_rect,
                 self.meter.shown(Instant::now()),
+                self.meter.peak,
                 self.scale,
                 self.meter_available,
-                self.meter2
-                    .map(|m| (m.shown(Instant::now()), self.meter2_available)),
+                self.meter2.map(|m| {
+                    (m.shown(Instant::now()), m.peak, self.meter2_available)
+                }),
             );
         }
         if let Some(label) = &self.label {
@@ -610,6 +619,7 @@ impl<Message> canvas::Program<Message> for Fader<Message> {
                     self.range,
                     state.dragging,
                     self.scale,
+                    self.fill,
                 );
             }));
         }
@@ -618,19 +628,14 @@ impl<Message> canvas::Program<Message> for Fader<Message> {
 
     fn mouse_interaction(
         &self,
-        state: &State,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
+        _state: &State,
+        _bounds: Rectangle,
+        _cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        if state.dragging {
-            return mouse::Interaction::Grabbing;
-        }
-        match cursor.position_over(bounds) {
-            Some(pos) if self.is_over_track(pos.x, bounds.x, bounds.width) => {
-                mouse::Interaction::Grab
-            }
-            _ => mouse::Interaction::None,
-        }
+        // No grab hand: over a strip of faders it covers the very thing the
+        // user is reading (levels, scale, the cap), so the default cursor
+        // stays.
+        mouse::Interaction::None
     }
 }
 
@@ -709,12 +714,13 @@ fn draw_meter(
     frame: &mut Frame,
     r: Rectangle,
     level: f32,
+    peak: f32,
     scale: f32,
     available: bool,
-    right: Option<(f32, bool)>,
+    right: Option<(f32, f32, bool)>,
 ) {
-    let Some((level2, available2)) = right else {
-        draw_meter_bar(frame, r, level, scale, available);
+    let Some((level2, peak2, available2)) = right else {
+        draw_meter_bar(frame, r, level, peak, scale, available);
         return;
     };
     let gap = 1.0 * scale;
@@ -724,11 +730,18 @@ fn draw_meter(
         Point::new(r.x + half_w + gap, r.y),
         Size::new(half_w, r.height),
     );
-    draw_meter_bar(frame, left_rect, level, scale, available);
-    draw_meter_bar(frame, right_rect, level2, scale, available2);
+    draw_meter_bar(frame, left_rect, level, peak, scale, available);
+    draw_meter_bar(frame, right_rect, level2, peak2, scale, available2);
 }
 
-fn draw_meter_bar(frame: &mut Frame, r: Rectangle, level: f32, scale: f32, available: bool) {
+fn draw_meter_bar(
+    frame: &mut Frame,
+    r: Rectangle,
+    level: f32,
+    peak: f32,
+    scale: f32,
+    available: bool,
+) {
     let l = level.clamp(0.0, 1.0);
     let fill_w = r.width;
     let radius = METER_RADIUS * scale;
@@ -809,6 +822,25 @@ fn draw_meter_bar(frame: &mut Frame, r: Rectangle, level: f32, scale: f32, avail
         }
     }
 
+    // Peak-hold marker: a thin bright line above the bar, held for the
+    // configured time by `MeterAnim`.  It is independent of the bar's
+    // fast fall, so a transient remains readable after the bar drops.
+    let p = peak.clamp(0.0, 1.0);
+    if p > l + 0.002 {
+        let peak_y = r.y + r.height - r.height * vol_to_t(p);
+        let h = (1.5 * scale).max(1.0);
+        frame.fill(
+            &Path::rectangle(
+                Point::new(r.x, (peak_y - h / 2.0).max(r.y)),
+                Size::new(fill_w, h),
+            ),
+            Color {
+                a: 0.9,
+                ..theme::TEXT_PRIMARY
+            },
+        );
+    }
+
     // Clip LED — a fixed indicator above the track, dim until triggered.
     let clip_rect = Rectangle::new(Point::new(r.x, r.y), Size::new(fill_w, clip_h));
     let clipping = l >= 0.95;
@@ -851,7 +883,9 @@ fn draw_meter_bar(frame: &mut Frame, r: Rectangle, level: f32, scale: f32, avail
     );
 }
 
-const RAIL_W: f32 = 3.5;
+/// The narrow recessed channel a compact (no-meter) fader slides in — one
+/// dark strip, not a wide slot.
+const SLOT_W: f32 = 7.0;
 const CAP_W: f32 = 22.0;
 const CAP_H: f32 = 15.0;
 const CAP_RADIUS: f32 = 3.0;
@@ -867,8 +901,11 @@ fn draw_track(
     range: (f32, f32),
     dragging: bool,
     scale: f32,
+    fill_color: Color,
 ) {
-    let rail_w = RAIL_W * scale;
+    // One line per fader: the slot *is* the rail, for the main fader and the
+    // thin FX fader alike. There is no second, thinner rail inside it.
+    let rail_w = SLOT_W * scale;
     let cap_w = CAP_W * scale;
     let cap_h = CAP_H * scale;
     let cap_radius = CAP_RADIUS * scale;
@@ -891,12 +928,14 @@ fn draw_track(
     let raw_y = pos_of(value);
     let cap_y = safe_clamp(raw_y, r.y + half_cap, r.y + r.height - half_cap);
 
-    // Groove — the full-length rail, unfilled color.
-    let groove = Path::rectangle(
-        Point::new(cx - rail_w / 2.0, r.y),
-        Size::new(rail_w, r.height),
+    // Every fader slides in the same narrow dark strip, so the slot reads
+    // above the cap — the main fader and the thin FX fader look like the
+    // same piece of hardware at two sizes.
+    let slot = Path::rectangle(
+        Point::new(cx - (SLOT_W * scale) / 2.0, r.y),
+        Size::new(SLOT_W * scale, r.height),
     );
-    frame.fill(&groove, theme::BORDER);
+    frame.fill(&slot, theme::BG_DEEP);
 
     // Filled portion of the rail, from the bottom up to the cap.
     if raw_y < r.y + r.height {
@@ -904,7 +943,7 @@ fn draw_track(
             Point::new(cx - rail_w / 2.0, cap_y),
             Size::new(rail_w, r.y + r.height - cap_y),
         );
-        frame.fill(&fill, theme::FADER);
+        frame.fill(&fill, fill_color);
     }
 
     // Unity/default reference — a tick crossing the rail, like the 0 dB
@@ -991,10 +1030,10 @@ fn draw_ruler(frame: &mut Frame, r: Rectangle, scale: f32) {
             position: Point::new(label_x, y),
             // 0 dB is the reference the cap rests on: one step brighter.
             color: if db == 0.0 {
-                theme::TEXT_SEC
+                theme::TEXT_PRIMARY
             } else {
                 Color {
-                    a: 0.6,
+                    a: 0.85,
                     ..theme::TEXT_SEC
                 }
             },
@@ -1072,6 +1111,7 @@ impl<Message> canvas::Program<Message> for VuMeter {
             &mut frame,
             meter_rect,
             self.level.shown(Instant::now()),
+            self.level.peak,
             self.scale,
             self.available,
             // Collapsed strips are a glance-only view with no room for a
@@ -1138,6 +1178,7 @@ mod tests {
         let f = MeterFrame {
             prev: 0.2,
             value: 0.8,
+            peak: 0.8,
             since: Instant::now(),
         };
         assert!(
@@ -1159,6 +1200,7 @@ mod tests {
         let f = MeterFrame {
             prev: 0.0,
             value: 1.0,
+            peak: 1.0,
             since: Instant::now(),
         };
         assert_eq!(f.at(f.since), 0.0);

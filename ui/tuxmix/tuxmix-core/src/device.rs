@@ -1,9 +1,13 @@
-use crate::channel::{ChannelId, EqBandType, InputChannel, OutputChannel, PlaybackChannel, Sensitivity};
+use crate::capabilities::DeviceCapabilities;
+use crate::channel::{
+    ChannelId, ChannelType, Dynamics, Echo, EqBandType, InputChannel, InputEq, InputLevel,
+    OutputChannel, PlaybackChannel, Reverb, Sensitivity,
+};
 use crate::error::Error;
 use crate::scene::Scene;
 
 /// Global device-level settings.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceSettings {
     /// Current clock source (e.g. "Internal", "AutoSync").
     pub clock_source: String,
@@ -72,10 +76,32 @@ pub struct DeviceSettings {
     /// [`RmeDevice::set_dim`].
     #[serde(default)]
     pub dim: bool,
+    /// Control-room Speaker B switch.
+    #[serde(default)]
+    pub speaker_b: bool,
+    /// Control-room Assign: the Main Out pair, in internal pair order.
+    /// `None` = the unit's own choice.
+    #[serde(default)]
+    pub main_out: Option<usize>,
+    /// Control-room Assign: the Main Out B (Speaker B) pair.
+    #[serde(default)]
+    pub main_b_out: Option<usize>,
+    /// Control-room Mono monitoring option (host-side).
+    #[serde(default)]
+    pub mono: bool,
+    /// Control-room Mute FX option (host-side).
+    #[serde(default)]
+    pub mute_fx: bool,
     /// FX send level in dB (-65..0, None = unset). 0 dB = max send.
     /// `Option` so old scenes (no send) stay untouched on apply.
     #[serde(default)]
     pub fx_send_db: Option<f32>,
+    /// UCX global Reverb block.  `None` on backends without FX.
+    #[serde(default)]
+    pub reverb: Option<Reverb>,
+    /// UCX global Echo block.  `None` on backends without FX.
+    #[serde(default)]
+    pub echo: Option<Echo>,
     /// Stereo width (-1..+1, 0 = normal). Which strip it affects is TBD.
     #[serde(default)]
     pub width: f32,
@@ -84,6 +110,23 @@ pub struct DeviceSettings {
     /// Scene JSON (and scenes from the ALSA backend) still deserialize.
     #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
+    /// UC Gain-tab reference codes.  These are device-owned: read from
+    /// `0x17` and written only when the user changes them.
+    #[serde(default)]
+    pub line_in_ref: u16,
+    /// UCX Line In reference for inputs 5-8 (one shared group).
+    #[serde(default)]
+    pub line_in_ref_58: u16,
+    #[serde(default)]
+    pub line_out_ref: u16,
+    #[serde(default)]
+    pub phones_ref: u16,
+    /// Word-clock output single-speed option (UCX options bit 6).
+    #[serde(default)]
+    pub word_clock_single_speed: bool,
+    /// Word-clock input termination (UCX options bit 3).
+    #[serde(default)]
+    pub word_clock_termination: bool,
     /// Input-strip stereo link mirror, kept in sync by
     /// [`RmeDevice::set_input_link`] so it's readable (the trait itself
     /// only has a setter — this is where the UI reads the current state
@@ -168,6 +211,84 @@ pub trait RmeDevice {
         true
     }
 
+    /// Whether this backend can drive output loopback (`0x15`).  Defaults
+    /// to [`Self::protocol_features`]; the UC/UCX hwdep backend overrides
+    /// it because loopback is a routing feature, not part of the EQ/FX set.
+    fn loopback_supported(&self) -> bool {
+        self.protocol_features()
+    }
+
+    /// Whether the backend can drive the low cut independently of the
+    /// main EQ bypass.  The hwdep UCX path has a dedicated register.
+    fn low_cut_supported(&self) -> bool {
+        false
+    }
+
+    /// Whether this backend can invert a channel's phase.  Defaults to
+    /// [`Self::protocol_features`]; the UC/UCX hwdep backend overrides it
+    /// because the UC stores phase in the matrix sign bit even though it
+    /// has no EQ/FX DSP.
+    fn phase_supported(&self) -> bool {
+        self.protocol_features()
+    }
+
+    /// Whether this backend can drive a hardware-output balance.  The UC
+    /// implements it as unequal left/right output levels (no balance
+    /// register); the UCX backend does not expose it yet.
+    fn output_balance_supported(&self) -> bool {
+        false
+    }
+
+    /// The complete capability set of this connection.  The defaults are
+    /// derived from the individual methods below so existing backends keep
+    /// answering consistently; model-specific backends override this with
+    /// their static profile so the GUI has one guard to consult.
+    fn capabilities(&self) -> DeviceCapabilities {
+        DeviceCapabilities {
+            protocol_features: self.protocol_features(),
+            eq: self.protocol_features(),
+            low_cut: self.low_cut_supported(),
+            loopback: self.loopback_supported(),
+            phase: self.phase_supported(),
+            phase_without_eq: false,
+            output_balance: self.output_balance_supported(),
+            stereo_split: self.stereo_split_supported(),
+            matrix_cells: self.matrix_cells_supported(),
+            class_compliant: self.class_compliant(),
+            input_phantom: true,
+            input_pad: true,
+            input_level: false,
+            input_autoset: false,
+            dynamics: false,
+            fx: false,
+            pitch: true,
+            width: true,
+            ms_proc: true,
+            an12: true,
+            input_link: true,
+            eq_for_record: true,
+            optical_out: true,
+        }
+    }
+
+    /// Whether this backend can toggle a playback pair's stereo split.
+    /// Defaults to [`Self::protocol_features`]; the UCX v1 ALSA backend
+    /// implements the split through its matrix model even though the full
+    /// RME feature set (EQ/FX/trim) is not available yet.
+    fn stereo_split_supported(&self) -> bool {
+        self.protocol_features()
+    }
+
+    /// Whether this card is running the vendor's class-compliant
+    /// personality.  Distinct from [`Self::protocol_features`]: a
+    /// proprietary driver can expose only a v1 subset (our UCX driver:
+    /// routing, gains, mutes, phantom/PAD and clock) while still speaking
+    /// the vendor protocol.  Defaults to `!protocol_features()` for the
+    /// backends where the two coincide (Babyface Pro, mock, USB).
+    fn class_compliant(&self) -> bool {
+        !self.protocol_features()
+    }
+
     /// Whether the device this handle was opened on is still there, and
     /// still the same one. A card that was unplugged (or re-enumerated
     /// under a new card index, e.g. by a personality switch) keeps
@@ -182,6 +303,21 @@ pub trait RmeDevice {
 
     /// Number of physical stereo output pairs on this device.
     fn output_pair_count(&self) -> usize;
+
+    /// Hardware-output display order: each entry is the output-pair index
+    /// shown at that position in the mixer's bottom row.  Defaults to the
+    /// device block order; models whose TotalMix row is ordered differently
+    /// override it.
+    fn output_display_order(&self) -> Vec<usize> {
+        (0..self.output_pair_count()).collect()
+    }
+
+    /// The UC's matrix columns are already in display order (AN1/2
+    /// first, Phones last); the UCX stores them Phones-first.  Used by
+    /// the GUI to keep Matrix labels and routing indices aligned.
+    fn matrix_uses_display_order(&self) -> bool {
+        false
+    }
 
     /// Attempt to detect the device on the ALSA bus and open a mixer handle.
     fn open() -> Result<Self, Error>
@@ -220,6 +356,40 @@ pub trait RmeDevice {
     /// Get the volume (0.0 – 1.0) for a given channel into a specific output pair.
     fn volume(&self, channel: ChannelId, output: usize) -> Result<f32, Error>;
 
+    /// Whether the backend exposes independent mono matrix cells.  The
+    /// UC/UCX hardware matrix is 36 sources × 18 output blocks; other
+    /// backends only have the per-pair channel model.
+    fn matrix_cells_supported(&self) -> bool {
+        false
+    }
+
+    /// Start the input meter tap, if the backend defers it.  The UC's
+    /// meter tap opens the capture PCM, which starts the device engine;
+    /// the startup scene must be written *before* that so the UC latches
+    /// the matrix at engine start.
+    fn begin_metering(&mut self) {}
+
+    /// Gain of one mono matrix cell, `block` 0–17.  `None` when the
+    /// channel has no matrix row.  Default backends answer from the
+    /// per-pair model for the channel's natural side only.
+    fn matrix_cell(&self, channel: ChannelId, block: usize) -> Option<f32> {
+        if block >= self.output_pair_count() * 2 {
+            return None;
+        }
+        self.volume(channel, block / 2).ok()
+    }
+
+    /// Write one mono matrix cell without applying the stereo-pair link.
+    /// Default backends fall back to the pair write.
+    fn set_matrix_cell(
+        &mut self,
+        channel: ChannelId,
+        block: usize,
+        gain: f32,
+    ) -> Result<(), Error> {
+        self.set_volume(channel, block / 2, gain)
+    }
+
     /// Set the pan (-100 .. 100) for a given channel into a specific output pair.
     fn set_pan(&mut self, channel: ChannelId, output: usize, pan: i8) -> Result<(), Error>;
 
@@ -249,6 +419,27 @@ pub trait RmeDevice {
     /// Set the -20dB pad for an input. Errors if the input type has no
     /// pad switch.
     fn set_pad(&mut self, idx: usize, on: bool) -> Result<(), Error>;
+
+    /// Set the Hi-Z instrument switch for an input. Backends without
+    /// such a switch report an error; callers should only offer it when
+    /// `InputChannel::has_instrument` is set.
+    fn set_instrument(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        let _ = (idx, on);
+        Err(Error::InvalidChannel(
+            "Instrument switch is not supported on this backend".into(),
+        ))
+    }
+
+    /// Same linked-pair behaviour as [`Self::set_input_pad`], for the
+    /// instrument switch.
+    fn set_input_instrument(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        self.set_instrument(idx, on)?;
+        let pair = idx / 2;
+        if self.input_pair_linked(pair) {
+            self.set_instrument(idx ^ 1, on)?;
+        }
+        Ok(())
+    }
 
     /// Set the preamp gain (dB, 1 dB steps, see
     /// [`InputChannel::gain_max`]) for an input. Errors if the input
@@ -298,6 +489,60 @@ pub trait RmeDevice {
         Ok(())
     }
 
+    /// Set the three-value input Level (`-10 dBV`, `+4 dBu`, `LoGain`).
+    /// Backends without a Level control fall back to the two-value
+    /// sensitivity switch where one exists.
+    fn set_input_level(&mut self, idx: usize, level: InputLevel) -> Result<(), Error> {
+        match level {
+            InputLevel::Minus10dBV => self.set_sensitivity(idx, Sensitivity::Minus10dBV),
+            InputLevel::Plus4dBu => self.set_sensitivity(idx, Sensitivity::Plus4dBu),
+            InputLevel::LoGain => Err(Error::InvalidChannel(format!(
+                "input {idx} has no LoGain reference level on this backend"
+            ))),
+        }
+    }
+
+    /// AutoSet automatic gain reduction (UCX inputs 1/2).
+    fn set_autoset(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        let _ = (idx, on);
+        Err(Error::InvalidChannel(
+            "AutoSet is not supported on this backend".into(),
+        ))
+    }
+
+    /// Apply a complete Compressor/Expander/Auto Level state to one
+    /// hardware input or output.
+    fn set_dynamics(&mut self, channel: ChannelId, dynamics: &Dynamics) -> Result<(), Error> {
+        let _ = (channel, dynamics);
+        Err(Error::InvalidChannel(
+            "Dynamics are not supported on this backend".into(),
+        ))
+    }
+
+    /// Apply the global Reverb block.
+    fn set_reverb(&mut self, reverb: &Reverb) -> Result<(), Error> {
+        let _ = reverb;
+        Err(Error::InvalidChannel(
+            "Reverb is not supported on this backend".into(),
+        ))
+    }
+
+    /// Apply the global Echo block.
+    fn set_echo(&mut self, echo: &Echo) -> Result<(), Error> {
+        let _ = echo;
+        Err(Error::InvalidChannel(
+            "Echo is not supported on this backend".into(),
+        ))
+    }
+
+    /// Per-output FX Return level in dB (`0xNN03`).
+    fn set_fx_return(&mut self, output: usize, db: f32) -> Result<(), Error> {
+        let _ = (output, db);
+        Err(Error::InvalidChannel(
+            "FX Return is not supported on this backend".into(),
+        ))
+    }
+
     /// Set the sample clock pitch/varispeed in percent (-5..+5, 0 = nominal).
     /// The 0x1B DDS quad shifts the device clock dynamically (the
     /// actual sample rate moves with the pitch).
@@ -324,6 +569,13 @@ pub trait RmeDevice {
         ))
     }
 
+    /// Loopback on one hardware output channel.  The UC can loop each of
+    /// its 18 output blocks independently (`0x15`); backends where the
+    /// control is genuinely per pair keep the pair behavior.
+    fn set_loopback_channel(&mut self, channel: usize, on: bool) -> Result<(), Error> {
+        self.set_loopback(channel / 2, on)
+    }
+
     /// MS-proc engage: mutes the AN2 crosspoints, restores the saved
     /// fader on disengage.
     fn set_ms_proc(&mut self, on: bool) -> Result<(), Error> {
@@ -347,6 +599,42 @@ pub trait RmeDevice {
         let _ = on;
         Err(Error::InvalidChannel(
             "Dim is not supported on this backend".into(),
+        ))
+    }
+
+    /// Control-room Assign: which hardware output pair is the Main Out, in
+    /// internal pair order. `None` leaves the device's own choice alone.
+    /// Measured as bit 1 of the output mode word (`0xNN02`).
+    fn set_main_out(&mut self, pair: Option<usize>) -> Result<(), Error> {
+        let _ = pair;
+        Err(Error::InvalidChannel(
+            "Assign is not supported on this backend".into(),
+        ))
+    }
+
+    /// Control-room Assign for Main Out B: the second monitoring output.
+    /// Measured as the same mode-word bit plus the control-room state word.
+    fn set_main_out_b(&mut self, pair: Option<usize>) -> Result<(), Error> {
+        let _ = pair;
+        Err(Error::InvalidChannel(
+            "Assign is not supported on this backend".into(),
+        ))
+    }
+
+    /// Control-room Mute FX: the control-room outputs' FX return drops to
+    /// silence while held. Measured as a level toggle, not a flag.
+    fn set_mute_fx(&mut self, on: bool) -> Result<(), Error> {
+        let _ = on;
+        Err(Error::InvalidChannel(
+            "Mute FX is not supported on this backend".into(),
+        ))
+    }
+
+    /// Control-room Speaker B switch.
+    fn set_speaker_b(&mut self, on: bool) -> Result<(), Error> {
+        let _ = on;
+        Err(Error::InvalidChannel(
+            "Speaker B is not supported on this backend".into(),
         ))
     }
 
@@ -407,14 +695,25 @@ pub trait RmeDevice {
         self.settings().output_link.get(pair).copied().unwrap_or(true)
     }
 
-    /// Sets whether output pair `pair` is linked. Pure model state — see
-    /// this section's doc comment; no backend needs to override this.
+    /// Sets whether output pair `pair` is linked.  Linking centers the
+    /// pair's balance and uses the left channel's mute state; splitting
+    /// leaves the two output levels as independent mono channels.
     fn set_output_linked(&mut self, pair: usize, linked: bool) -> Result<(), Error> {
-        let v = &mut self.settings_mut().output_link;
-        if v.len() <= pair {
-            v.resize(pair + 1, true);
+        let (left, right) = (pair * 2, pair * 2 + 1);
+        let saved_mute = self.outputs().get(left).map(|o| o.mute);
+        {
+            let v = &mut self.settings_mut().output_link;
+            if v.len() <= pair {
+                v.resize(pair + 1, true);
+            }
+            v[pair] = linked;
         }
-        v[pair] = linked;
+        if linked {
+            if let Some(mute) = saved_mute {
+                self.set_mute(ChannelId::Output(right), mute)?;
+            }
+            self.set_pan(ChannelId::Output(left), 0, 0)?;
+        }
         Ok(())
     }
 
@@ -479,14 +778,52 @@ pub trait RmeDevice {
             .unwrap_or(true)
     }
 
-    /// Sets whether input pair `pair` is linked. Pure model state, same
-    /// as [`Self::set_output_linked`].
+    /// Sets whether input pair `pair` is linked.  Linking uses the left
+    /// channel as the pair's representative; splitting gives the two mono
+    /// channels hard-left and hard-right pans.
     fn set_input_pair_linked(&mut self, pair: usize, linked: bool) -> Result<(), Error> {
-        let v = &mut self.settings_mut().input_pair_link;
-        if v.len() <= pair {
-            v.resize(pair + 1, true);
+        let (left, right) = (pair * 2, pair * 2 + 1);
+        let saved = self.inputs().get(left).cloned();
+        {
+            let v = &mut self.settings_mut().input_pair_link;
+            if v.len() <= pair {
+                v.resize(pair + 1, true);
+            }
+            v[pair] = linked;
         }
-        v[pair] = linked;
+
+        if let Some(saved) = saved {
+            if linked {
+                for output in 0..self.output_pair_count() {
+                    let volume = saved.volumes.get(output).copied().unwrap_or(1.0);
+                    self.set_volume(ChannelId::Input(right), output, volume)?;
+                }
+                self.set_mute(ChannelId::Input(right), saved.mute)?;
+                self.set_solo(ChannelId::Input(right), saved.solo)?;
+                if saved.channel_type == ChannelType::Mic {
+                    self.set_input_phantom(left, saved.phantom)?;
+                }
+                if saved.has_pad {
+                    self.set_input_pad(left, saved.pad)?;
+                }
+                if saved.has_instrument {
+                    self.set_input_instrument(left, saved.instrument)?;
+                }
+                if let Some(gain) = saved.gain {
+                    self.set_input_gain(left, gain)?;
+                }
+            }
+        }
+
+        for output in 0..self.output_pair_count() {
+            if linked {
+                self.set_pan(ChannelId::Input(left), output, 0)?;
+                self.set_pan(ChannelId::Input(right), output, 0)?;
+            } else {
+                self.set_pan(ChannelId::Input(left), output, -100)?;
+                self.set_pan(ChannelId::Input(right), output, 100)?;
+            }
+        }
         Ok(())
     }
 
@@ -556,7 +893,31 @@ pub trait RmeDevice {
     /// Sets whether playback pair `pair` is linked — the inverse of
     /// [`Self::set_stereo_split`], which already writes both channels.
     fn set_playback_linked(&mut self, pair: usize, linked: bool) -> Result<(), Error> {
-        self.set_stereo_split(pair * 2, !linked)
+        let (left, right) = (pair * 2, pair * 2 + 1);
+        let saved = self.playbacks().get(left).cloned();
+        self.set_stereo_split(pair * 2, !linked)?;
+
+        if linked {
+            if let Some(saved) = saved {
+                for output in 0..self.output_pair_count() {
+                    let volume = saved.volumes.get(output).copied().unwrap_or(1.0);
+                    self.set_volume(ChannelId::Playback(right), output, volume)?;
+                }
+                self.set_mute(ChannelId::Playback(right), saved.mute)?;
+                self.set_solo(ChannelId::Playback(right), saved.solo)?;
+            }
+        }
+
+        for output in 0..self.output_pair_count() {
+            if linked {
+                self.set_pan(ChannelId::Playback(left), output, 0)?;
+                self.set_pan(ChannelId::Playback(right), output, 0)?;
+            } else {
+                self.set_pan(ChannelId::Playback(left), output, -100)?;
+                self.set_pan(ChannelId::Playback(right), output, 100)?;
+            }
+        }
+        Ok(())
     }
 
     /// Sets playback pair `pair`'s volume (into submix `output`),
@@ -620,9 +981,20 @@ pub trait RmeDevice {
         ))
     }
 
-    /// FX send level in dB (-65..0, 0 = max send).
+    /// FX send level in dB (-65..0, 0 = max send). The backends whose send
+    /// is a single global control (Babyface Pro's ALSA "FX Send") use this
+    /// one; per-channel backends implement [`Self::set_channel_fx_send`].
     fn set_fx_send(&mut self, db: f32) -> Result<(), Error> {
         let _ = db;
+        Err(Error::InvalidChannel(
+            "FX send is not supported on this backend".into(),
+        ))
+    }
+
+    /// Per-channel FX send level in dB (-65..0, 0 = max send). Inputs write
+    /// `NN01` in 0.1 dB; playbacks write the `0x47A0` family linearly.
+    fn set_channel_fx_send(&mut self, channel: ChannelId, db: f32) -> Result<(), Error> {
+        let _ = (channel, db);
         Err(Error::InvalidChannel(
             "FX send is not supported on this backend".into(),
         ))
@@ -703,6 +1075,14 @@ pub trait RmeDevice {
         ))
     }
 
+    /// Enable/disable the low-cut filter independently of the main EQ.
+    fn set_eq_low_cut_enabled(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        let _ = (idx, on);
+        Err(Error::InvalidChannel(
+            "low cut is not supported on this backend".into(),
+        ))
+    }
+
     /// Set the low-cut filter's corner frequency (20-20000 Hz).
     fn set_eq_low_cut_freq(&mut self, idx: usize, freq_hz: u16) -> Result<(), Error> {
         let _ = (idx, freq_hz);
@@ -716,6 +1096,16 @@ pub trait RmeDevice {
         let _ = (idx, slope_db_oct);
         Err(Error::InvalidChannel(
             "EQ is not supported on this backend".into(),
+        ))
+    }
+
+    /// Apply a complete EQ/low-cut state to one hardware output.  Backends
+    /// without output DSP leave this unsupported; the GUI only shows the
+    /// EQ trigger when `OutputChannel::eq` is `Some`.
+    fn set_output_eq(&mut self, idx: usize, eq: &InputEq) -> Result<(), Error> {
+        let _ = (idx, eq);
+        Err(Error::InvalidChannel(
+            "output EQ is not supported on this backend".into(),
         ))
     }
 

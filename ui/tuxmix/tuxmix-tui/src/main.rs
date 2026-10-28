@@ -70,6 +70,9 @@ impl RmeDevice for DeviceHandle {
     fn protocol_features(&self) -> bool {
         delegate!(self, protocol_features)
     }
+    fn loopback_supported(&self) -> bool {
+        delegate!(self, loopback_supported)
+    }
     fn is_connected(&self) -> bool {
         delegate!(self, is_connected)
     }

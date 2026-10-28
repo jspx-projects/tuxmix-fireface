@@ -184,6 +184,8 @@ fn eq_band_type_to_enum(t: EqBandType) -> u32 {
         EqBandType::Bell => 1,
         EqBandType::LowShelf => 2,
         EqBandType::HighShelf => 3,
+        // The Babyface Pro's own enum has no low-pass entry; keep it a shelf.
+        EqBandType::LowPass => 3,
     }
 }
 
@@ -1081,6 +1083,10 @@ impl BabyfacePro {
             if let Some(selem) = self.mixer.find_selem(&format!("{strip} EQ Low Cut Freq"), 0) {
                 if let Ok(v) = selem.get_playback_volume(mono) {
                     eq.low_cut_freq_hz = v.clamp(0, 20_000) as u16;
+                    // The Babyface ALSA surface has no separate low-cut
+                    // enable; keep the plot showing it rather than
+                    // pretending it is off.
+                    eq.low_cut_enabled = true;
                 }
             }
             if let Some(selem) = self.mixer.find_selem(&format!("{strip} EQ Low Cut Slope"), 0) {
@@ -1263,8 +1269,11 @@ impl RmeDevice for BabyfacePro {
         // `capture_meter::INPUT_FOR_CAPTURE` therefore maps them straight
         // onto the input strips. See `capture_meter`'s module doc comment
         // for the live mapping.
-        let capture_meter =
-            crate::capture_meter::CaptureMeter::start(mixer.card_name(), 48_000);
+        let capture_meter = crate::capture_meter::CaptureMeter::start(
+            mixer.card_name(),
+            48_000,
+            crate::capture_meter::CAPTURE_CHANNELS,
+        );
         if capture_meter.is_none() {
             log::warn!("Could not open the capture PCM for input level metering; meters will read N/A");
         }
@@ -1290,9 +1299,22 @@ impl RmeDevice for BabyfacePro {
                 eq_for_record: false,
                 optical_out_spdif: false,
                 dim: false,
+                speaker_b: false,
+                main_out: None,
+                main_b_out: None,
+                mono: false,
+                mute_fx: false,
                 fx_send_db: None,
+                reverb: None,
+                echo: None,
                 width: 0.0,
                 sample_rate: 48_000,
+                line_in_ref: 0,
+                line_in_ref_58: 0,
+                line_out_ref: 2,
+                phones_ref: 1,
+                word_clock_single_speed: false,
+                word_clock_termination: false,
                 input_link: true,
                 output_link: Vec::new(),
                 input_pair_link: Vec::new(),
@@ -2161,6 +2183,7 @@ impl RmeDevice for BabyfacePro {
         Scene {
             name: "Untitled".into(),
             model: self.canonical_model().to_string(),
+            matrix_overrides: Vec::new(),
             inputs: self.inputs.clone(),
             playbacks: self.playbacks.clone(),
             outputs: self.outputs.clone(),

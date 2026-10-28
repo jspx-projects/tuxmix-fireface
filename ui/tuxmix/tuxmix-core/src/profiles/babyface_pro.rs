@@ -85,4 +85,32 @@ pub const PROFILE: DeviceProfile = DeviceProfile {
             right: "ADAT8",
         },
     ],
+    // Babyface Pro software playback follows the output order.
+    playback_pairs: &[
+        OutputPairSpec {
+            left: "AN1",
+            right: "AN2",
+        },
+        OutputPairSpec {
+            left: "PH3",
+            right: "PH4",
+        },
+        OutputPairSpec {
+            left: "AS1",
+            right: "AS2",
+        },
+        OutputPairSpec {
+            left: "ADAT3",
+            right: "ADAT4",
+        },
+        OutputPairSpec {
+            left: "ADAT5",
+            right: "ADAT6",
+        },
+        OutputPairSpec {
+            left: "ADAT7",
+            right: "ADAT8",
+        },
+    ],
+    output_order: &[0, 1, 2, 3, 4, 5],
 };

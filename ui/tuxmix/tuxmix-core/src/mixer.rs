@@ -65,6 +65,43 @@ impl AlsaMixer {
         }
     }
 
+    /// Open the card whose short name is exactly `model` (e.g.
+    /// "Fireface UC", not "Fireface UCX").  Used by the UC profile,
+    /// whose name is a prefix of the UCX's.
+    pub fn open_by_card_exact(model: &str) -> Result<Self, Error> {
+        match Self::resolve_card_exact(model) {
+            Some((card_name, name)) => {
+                info!("Detected target device: {} ({})", name, card_name);
+                let mixer = Mixer::new(&card_name, false)?;
+                let _ = mixer.find_selem(&SelemId::new("", 0));
+                Ok(Self { mixer, card_name })
+            }
+            None => Err(Error::DeviceNotFound {
+                model: model.to_string(),
+            }),
+        }
+    }
+
+    /// Exact-name scan counterpart of `resolve_card`.
+    pub(crate) fn resolve_card_exact(model: &str) -> Option<(String, String)> {
+        for (card_idx, _name) in &read_card_list() {
+            let card_name = format!("hw:{}", card_idx);
+            let ctl = match Ctl::new(&card_name, false) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let info = match ctl.card_info() {
+                Ok(i) => i,
+                Err(_) => continue,
+            };
+            let name = info.get_name().unwrap_or_default().to_string();
+            if name == model {
+                return Some((card_name, name));
+            }
+        }
+        None
+    }
+
     /// The scan half of `open_by_card_name`, opening nothing: the
     /// `(card_name, card_info_name)` of the first card whose name
     /// contains `card_substring`. Kept quiet on purpose: this is what the

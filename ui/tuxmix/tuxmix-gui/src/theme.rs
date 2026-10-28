@@ -16,16 +16,14 @@ use iced::{Background, Border, Color, Shadow};
 // see the reference-totalmix-ui-assets memory) and read as a different
 // product than the icon on the taskbar.
 pub const BG_DEEP: Color = Color::from_rgb8(0x0e, 0x0e, 0x10);
-/// Card and control surface: the icon's tile black, lifted just enough
-/// to sit in UI range.
-pub const SURFACE: Color = Color::from_rgb8(0x1a, 0x1b, 0x1e);
-/// The fill under the cursor. Every hover in the app used to borrow a
-/// palette color that meant something else (the orange accent, a muted
-/// channel hue); this one means nothing but "here".
-pub const SURFACE_HI: Color = Color::from_rgb8(0x26, 0x27, 0x2b);
-/// Hairlines: one step above `SURFACE`, so a card reads as an object
-/// without a heavy outline.
-pub const BORDER: Color = Color::from_rgb8(0x30, 0x31, 0x36);
+/// Standard channel-strip surface.
+pub const SURFACE: Color = Color::from_rgb8(0x24, 0x25, 0x2a);
+/// Hover surface for controls and strips.
+pub const SURFACE_HI: Color = Color::from_rgb8(0x2d, 0x2e, 0x33);
+/// Active input, playback, and selected output strip surface.
+pub const SUBMIX_ACTIVE: Color = Color::from_rgb8(0x3a, 0x3b, 0x42);
+/// Hairlines and card borders.
+pub const BORDER: Color = Color::from_rgb8(0x36, 0x37, 0x3d);
 /// The mark's white, softened a touch for body text.
 pub const TEXT_PRIMARY: Color = Color::from_rgb8(0xf2, 0xf3, 0xf5);
 /// The mark's own silver (`#b4b4b4` in the icon's gradient), dimmed one
@@ -43,13 +41,22 @@ pub const ACCENT_DIM: Color = Color::from_rgb8(0x37, 0x38, 0x3e);
 pub const FADER: Color = Color::from_rgb8(0xc9, 0xcb, 0xd1);
 pub const MGREEN: Color = Color::from_rgb8(0x3d, 0xd6, 0x8c);
 pub const MRED: Color = Color::from_rgb8(0xe5, 0x48, 0x4d);
-/// 48V lights like every other engaged toggle.
-pub const PHANTOM: Color = ACCENT;
+/// 48V uses its own orange so phantom power is distinct from the
+/// white "engaged" toggles around it.
+pub const PHANTOM: Color = Color::from_rgb8(0xff, 0x9f, 0x43);
 pub const GCONN: Color = Color::from_rgb8(0x3d, 0xd6, 0x8c);
 /// Amber: attention without alarm - the Simulated / Class Compliant
 /// chip, solo, warnings that are not failures.
 pub const YSIM: Color = Color::from_rgb8(0xf0, 0xb4, 0x29);
 pub const MUTE_COLOR: Color = Color::from_rgb8(0x3d, 0x9d, 0xf6);
+
+/// Knob-rim colours: a shade under the button accents, so the arc reads as a
+/// colour against a dark strip instead of washing out next to the value text.
+pub const KNOB_BLUE: Color = Color::from_rgb8(0x2f, 0x7a, 0xc4);
+/// The knob's face: a step darker than `SURFACE`, so the rim and arc read as
+/// colour on the strip card instead of merging into it.
+pub const KNOB_FACE: Color = Color::from_rgb8(0x1a, 0x1b, 0x1f);
+pub const KNOB_GREEN: Color = Color::from_rgb8(0x2f, 0xa8, 0x6e);
 /// Band identity in the EQ panel, matching the three columns and their
 /// handles in the response plot. These reuse the palette's red/green/
 /// azure, but inside the EQ they mean band 1/2/3, not clip/signal/mute.
@@ -129,6 +136,9 @@ pub const RADIUS_MD: f32 = 10.0;
 /// → M/S → 48V/PAD → fader → dB → pan) and between a pan dot and its
 /// label — these read as one continuous unit, not separate rows.
 pub const SPACE_HAIRLINE: f32 = 1.0;
+/// Standard layout gap between a knob box and its label.  The knob widget
+/// adds its own transparent margin, so the visible gap is slightly larger.
+pub const KNOB_LABEL_GAP: f32 = SPACE_HAIRLINE;
 /// Between closely related inline siblings: a channel name and its type
 /// tag, the M/S button pair, a matrix cell grid, the MIXER/MATRIX toggle.
 pub const SPACE_TIGHT: f32 = 2.0;
@@ -137,6 +147,10 @@ pub const SPACE_SM: f32 = 4.0;
 /// Strip card padding, strip-to-strip gaps, a chip's internal row
 /// spacing.
 pub const SPACE_MD: f32 = 6.0;
+/// Minimum gap between an inline slideout's absolute edge and its
+/// contents.  Slightly wider than `SPACE_MD` so labels and focus rings
+/// never touch the panel edge.
+pub const FLYOUT_PAD: f32 = 8.0;
 /// Section-level spacing: the gap between HARDWARE INPUTS / SOFTWARE
 /// PLAYBACK / HARDWARE OUTPUTS blocks, a section header's own row.
 pub const SPACE_LG: f32 = 8.0;
@@ -151,6 +165,27 @@ pub const SPACE_XXL: f32 = 16.0;
 /// against it (`sidebar::title_row`), so the two read as one header line.
 pub const TOP_BAR_H: f32 = 48.0;
 
+/// A slideout card that visually merges with the active tab on its left.
+/// No border: the tab background and the panel background are the same
+/// surface, and the panel overlaps the strip's right padding by the tab's
+/// width offset.  The outer surface still separates it from the window.
+pub fn panel_attached(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SURFACE)),
+        // Invisible border (same colour as the background) but the radius
+        // still shapes the surface, giving the slideout the channel strips'
+        // rounded top corners without drawing a line at the tab join.
+        border: Border {
+            color: SURFACE,
+            width: 1.0,
+            radius: RADIUS_MD.into(),
+        },
+        text_color: Some(TEXT_PRIMARY),
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
 pub fn panel(_theme: &iced::Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(SURFACE)),
@@ -162,6 +197,28 @@ pub fn panel(_theme: &iced::Theme) -> container::Style {
         text_color: Some(TEXT_PRIMARY),
         shadow: Shadow::default(),
         snap: false,
+    }
+}
+
+/// The FX column's header band: the panel surface lifted one step, so the
+/// effect name and its on switch read as that panel's title bar. TotalMix
+/// draws the same three-step relationship inside one FX panel — lightest
+/// header, darker controls, mid-tone tail.
+pub fn fx_header(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SURFACE_HI)),
+        text_color: Some(TEXT_PRIMARY),
+        ..container::Style::default()
+    }
+}
+
+/// The FX column's controls band, recessed a step below its header so the
+/// knobs sit in a well rather than on the same surface as the title.
+pub fn fx_controls(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(blend(SURFACE, BG_DEEP, 0.45))),
+        text_color: Some(TEXT_PRIMARY),
+        ..container::Style::default()
     }
 }
 
@@ -233,6 +290,7 @@ pub fn strip_panel(
     selected: bool,
     hovered: bool,
     tint: Option<Color>,
+    active_surface: bool,
 ) -> impl Fn(&iced::Theme) -> container::Style {
     move |theme| {
         let base = panel(theme);
@@ -242,6 +300,22 @@ pub fn strip_panel(
                 ..base
             },
             None => base,
+        };
+        // The selected hardware-output/submix strip sits one step lighter
+        // than every other strip (TotalMix makes the current submix
+        // obvious the same way).  It is a background cue, independent of
+        // the accent border used for a Ctrl/Shift multi-selection.
+        let base = if active_surface {
+            container::Style {
+                background: Some(Background::Color(SUBMIX_ACTIVE)),
+                border: Border {
+                    color: blend(BORDER, FADER, 0.35),
+                    ..base.border
+                },
+                ..base
+            }
+        } else {
+            base
         };
         if selected {
             container::Style {
@@ -322,6 +396,100 @@ pub fn toggle_button(
 ) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
     armed_toggle_button(active, false, active_color)
 }
+
+/// Shared outline switch: when engaged the text and border take `color`
+/// while the face stays dark, so it reads as a state outline rather than a
+/// filled pill.
+fn outline_toggle(
+    active: bool,
+    color: Color,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        let pressed = matches!(status, button::Status::Pressed);
+        let mut background = if hovered { SURFACE_HI } else { BG_DEEP };
+        if pressed {
+            background = blend(background, Color::BLACK, PRESS_DARKEN);
+        }
+        button::Style {
+            background: Some(Background::Color(background)),
+            text_color: if matches!(status, button::Status::Disabled) {
+                Color { a: 0.4, ..TEXT_SEC }
+            } else if active {
+                color
+            } else {
+                TEXT_SEC
+            },
+            border: Border {
+                color: if active {
+                    color
+                } else if hovered {
+                    FADER
+                } else {
+                    BORDER
+                },
+                width: 1.0,
+                radius: RADIUS_SM.into(),
+            },
+            shadow: Shadow::default(),
+            snap: false,
+        }
+    }
+}
+
+/// The 48 V switch is an outline, not a filled button: when engaged the
+/// border and label turn orange, while the face stays dark.  This keeps
+/// phantom power distinct without making a bright block in the strip.
+pub fn phantom_button(active: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    outline_toggle(active, PHANTOM)
+}
+
+/// Phase is an outline switch, not a filled toggle: when engaged the text
+/// and border turn green while the face stays dark, so a phase-inverted
+/// channel reads as a signal-state warning rather than another bright pill.
+pub fn phase_button(active: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    outline_toggle(active, MGREEN)
+}
+
+/// The STEREO link switch uses the same orange outline as the 48 V switch
+/// when the pair is engaged.
+pub fn stereo_button(active: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    outline_toggle(active, PHANTOM)
+}
+
+/// A bare glyph button for the strip's settings gear.  It keeps the
+/// original button's hit area and size but drops the filled pill, border
+/// and shadow, so the gear reads as an icon rather than a labelled control.
+/// An icon-only tab (Settings / Trim / EQ).  When its slideout is open the
+/// glyph sits on the same dark surface as the panel, so the tab reads as
+/// attached to the panel on its right.  `lit` keeps a non-open state (EQ
+/// enabled, Trim non-zero) visible as an accent glyph without the box.
+pub fn panel_tab(active: bool, lit: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        // The rectangle is the tab of the open slideout: show it only while
+        // that slideout is visible.  Hover changes the glyph, not the box.
+        let background = if active {
+            Some(Background::Color(SURFACE))
+        } else {
+            None
+        };
+        button::Style {
+            background,
+            text_color: if active || lit || hovered {
+                ACCENT
+            } else {
+                TEXT_SEC
+            },
+            // No border: the active tab's surface must merge with the
+            // borderless attached panel it opens.
+            border: Border::default(),
+            shadow: Shadow::default(),
+            snap: false,
+        }
+    }
+}
+
 
 /// `toggle_button` with a third, "armed" state: off right now, but set to
 /// come back. A channel's M (or S) whose mute (solo) the sidebar's Mute
@@ -677,6 +845,22 @@ pub fn accent_bar(_theme: &iced::Theme) -> container::Style {
 /// A recessed group container — used to visually cluster related top-bar
 /// controls (e.g. the scene name/save/load trio) against the flatter
 /// top-bar background.
+/// Background used when a knob label is deliberately overlapped with the
+/// unused bottom margin of its knob.
+pub fn label_backdrop(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(SURFACE)),
+        border: Border {
+            color: Color { a: 0.0, ..SURFACE },
+            width: 0.0,
+            radius: 2.0.into(),
+        },
+        text_color: Some(TEXT_PRIMARY),
+        shadow: Shadow::default(),
+        snap: false,
+    }
+}
+
 pub fn chip(_theme: &iced::Theme) -> container::Style {
     container::Style {
         background: Some(Background::Color(BG_DEEP)),
@@ -743,6 +927,15 @@ pub fn thin_scrollbar() -> iced::widget::scrollable::Scrollbar {
     iced::widget::scrollable::Scrollbar::new()
         .width(4)
         .scroller_width(4)
+}
+
+/// A scrollbar with no visible rail or scroller.  Slideout panels use it so
+/// a wheel can still reach clipped content at extreme zoom without ever
+/// drawing a scrollbar inside the panel.
+pub fn hidden_scrollbar() -> iced::widget::scrollable::Scrollbar {
+    iced::widget::scrollable::Scrollbar::new()
+        .width(0)
+        .scroller_width(0)
 }
 
 /// A thin, minimal scrollbar rail — the scroller brightens on hover/drag

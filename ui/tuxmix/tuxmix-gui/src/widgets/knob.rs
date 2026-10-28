@@ -56,6 +56,11 @@ pub struct Knob<Message> {
     /// range has a centered default — `false` for gain/freq/Q/low-cut,
     /// where TotalMix draws just the plain tick.
     pub arc_from_center: bool,
+    /// Draws the part of the rim between the minimum and the current value
+    /// in this color.  `None` leaves the normal neutral rim; the input gain
+    /// knob uses the 48 V orange so its position reads at a glance without
+    /// tinting the text or filling the face.
+    pub level_arc_color: Option<Color>,
     /// `false` renders a dimmed, inert knob that ignores all mouse
     /// input — for a slot the reference visually has a knob in, but
     /// `tuxmix-core`/`tuxmix-usb` has no real control backing yet (e.g.
@@ -243,6 +248,7 @@ impl<Message> canvas::Program<Message> for Knob<Message> {
                     *display = MeterFrame {
                         prev: display.at(*now),
                         value: self.value,
+                        peak: self.value,
                         since: *now,
                     };
                 }
@@ -279,7 +285,13 @@ impl<Message> canvas::Program<Message> for Knob<Message> {
             display_value.to_bits().hash(&mut h);
             self.label.hash(&mut h);
             self.scale.to_bits().hash(&mut h);
-            (state.dragging, self.interactive, self.arc_from_center).hash(&mut h);
+            (
+                state.dragging,
+                self.interactive,
+                self.arc_from_center,
+                self.level_arc_color.is_some(),
+            )
+                .hash(&mut h);
             (bounds.width.to_bits(), bounds.height.to_bits()).hash(&mut h);
             h.finish()
         };
@@ -310,9 +322,9 @@ impl<Message> canvas::Program<Message> for Knob<Message> {
             // readable — one visual state to reason about, not two.
             const DRAG_LIGHTEN: f32 = 0.18;
             let face_color = if state.dragging {
-                theme::blend(theme::SURFACE, Color::WHITE, DRAG_LIGHTEN)
+                theme::blend(theme::KNOB_FACE, Color::WHITE, DRAG_LIGHTEN)
             } else {
-                theme::SURFACE
+                theme::KNOB_FACE
             };
             frame.fill(&Path::circle(center, radius.max(1.0)), face_color);
             frame.stroke(
@@ -321,6 +333,55 @@ impl<Message> canvas::Program<Message> for Knob<Message> {
                     .with_color(Color { a: dim, ..theme::BORDER })
                     .with_width(border_w),
             );
+
+            // Range track: the full knob sweep, always present while the
+            // control is live.  The value arc below is drawn on top of it,
+            // so the setting is read relative to the whole range instead
+            // of as a floating mark.  (User guideline: every knob has the
+            // circle segment.)
+            if self.interactive {
+                let start_angle = angle_of(0.0).0;
+                let end_angle = angle_of(1.0).0;
+                frame.stroke(
+                    &Path::new(|b| {
+                        b.arc(canvas::path::Arc {
+                            center,
+                            radius,
+                            start_angle: Radians(start_angle),
+                            end_angle: Radians(end_angle),
+                        })
+                    }),
+                    Stroke::default()
+                        .with_color(Color {
+                            a: 0.22,
+                            ..theme::TEXT_SEC
+                        })
+                        .with_width(2.0 * self.scale),
+                );
+            }
+
+            // Value arc along the rim: the turned part of the outline.
+            // A centered arc (balance/pan) uses the same color but starts at
+            // 12 o'clock, so the minimum-to-value arc is skipped there.
+            if let Some(color) = self.level_arc_color {
+                if self.interactive && !self.arc_from_center && t > 0.0 {
+                    let start_angle = angle_of(0.0).0;
+                    let end_angle = angle_of(t).0;
+                    frame.stroke(
+                        &Path::new(|b| {
+                            b.arc(canvas::path::Arc {
+                                center,
+                                radius,
+                                start_angle: Radians(start_angle),
+                                end_angle: Radians(end_angle),
+                            })
+                        }),
+                        Stroke::default()
+                            .with_color(Color { a: dim, ..color })
+                            .with_width(2.0 * self.scale),
+                    );
+                }
+            }
 
             // Orange arc from the centered (t=0.5) position round to the
             // current value — the real TotalMix pan-knob signature (see
@@ -345,7 +406,9 @@ impl<Message> canvas::Program<Message> for Knob<Message> {
                             end_angle: Radians(end_angle),
                         })
                     }),
-                    Stroke::default().with_color(theme::ACCENT).with_width(2.5 * self.scale),
+                    Stroke::default()
+                        .with_color(self.level_arc_color.unwrap_or(theme::ACCENT))
+                        .with_width(2.5 * self.scale),
                 );
             }
 
@@ -368,12 +431,22 @@ impl<Message> canvas::Program<Message> for Knob<Message> {
             );
 
             // Value label, centered in the face — the knob doubles as its own
-            // readout instead of a separate text element below it.
+            // readout instead of a separate text element below it.  Short
+            // values (gain, pan, trim) fill most of the face; longer EQ
+            // frequencies step down so they still fit inside the rim.
+            let label_chars = self.label.chars().count();
+            let label_size = if label_chars <= 4 {
+                15.0
+            } else if label_chars <= 6 {
+                11.0
+            } else {
+                9.5
+            };
             frame.fill_text(canvas::Text {
                 content: self.label.clone(),
                 position: center,
                 color: Color { a: dim, ..theme::TEXT_PRIMARY },
-                size: (theme::TEXT_MICRO * self.scale).into(),
+                size: (label_size * self.scale).into(),
                 align_x: text::Alignment::Center,
                 align_y: alignment::Vertical::Center,
                 ..canvas::Text::default()
@@ -385,19 +458,12 @@ impl<Message> canvas::Program<Message> for Knob<Message> {
 
     fn mouse_interaction(
         &self,
-        state: &State,
-        bounds: Rectangle,
-        cursor: mouse::Cursor,
+        _state: &State,
+        _bounds: Rectangle,
+        _cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        if !self.interactive {
-            mouse::Interaction::None
-        } else if state.dragging {
-            mouse::Interaction::Grabbing
-        } else if cursor.is_over(bounds) {
-            mouse::Interaction::Grab
-        } else {
-            mouse::Interaction::None
-        }
+        // Same as the fader: no grab hand over the controls.
+        mouse::Interaction::None
     }
 }
 
@@ -425,6 +491,7 @@ mod tests {
             range,
             label: String::new(),
             arc_from_center: false,
+            level_arc_color: None,
             interactive: true,
             log_scale,
             modifiers: Modifiers::default(),

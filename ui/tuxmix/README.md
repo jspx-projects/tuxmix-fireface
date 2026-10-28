@@ -37,7 +37,11 @@ paru -S tuxmix        # Arch, CachyOS
 
 Other distributions: `cargo build --release`, see the
 [guide](docs/guide.md#building-from-source).
-Try it without hardware: `tuxmix --mock`.
+Try it without hardware: `tuxmix --mock` simulates a Babyface Pro FS,
+`tuxmix --mock-ucx` a Fireface UCX and `tuxmix --mock-uc` a Fireface UC. Each
+one brings the panels its unit really has — the UCX adds EQ, dynamics, FX and
+the Control Room; the UC shows the gated set. All three are also selectable in
+the Device picker.
 
 ## Learn more
 
