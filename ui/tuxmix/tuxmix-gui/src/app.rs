@@ -4039,6 +4039,27 @@ fn needs_protocol_features(message: &Message) -> bool {
     )
 }
 
+/// Select a strip the way a plain click does.  The strip's own controls
+/// (mute, solo, the flyout buttons, the fader, the knobs) call this too, so
+/// a click anywhere on a channel selects it; on a hardware output it also
+/// shows that output's submix.  A strip that is already part of a
+/// multi-selection keeps the selection, so group edits still work.
+fn select_strip(state: &mut TuxMix, cid: ChannelId) {
+    state.focus_channel = Some(cid);
+    if !state.selected.contains(&cid) {
+        state.selected.clear();
+        state.selected.insert(cid);
+    }
+    state.select_anchor = Some(cid);
+    if let ChannelId::Output(i) = cid {
+        state.sel_out = if state.device.outputs_one_per_pair() {
+            i
+        } else {
+            i / 2
+        };
+    }
+}
+
 pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
     // The Assign cards close as soon as the user does anything else: a
     // click outside them, a strip, a fader, a sidebar control — all arrive
@@ -4570,6 +4591,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
         }
         Message::Mute(cid, m) => {
+            select_strip(state, cid);
             // `propagation_set` covers both the pre-existing multi-select
             // case and (new) any mute-linked group `cid` belongs to.
             set_channel_mute(state, cid, m);
@@ -4580,6 +4602,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
         }
         Message::Solo(cid, s) => {
+            select_strip(state, cid);
             set_channel_solo(state, cid, s);
             notify_osc(state, OscOutbound::Solo(cid, s));
             for other in propagation_set(state, cid, sidebar::GroupLink::Solo) {
@@ -4654,6 +4677,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             notify_osc_bool(state, format!("/input/{idx}/autoset"), on);
         }
         Message::Gain(idx, g) => {
+            select_strip(state, ChannelId::Input(idx));
             if let Err(e) = state.device.set_input_gain(idx, g) {
                 fail(state, "set_input_gain", &e);
             }
@@ -4967,6 +4991,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             apply_reset_mix(state, kind);
         }
         Message::FxSendChanged(cid, db) => {
+            select_strip(state, cid);
             if let Err(e) = state.device.set_channel_fx_send(cid, db) {
                 fail(state, "set_channel_fx_send", &e);
             }
@@ -4974,6 +4999,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             notify_osc_raw(state, format!("/{kind}/{id}/fx_send"), vec![OscType::Float(db)]);
         }
         Message::FxReturnChanged(out, db) => {
+            select_strip(state, ChannelId::Output(out));
             if let Err(e) = state.device.set_fx_return(out, db) {
                 fail(state, "set_fx_return", &e);
             }
@@ -5078,6 +5104,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             notify_osc_bool(state, "/word_clock_single_speed", on);
         }
         Message::CueChanged(cid, on) => {
+            select_strip(state, cid);
             if let ChannelId::Output(idx) = cid {
                 if let Err(e) = state.device.set_cue(idx / 2, on) {
                     fail(state, "set_cue", &e);
@@ -5094,6 +5121,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
         }
         Message::VolumeChanged(cid, out, v) => {
+            select_strip(state, cid);
             apply_grouped_volume(state, cid, out, v);
         }
         Message::MatrixCellChanged(cid, block, v) => {
@@ -5130,6 +5158,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             state.last_activity = Instant::now();
         }
         Message::FaderPressed(cid, out, v, range) => {
+            select_strip(state, cid);
             if let Some((lo, hi)) = range {
                 state.drag_range = Some((cid, lo, hi));
             }
@@ -5160,9 +5189,11 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
         }
         Message::PanChanged(cid, out, pan) => {
+            select_strip(state, cid);
             apply_grouped_pan(state, cid, out, pan);
         }
         Message::PanReset(cid, out) => {
+            select_strip(state, cid);
             if state.selected.len() > 1 && state.selected.contains(&cid) {
                 for sel in state.selected.clone() {
                     if let Err(e) = state.device.set_pan(sel, out, 0) {
@@ -5178,6 +5209,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
         }
         Message::ToggleCollapse(cid) => {
+            select_strip(state, cid);
             let target = !state.collapsed.contains(&cid);
             if state.selected.len() > 1 && state.selected.contains(&cid) {
                 // Uniform target for the whole group — the opposite of
@@ -5192,6 +5224,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
         }
         Message::ToggleFlyout(cid, kind) => {
+            select_strip(state, cid);
             let now = Instant::now();
             if state.flyout_open.contains(&(cid, kind)) {
                 begin_flyout_close(state, cid, kind, now);
@@ -5246,19 +5279,9 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 if state.select_anchor.is_none() {
                     state.select_anchor = Some(cid);
                 }
-            } else if let ChannelId::Output(i) = cid {
-                // Clicking a hardware OUTPUT strip selects that output's
-                // submix (TotalMix behavior) — the input/playback strips
-                // then show their faders INTO this output. The output
-                // layout depends on the backend: the USB path is ONE
-                // channel per submix pair (index == pair), while the
-                // ALSA/profile path is two channels per pair (`2*i` /
-                // `2*i+1` in `build_outputs`).
-                state.sel_out = if state.device.outputs_one_per_pair() {
-                    i
-                } else {
-                    i / 2
-                };
+            } else {
+                // Plain click: this strip becomes the selection.
+                select_strip(state, cid);
             }
         }
         Message::ClearSelection => {
@@ -5267,6 +5290,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         }
         Message::StripHovered(h) => state.hovered_strip = h,
         Message::EditStart(cid, buf) => {
+            select_strip(state, cid);
             state.editing = Some(cid);
             state.edit_buf = buf;
             state.field_opening = true;
@@ -5471,6 +5495,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             };
         }
         Message::RenameStart(cid) => {
+            select_strip(state, cid);
             // Opening another strip's name accepts the one being typed.
             if state.renaming.is_some_and(|open| open != cid) {
                 let _ = update(state, Message::RenameCommit);
@@ -12667,5 +12692,59 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+
+    // A click anywhere on a channel selects it; on a hardware output it
+    // also shows that output's submix — including clicks on the strip's
+    // own controls, which used to consume the press without selecting.
+    #[test]
+    fn a_plain_click_selects_the_strip_and_shows_its_submix() {
+        let mut state = new(true, None, None);
+        state.sel_out = 0;
+        let out = state.device.outputs().len() - 1;
+        let cid = ChannelId::Output(out);
+        let _ = update(&mut state, Message::StripClicked(cid));
+        assert!(state.selected.contains(&cid));
+        assert_eq!(state.focus_channel, Some(cid));
+        assert_eq!(
+            state.sel_out,
+            if state.device.outputs_one_per_pair() { out } else { out / 2 }
+        );
+    }
+
+    #[test]
+    fn a_strip_control_click_selects_the_strip_and_shows_its_submix() {
+        let mut state = new(true, None, None);
+        state.sel_out = 0;
+        let out = state.device.outputs().len() - 1;
+        let cid = ChannelId::Output(out);
+        let _ = update(&mut state, Message::ToggleFlyout(cid, strip::FlyoutKind::Settings));
+        assert_eq!(state.focus_channel, Some(cid));
+        assert!(state.selected.contains(&cid));
+        assert_eq!(
+            state.sel_out,
+            if state.device.outputs_one_per_pair() { out } else { out / 2 }
+        );
+    }
+
+    #[test]
+    fn a_strip_control_click_on_an_input_keeps_the_submix() {
+        let mut state = new(true, None, None);
+        state.sel_out = 2;
+        let cid = ChannelId::Input(1);
+        let _ = update(&mut state, Message::Mute(cid, true));
+        assert!(state.selected.contains(&cid));
+        assert_eq!(state.sel_out, 2);
+    }
+
+    #[test]
+    fn a_strip_control_click_on_a_selected_strip_keeps_the_group() {
+        let mut state = new(true, None, None);
+        let a = ChannelId::Input(0);
+        let b = ChannelId::Input(4);
+        state.selected.insert(a);
+        state.selected.insert(b);
+        let _ = update(&mut state, Message::Solo(a, true));
+        assert!(state.selected.contains(&a) && state.selected.contains(&b));
     }
 }
