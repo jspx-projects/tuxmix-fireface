@@ -924,7 +924,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // it — the user caught this directly). `STRIP_W` was widened (see
     // its own doc comment) specifically so this column has room without
     // pushing the meter/ruler group past the fader canvas's own bounds.
-    let mut icon_col = column![].spacing(theme::SPACE_TIGHT).align_x(iced::Alignment::Center);
+    let mut icon_col = column![].spacing(theme::SPACE_MD).align_x(iced::Alignment::Center);
     // Trim ("T") sits above the gear icon — every hardware input has one
     // (confirmed via the reference: ADAT/AS strips show "T" same as the
     // analog ones, unlike Gain which only exists on Mic/Instrument), but
