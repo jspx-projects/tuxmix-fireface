@@ -1,0 +1,9 @@
+/target
+*.so
+*.log
+*.pcap
+__pycache__/
+
+# Proprietary RME TotalMix FX screenshots — local visual reference for
+# the redesign, never to be committed.
+/Totalmix UI Screenshots/
