@@ -1,7 +1,26 @@
-# RME Fireface on Linux
+# TuxMix and the Fireface driver for Linux
 
 Native Linux support for the RME Fireface UC and UCX in normal RME vendor
-mode: a kernel transport module and the TuxMix mixer.
+mode: a kernel transport module (`snd-fireface-uc`) and the TuxMix mixer.
+
+This tree is based on [TuxMix](https://github.com/ismail-bahloul/TuxMix) by
+Ismaïl Bahloul — his Babyface Pro FS mixer — and extends it into a full
+control surface for the Fireface UC family.  His commit history is preserved
+in this repository.
+
+## What this tree adds
+
+- **Fireface UC and Fireface UCX support.**  The `snd-fireface-uc` kernel
+  module provides the vendor-mode USB transport, the ALSA PCM device, a
+  `snd-hwdep` control ABI and per-unit identification by serial.
+- **MIDI in and out over USB.**  A standard rawmidi port on the unit's
+  second USB interface; works with any Linux sequencer or DAW.
+- **Full OSC support.**  The complete RME OSC dialect: per-channel
+  parameters, streamed meter peaks and remote control of the whole mixer
+  and control room from any OSC client.
+- **A much improved GUI.**  Near-complete mixer and Control Room
+  functionality, with channel strips that slide their panels in and out —
+  EQ, dynamics, sends and settings live next to their own strip.
 
 ## Architecture
 
@@ -142,3 +161,19 @@ versions.
 TuxMix and its third-party components retain their own notices in
 [ui/tuxmix/LICENSE](ui/tuxmix/LICENSE).  The combined project is distributed
 under GPL-3.0-or-later.
+
+## Credits and attribution
+
+This tree is based on [TuxMix](https://github.com/ismail-bahloul/TuxMix) by
+Ismaïl Bahloul, at his release 0.3.1.  From that project we inherited the
+mixer application, its device model, the Babyface Pro FS support (the ALSA
+and direct-USB backends in `ui/tuxmix/tuxmix-usb`), the TUI and the scene
+system.  TuxMix is MIT licensed; the license and copyright notice are kept
+in [ui/tuxmix/LICENSE](ui/tuxmix/LICENSE), and his commit history is part of
+this repository.
+
+The Fireface UC/UCX kernel module, the OSC layer, the GUI's mixer and
+Control Room extensions and the Fireface backends were developed in this
+tree.  All Fireface protocol knowledge comes from our own USB captures; no
+RME documentation or code is included.
+
