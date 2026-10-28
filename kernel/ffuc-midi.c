@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * RME Fireface USB - MIDI over the class-compliant USB-MIDI interface.
  *

@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-License-Identifier: GPL-2.0-only
 #
 # Out-of-tree build of the RME Fireface USB transport driver.
 #

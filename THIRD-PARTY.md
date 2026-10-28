@@ -49,9 +49,9 @@ while the repository license is MIT.  Both statements are reproduced here.
 
 <https://github.com/OroboroModular/rme-fireface-ucx-linux-driver>
 
-GPL-2.0-or-later (SPDX headers), the same license as the kernel module in
-this repository.  The Fireface UCX transport, register model and meter
-decoding in `kernel/` build on this project.
+GPL-2.0-or-later (SPDX headers).  We use it under GPL-2.0, which is why the
+kernel module in this repository is GPL-2.0-only.  The Fireface UCX transport,
+register model and meter decoding in `kernel/` build on this project.
 
 ## Reference material
 

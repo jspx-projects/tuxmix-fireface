@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * RME Fireface USB - userspace ABI for the snd-hwdep control transport.
  *

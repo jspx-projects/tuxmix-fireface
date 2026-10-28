@@ -156,15 +156,17 @@ than controls that silently do nothing.
 
 ## License
 
-This project is free software: you can redistribute it and/or modify it under
-the terms of the **GNU General Public License, version 3 or later**.  See
-[LICENSE](LICENSE).  The kernel module is additionally marked
-GPL-2.0-or-later so it remains compatible with the kernel and with later GPL
-versions.
+The repository contains separate works under different licenses:
 
-TuxMix and its third-party components retain their own notices in
-[ui/tuxmix/LICENSE](ui/tuxmix/LICENSE).  The combined project is distributed
-under GPL-3.0-or-later.
+- `kernel/` — the Fireface UC/UCX kernel module, **GPL-2.0-only**, matching the
+  kernel and the GPL-2.0 sources it builds on.
+- Tools, scripts and documentation — **GPL-3.0-or-later**.  See
+  [LICENSE](LICENSE).
+- `ui/tuxmix/` — TuxMix, **MIT**, with its own notices in
+  [ui/tuxmix/LICENSE](ui/tuxmix/LICENSE).
+
+The module and the mixer meet at the kernel's hwdep ioctl interface; they are
+not combined into a single work.
 
 ## Credits and attribution
 
