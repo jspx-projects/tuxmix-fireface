@@ -81,7 +81,10 @@ symbols the unit has, in the fixed order `T`, settings gear, `EQ`, `D` — the
 UC has `T` and the gear, the UCX has all four.  The hardware-input row is the
 reference, and every other strip places its symbols at the same absolute
 heights.  A channel without one of them keeps an empty slot of the same
-height and gap, so no symbol below moves:
+height and gap, so no symbol below moves.  The gap below the FX fader is
+`theme::SPACE_LG` plus the column's own spacing (12 px at scale 1) and the
+symbols are `theme::SPACE_MD` (6 px) apart; empty slots use the same heights
+and gaps.
 
 | Strip | Fader | Register | Fill |
 |---|---|---|---|
@@ -105,6 +108,8 @@ used, since it covers the values it hovers over.
   so its rim and arc read as colour against the card.
 - Every interactive knob draws a faint full-range track and a value arc from
   the range minimum, or from top centre for pan and balance.
+- An always-on coloured outline is not used.  The full-range track stays
+  neutral; colour appears on an arc only while the control is live.
 - The default arc colour is white. Semantic colours are:
   - input gain: orange;
   - EQ gain: red, green and blue for bands 1–3;
@@ -142,17 +147,28 @@ applies to Dynamics, Auto Level, Reverb and Echo.
 
 The panel follows the channel type.
 
+The layout is one vertical stack per channel type; shared controls sit at the
+same height in every panel.
+
 | Channel | Contents, top to bottom |
 |---|---|
-| Input 1/2 | Stereo, 48V, Gain, AutoSet, FX Send, MS Proc, Phase L/R |
-| Input 3/4 | Stereo, Inst, Gain, Level, AutoSet, FX Send, MS Proc, Phase L/R |
-| Inputs 5–8 | Stereo, FX Send, MS Proc, Phase L/R |
-| Digital inputs | Stereo, FX Send, MS Proc, Phase L/R |
-| Software playback | Stereo |
-| Hardware output | Stereo, FX Return, Loopback |
+| Input 1/2 | Stereo, 48V, AutoSet, Gain, Width, Send FX, MS Proc, Ø L / R Ø |
+| Input 3/4 | Stereo, reference level, Inst + Gain, AutoSet, Width, Send FX, MS Proc, Ø L / R Ø |
+| Inputs 5–8 | Stereo, reference level (one setting shared by 5–8), Width, Send FX, MS Proc, Ø L / R Ø |
+| Digital inputs (9+) | Stereo, Width, Send FX, MS Proc, Ø L / R Ø |
+| Software playback | Stereo, Width, Send FX, MS Proc, Ø L / R Ø |
+| Hardware output | Stereo, reference level, Return FX, Ø L / R Ø, No Trim, Talkback, Loopback |
 
-48 V is available on inputs 1/2. Inst and Level are available on inputs 3/4.
-The UCX has no PAD.
+- 48 V is available on inputs 1/2; AutoSet on 1/2 and 3/4; Inst and a gain
+  knob on 3/4; inputs 5–8 have a reference-level selector instead of
+  Inst + Gain, and inputs 9+ have no reference-level control.
+- The reference levels for 5–8 move together: any change to one of them
+  applies to all four.  Inputs 3 and 4 keep separate reference levels unless
+  they are linked.
+- Reference-level values are `-10 dBV`, `+4 dBu` and `Lo Gain`.
+- The Send FX knob mirrors the thin FX fader on the strip; the Return FX knob
+  mirrors the thin fader on outputs.  One value, two views.
+- The UCX has no PAD.
 
 Control styles:
 
@@ -168,11 +184,10 @@ exception.
 
 ### 3.1 Phase
 
-Phase is available on input strips at the bottom of the Settings panel.
-
-- Inputs 1/2 show a **Phase** button; a linked pair shows **Phase L** and
-  **Phase R**.
-- Other input channels use `Ø`, or `Ø L` and `R Ø` for a linked pair.
+Phase is available on every input channel at the bottom of the Settings
+panel, and on hardware outputs.  The label is the symbol `Ø`, never the word:
+a linked pair shows `Ø L` and `R Ø`, a single channel shows `Ø`.  Engaged
+buttons use green text and a green outline.
 
 ### 3.2 Gain
 

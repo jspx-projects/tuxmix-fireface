@@ -108,6 +108,13 @@ Authoritative files:
   so no symbol below moves.
 - The pointer never changes over a fader or a knob; the grab hand hides
   the values underneath it.
+- Knobs carry a neutral full-range track; a coloured arc appears only while
+  the control is live. No always-on coloured outline.
+- Phase buttons use the `Ø` symbol, never the word: `Ø L` / `R Ø` for a
+  linked pair, `Ø` alone otherwise.
+- The Settings slideout is one vertical stack per channel type; shared
+  controls keep the same height between channel types. The per-channel
+  order is in `docs/spec/TUXMIX-SPEC.md` §3.
 - Slideouts always open to the right of their own channel. In the Control
   Room the section shifts its own channels left by one slot to make the
   space; its left edge may overlap the channel row but never moves it.
