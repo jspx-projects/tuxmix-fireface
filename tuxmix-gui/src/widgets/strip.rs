@@ -1207,7 +1207,9 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
                         text("▸").size(theme::TEXT_XS * scale),
                     ]
                     .spacing(theme::SPACE_TIGHT)
-                    .width(Length::Fill),
+                    .align_y(iced::Alignment::Center)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
                 )
                 .width(Length::Fill)
                 .height(Length::Fixed(btn_h))
