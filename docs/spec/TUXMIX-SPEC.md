@@ -172,8 +172,6 @@ height on every input.
 - The Talkback row is empty on Control Room channels.
 - The Send FX knob mirrors the thin FX fader on the strip; the Return FX knob
   mirrors the thin fader on outputs. One value, two views.
-- The FX send follows the channel fader: a fader move rewrites the send with
-  the new absolute level.
 - Every slideout fits the strip height at normal size: everything is visible
   at a glance and the panel does not scroll.
 - The UCX has no PAD.

@@ -320,19 +320,24 @@ Level values:
 The unit has no register for these; the host computes them and rewrites
 the affected sends:
 
-- **Width** — the pair's send words, eight registers per stereo pair
-  (`0x4022/0x4062/…` family).
+- **Width** — the pair's 2x2 send matrix, rewritten only while the pair
+  has a live send; with every send at -infinity the sweep writes nothing.
+  The eight words of the pair (`0x4022/0x4062/…` family) carry the matrix.
 - **MS Proc on software playback** — the playback's send words
   (`0x4020…`, `0x4120…`, `0x41A0…` families).  On hardware inputs MS Proc
   uses `NN05` and the same send recompute.
 - **Talkback receive per output** and **No Trim** — host-side flags; they
-  write nothing.
+  write nothing.  With a talkback source selected, enabling talkback on an
+  output injects that source as ordinary send words into the output, dims
+  the other sends by the Dim setting (measured -20 dB on a -20 dB setting),
+  and mutes Main's FX return (`0x1803`/`0x1903` = `0xFD76`).
 - **Trim** — a per-channel attenuation applied to every send (see
   `TUXMIX-SPEC.md`).
 
 **FX send** is an absolute level in 0.1 dB (`0x0000` = 0.0 dB, `NN01`).
-It follows the channel fader: every fader move rewrites it with the new
-absolute value (`0x0201`/`0x0301`; playback `0x47A0`/`0x47E1`).
+A fader drag writes `0x0000` to the send and restores the knob value when
+the drag ends; the send value itself is the knob value and does not track
+the fader.  The post-fader coupling is not expressed in `NN01`.
 
 ### 6.3 Mute, solo and stereo mode
 
