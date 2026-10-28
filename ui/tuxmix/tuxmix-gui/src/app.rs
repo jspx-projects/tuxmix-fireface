@@ -149,16 +149,26 @@ pub enum DeviceKind {
 /// - otherwise, if exactly one real device is present, select it — even when
 ///   the saved preference names a different model;
 /// - with several devices and no matching preference, keep the auto entry;
-/// - an explicit Simulation preference is never overridden.
+/// - a saved Simulation preference gives way whenever a real device is
+///   present; the simulation is the fallback for "nothing connected".
 #[cfg(test)]
 fn choose_startup_kind(
     available: &[DeviceKind],
     preferred: Option<DeviceKind>,
 ) -> Option<DeviceKind> {
+    // A saved simulation is only used while nothing real is attached.
     if matches!(
         preferred,
         Some(DeviceKind::Mock) | Some(DeviceKind::MockUcx) | Some(DeviceKind::MockUc)
     ) {
+        if let Some(real) = available.iter().copied().find(|k| {
+            !matches!(
+                k,
+                DeviceKind::Mock | DeviceKind::MockUcx | DeviceKind::MockUc
+            )
+        }) {
+            return Some(real);
+        }
         return preferred;
     }
     if let Some(p) = preferred {
@@ -4300,11 +4310,23 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 // on screen even after the UC appeared.
                 let fallback_mock = state.device.is_mock() && !state.explicit_mock;
                 if (!state.connected || fallback_mock) && !state.explicit_mock {
-                    let fresh = state
-                        .device_target
-                        .as_ref()
-                        .and_then(DeviceHandle::open_target)
-                        .or_else(|| DeviceHandle::open_real(state.backend.as_deref()));
+                    // A running simulation must give way to a real unit that
+                    // appeared; only then fall back to the stored target.
+                    let fresh = if fallback_mock {
+                        DeviceHandle::open_real(state.backend.as_deref())
+                            .or_else(|| {
+                                state
+                                    .device_target
+                                    .as_ref()
+                                    .and_then(DeviceHandle::open_target)
+                            })
+                    } else {
+                        state
+                            .device_target
+                            .as_ref()
+                            .and_then(DeviceHandle::open_target)
+                            .or_else(|| DeviceHandle::open_real(state.backend.as_deref()))
+                    };
                     if let Some(fresh) = fresh {
                         log::info!("Device connected: {}", fresh.target().label());
                         state.device_target = Some(fresh.target());
@@ -11261,10 +11283,22 @@ mod tests {
     }
 
     #[test]
-    fn explicit_simulation_is_not_replaced_by_a_real_device() {
+    fn a_saved_simulation_gives_way_to_a_connected_device() {
         assert_eq!(
             choose_startup_kind(&[DeviceKind::Uc], Some(DeviceKind::Mock)),
-            Some(DeviceKind::Mock)
+            Some(DeviceKind::Uc)
+        );
+    }
+
+    #[test]
+    fn the_simulation_is_used_when_nothing_is_connected() {
+        assert_eq!(
+            choose_startup_kind(
+                &[DeviceKind::Mock, DeviceKind::MockUcx, DeviceKind::MockUc],
+                Some(DeviceKind::Mock)
+            ),
+            Some(DeviceKind::Mock),
+            "the saved simulation stays while no real device is present"
         );
     }
 
