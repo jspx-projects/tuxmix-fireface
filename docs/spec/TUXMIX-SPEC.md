@@ -74,12 +74,14 @@ of its right-hand control column.  The T / gear / EQ / D column starts
 directly below that fader, as high as the strip allows; spare height stays
 below the column, not between the fader and the buttons.
 
-The four symbols sit on one grid shared by all strips.  Every strip has a main
+The symbols sit on one grid shared by all strips.  Every strip has a main
 fader; the column is anchored to it, below the FX fader when the unit has an
-FX bus and directly below the fader top otherwise.  The hardware-input row is
-the reference, and every other strip places `T`, the settings gear, `EQ` and
-`D` at the same absolute heights.  A channel without one of them keeps an
-empty slot of the same height and gap, so no symbol below moves:
+FX bus and directly below the fader top otherwise.  The column holds the
+symbols the unit has, in the fixed order `T`, settings gear, `EQ`, `D` — the
+UC has `T` and the gear, the UCX has all four.  The hardware-input row is the
+reference, and every other strip places its symbols at the same absolute
+heights.  A channel without one of them keeps an empty slot of the same
+height and gap, so no symbol below moves:
 
 | Strip | Fader | Register | Fill |
 |---|---|---|---|

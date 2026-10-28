@@ -261,6 +261,12 @@ pub struct StripParams<'a> {
     /// Hover text for `T`: "Show trim" at 0 dB, otherwise the applied
     /// attenuation.
     pub trim_tip: String,
+    /// Whether the unit has this symbol at all.  The column reserves a slot
+    /// for every symbol the unit has, so a channel that lacks it keeps the
+    /// grid while a unit without the feature (no EQ on the UC) has no slot.
+    pub slot_trim: bool,
+    pub slot_eq: bool,
+    pub slot_dyn: bool,
     /// Whether this input has a Phase Ø invert switch — the 4 analog
     /// inputs only, and only where the backend decodes phase (the UC does
     /// not yet; see `UC-TODO-06`).
@@ -929,6 +935,14 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // the real, working control on Hardware Inputs, skip it on Playback
     // rather than either faking one there or blocking on new protocol
     // work.
+    // The four symbols keep one grid across every strip: a channel that
+    // lacks one keeps an empty slot of the same height, so the symbols
+    // below never move (hardware outputs have no T, playbacks no EQ/D).
+    let blank_slot = || -> Element<'a, Message> {
+        iced::widget::Space::new()
+            .height(Length::Fixed(ICON_BTN_H * scale))
+            .into()
+    };
     if p.has_trim {
         let trim_open = p.open_flyout == Some(FlyoutKind::Trim);
         // Lights up whenever trim is off unity too, not just while its
@@ -946,6 +960,8 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
             },
             scale,
         ));
+    } else if p.slot_trim {
+        icon_col = icon_col.push(blank_slot());
     }
     // Phase now lives in the Settings flyout, at the bottom of the manual's
     // Input row, rather than as an extra glyph in this narrow column.
@@ -977,7 +993,8 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
             if eq_open { "Hide EQ" } else { "Show EQ (3-band + low cut)" },
             scale,
         ));
-
+    } else if p.slot_eq {
+        icon_col = icon_col.push(blank_slot());
     }
     if p.has_dynamics && p.protocol_features {
         let dyn_open = p.open_flyout == Some(FlyoutKind::Dynamics);
@@ -989,6 +1006,8 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
             if dyn_open { "Hide Dynamics" } else { "Show Dynamics (Compressor, Expander, Auto Level)" },
             scale,
         ));
+    } else if p.slot_dyn {
+        icon_col = icon_col.push(blank_slot());
     }
     // The FX fader: send on inputs and playbacks, return on outputs. A thin
     // track beside the main fader, no meter, its own value drag — measured
@@ -1037,20 +1056,17 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
 
     // The FX fader sits at the top of the strip's right-hand control column,
     // above T / gear / EQ / D, so the main fader keeps the full height.
-    let icon_col = match fx_fader {
-        // FX fader on top, the button stack pushed down to the bottom of the
-        // column, the slack between them.
-        // FX fader pinned to the top of the row — the same line as the big
-        // fader's top in every row — with the button stack at the bottom.
-        Some(fx) => column![
-            fx,
-            iced::widget::Space::new().height(Length::Fill),
-            icon_col,
-        ]
-        .spacing(theme::SPACE_TIGHT)
-        .align_x(iced::Alignment::Center),
-        None => icon_col,
-    };
+    // The FX fader is pinned to the top of the row — the same line as the
+    // big fader's top in every row — and the symbol column starts directly
+    // below it.  The slack stays under the column, so the four symbols share
+    // one absolute height across all strips.
+    let icon_col = column![
+        fx_fader.unwrap_or_else(|| iced::widget::Space::new().height(Length::Fixed(0.0)).into()),
+        icon_col,
+        iced::widget::Space::new().height(Length::Fill),
+    ]
+    .spacing(theme::SPACE_TIGHT)
+    .align_x(iced::Alignment::Center);
     rows = rows.push(
         row![fader_widget, icon_col]
             .spacing(theme::SPACE_TIGHT)
