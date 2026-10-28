@@ -166,8 +166,9 @@ height on every input.
 - The reference levels for 5–8 move together: any change to one applies to
   all four. Inputs 3 and 4 keep separate levels unless linked.
 - Input reference values are `-10 dBV`, `+4 dBu`, `Lo Gain`; output
-  reference values are `-10 dBV`, `+4 dBu`, `Hi Gain`. All line outputs
-  follow one setting; Phones has its own.
+  reference values are `-10 dBV`, `+4 dBu`, `Hi Gain`. A channel in the
+  Control Room keeps its own reference level; every other hardware output
+  follows one shared setting.
 - The Talkback row is empty on Control Room channels.
 - The Send FX knob mirrors the thin FX fader on the strip; the Return FX knob
   mirrors the thin fader on outputs. One value, two views.
