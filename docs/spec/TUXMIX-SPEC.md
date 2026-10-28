@@ -70,7 +70,15 @@ it in a single scene apply:
 ### 2.0 FX fader
 
 Every strip on a unit with an FX bus carries a second, thin fader at the top
-of its right-hand control column, above T / gear / EQ / D:
+of its right-hand control column.  The T / gear / EQ / D column starts
+directly below that fader, as high as the strip allows; spare height stays
+below the column, not between the fader and the buttons.
+
+The four symbols sit on one grid shared by all strips: the hardware-input row
+is the reference, and every other strip places `T`, the settings gear, `EQ`
+and `D` at the same absolute heights.  A channel without one of them keeps an
+empty slot of the same height and gap, and a strip without an FX fader keeps
+that slot empty as well, so no symbol below moves:
 
 | Strip | Fader | Register | Fill |
 |---|---|---|---|

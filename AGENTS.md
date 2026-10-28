@@ -96,8 +96,13 @@ Authoritative files:
   colour (orange) or return colour (green), and a fader at the bottom
   shows none. No extra marker line.
 - The thin FX fader sits at the top of the strip's control column, level
-  with the top of the main fader in every row, with T / gear / EQ / D at
-  the bottom.
+  with the top of the main fader in every row. The T / gear / EQ / D column
+  starts directly below it, as high as the strip allows; spare height stays
+  below the column.
+- Every strip keeps each of the four symbols at the same absolute height as
+  the hardware-input row. A channel that lacks a symbol keeps its empty slot
+  (same height, same gap), and a strip without an FX fader keeps that slot
+  empty too, so the symbols below never move.
 - The pointer never changes over a fader or a knob; the grab hand hides
   the values underneath it.
 - Slideouts always open to the right of their own channel. In the Control
