@@ -556,6 +556,21 @@ ring = max(2 × quantum, ceil(192 / quantum) × quantum)
 output latency ≈ ring + 2 × 48 + 48 frames
 ```
 
+For the UCX the ring must also cover the output lead plus two URBs of
+margin, rounded to a whole URB:
+
+```text
+ucx_floor = round_up(max((nurbs + 2) × frames_per_urb,
+                         (nurbs + 1) × frames_per_urb + 60
+                         + 2 × frames_per_urb),
+                     frames_per_urb)
+ring = max(2 × quantum, ceil(ucx_floor / quantum) × quantum)
+```
+
+With the default 48-frame URB this gives 336 frames at 48 kHz and 576 frames
+at 96 kHz. The old 192-frame floor was smaller than the 204-frame output
+lead and underran at 96 and below.
+
 For 44.1 kHz:
 
 | Quantum | ALSA buffer | USB queue | Endpoint | Total |
@@ -575,8 +590,9 @@ On the UCX each URB carries up to eight 1 ms ISO packets of
 | 96 kHz | 96 | 288 (3.0 ms) | 60 (0.63 ms) | 348 frames (3.63 ms) |
 | 192 kHz | 192 | 576 (3.0 ms) | 60 (0.31 ms) | 636 frames (3.31 ms) |
 
-The idle ring estimate is
-`max(2 × quantum, ceil((nurbs + 2) × frames_per_urb / quantum) × quantum)`.
+The idle ring estimate is the formula above. The UC uses
+`max(2 × quantum, ceil((nurbs + 2) × frames_per_urb / quantum) × quantum)`;
+the UCX also includes the output lead and its two-URB margin.
 
 The Settings **Latency** line shows the card ring buffer and, on the Fireface
 models, the USB queue and device lead (the UC reports the queued URBs as an
