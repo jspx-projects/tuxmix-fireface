@@ -1,5 +1,7 @@
 # Documentation
 
+Architecture and latency orientation: [`DRIVER-ARCHITECTURE.md`](DRIVER-ARCHITECTURE.md).
+
 The authoritative specification is in [`spec/`](spec/README.md):
 
 - [UC control specification](spec/UC-CONTROL-SPEC.md)
