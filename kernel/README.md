@@ -10,9 +10,9 @@ The kernel module is a transport core:
 - the UC output-latch watchdog and engine recovery.
 
 Mixer state, routing, preamps, EQ, meters and scenes live in TuxMix
-userspace.  See [../docs/DRIVER-REFACTOR.md](../docs/DRIVER-REFACTOR.md),
-[../docs/PROTOCOL-COMPLETE.md](../docs/PROTOCOL-COMPLETE.md) and
-[../docs/HWDEP-ABI.md](../docs/HWDEP-ABI.md).
+userspace.  See [`../docs/DRIVER-ARCHITECTURE.md`](../docs/DRIVER-ARCHITECTURE.md)
+for the host/device/buffer picture and the measured latency budget.  The
+older protocol notes are in the archive (`docs/archive/`).
 
 ## Devices
 
