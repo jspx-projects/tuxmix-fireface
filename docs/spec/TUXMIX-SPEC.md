@@ -477,16 +477,16 @@ FX column. Its buttons sit in TotalMix's background groups:
 | Group | Control | Behaviour |
 |---|---|---|
 | assign | Assign | Picks the Main Out from the hardware outputs (output mode word `0xNN02` bit 1). Assigning another pair clears the previous one. The button reads `assign` with the list closed |
-| dim / recall | Dim | Lowers the Main Out by 20 dB and sets the device Dim flag |
+| dim / recall | Dim | Lowers the Main/Phones pair by 20 dB and sets `0x3D03 = 1` |
 | | Recall | Restores the pre-Dim level and clears the Dim flag |
 | mono / speaker B / ext. input / mute FX | Mono | Host-side monitoring option |
 | | Speaker B | Switches the main monitoring output to Speaker B |
 | | Ext. input | Switches monitoring to the external stereo input. Inert: the level register is unmeasured |
 | | Mute FX | Host-side effect-return option |
-| talkback | Talkback | Dims the Phones outputs and sends the talkback source. Inert: the source assignment is unmeasured |
+| talkback | Talkback | Sends the measured 19-word activation set (`0x3F9E` bit 0 is set while active). The source and dim are host-side settings and are not part of the toggle |
 
-Dim, Recall and Speaker B use the UCX control-room registers. Mono and
-Mute FX are stored in the device scene.
+Dim, Recall, Speaker B and Talkback use the UCX control-room registers. Mono
+and Mute FX are stored in the device scene.
 
 ### 11.1 Assign
 
@@ -507,6 +507,17 @@ Hovering or clicking a destination opens the second level beside it: every
 hardware output in order, `None` at the top, and the currently assigned output
 in bold. Choosing `None` clears that destination. The list closes when an
 output is chosen or a click lands outside it.
+
+### 11.2 Talkback
+
+Talkback is one 19-word burst. The set carries the Phones/Main sends, the
+`0x1803`/`0x1903` FX-return values and `0x3F9E` bit 0. The OFF set restores the
+same addresses.
+
+Source selection and the dim amount are host-side settings in the reference
+application; neither changes a register and neither changes the toggle set.
+TuxMix therefore does not expose a source picker or a dim amount. Per-output
+talkback receive is host-side and is not written.
 
 The section carries its own `control room` title in the same line as the
 HARDWARE OUTPUTS label. The title starts at the section's leftmost channel,

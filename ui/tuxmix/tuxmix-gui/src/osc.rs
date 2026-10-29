@@ -31,7 +31,7 @@
 //! - `/output/<id>/cue` bool
 //!
 //! Global / navigation:
-//! - `/dim`, `/recall`, `/speaker_b`, `/mono`, `/mute_fx`,
+//! - `/dim`, `/recall`, `/speaker_b`, `/mono`, `/mute_fx`, `/talkback`,
 //!   `/input_link`, `/eq_for_record`, `/optical_out_spdif`,
 //!   `/spdif_professional`, `/word_clock_single_speed`, `/ms_proc`,
 //!   `/an12`, `/pitch`, `/width` (bool/f)
@@ -100,6 +100,7 @@ pub enum OscCommand {
     ControlRoomRecall,
     Mono(bool),
     MuteFx(bool),
+    Talkback(bool),
     InputLink(bool),
     EqForRecord(bool),
     OpticalOutSpdif(bool),
@@ -368,6 +369,7 @@ impl OscCommand {
             ["recall"] => Some(OscCommand::ControlRoomRecall),
             ["mono"] => Some(OscCommand::Mono(arg_bool(args.first()?)?)),
             ["mute_fx"] => Some(OscCommand::MuteFx(arg_bool(args.first()?)?)),
+            ["talkback"] => Some(OscCommand::Talkback(arg_bool(args.first()?)?)),
             ["input_link"] => Some(OscCommand::InputLink(arg_bool(args.first()?)?)),
             ["eq_for_record"] => Some(OscCommand::EqForRecord(arg_bool(args.first()?)?)),
             ["optical_out_spdif"] => {
@@ -444,6 +446,7 @@ impl OscCommand {
             OscCommand::ControlRoomRecall => Message::ControlRoomRecall,
             OscCommand::Mono(on) => Message::ControlRoomMono(on),
             OscCommand::MuteFx(on) => Message::ControlRoomMuteFx(on),
+            OscCommand::Talkback(on) => Message::TalkbackChanged(on),
             OscCommand::InputLink(on) => Message::InputLinkChanged(on),
             OscCommand::EqForRecord(on) => Message::EqForRecordChanged(on),
             OscCommand::OpticalOutSpdif(on) => Message::OpticalOutFormatChanged(on),
@@ -732,6 +735,10 @@ mod tests {
         assert_eq!(
             OscCommand::parse("/dim", &[OscType::Int(1)]),
             Some(OscCommand::Dim(true))
+        );
+        assert_eq!(
+            OscCommand::parse("/talkback", &[OscType::Bool(true)]),
+            Some(OscCommand::Talkback(true))
         );
         assert_eq!(
             OscCommand::parse("/clock_source", &[OscType::String("Optical".into())]),
