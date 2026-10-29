@@ -125,7 +125,7 @@ stream live state changes.
 | Address | Meaning |
 |---|---|
 | `0x3d03` | DIM |
-| `0x3f9e` | monitor flags; bit 1 = MS processing |
+| `0x3f9e` | monitor flags; bit 0 = talkback active, bit 1 = MS processing |
 | `0x0007`, `0x0107`, `0x0207`, `0x0307` | input gain 1–4, 0.1 dB |
 | `0x1200..0x2300`, offset 0 | hardware-output volume, signed 0.1 dB |
 
@@ -340,11 +340,11 @@ the affected sends:
   gains `gl`/`gr` and the width angle `theta`, the coefficients are
   `gl*(cos+sin)/2`, `gr*(sin+cos)/2`, `gl*(cos-sin)/2` and
   `gr*(sin-cos)/2` for L→L, R→L, L→R and R→R.  Mono inputs reject MS Proc.
-- **Talkback receive per output** and **No Trim** — host-side flags; they
-  write nothing.  With a talkback source selected, enabling talkback on an
-  output injects that source as ordinary send words into the output, dims
-  the other sends by the Dim setting (measured -20 dB on a -20 dB setting),
-  and mutes Main's FX return (`0x1803`/`0x1903` = `0xFD76`).
+- **Talkback** — one 19-word burst.  The set writes the Phones/Main sends,
+  `0x1803`/`0x1903` = `0xFD76` and `0x3F9E` bit 0.  Source selection and the
+  dim amount are host-side settings and do not change the burst.  Per-output
+  talkback receive is host-side and writes nothing.
+- **No Trim** — a host-side flag; it writes nothing.
 - **Trim** — a per-channel attenuation applied to every send (see
   `TUXMIX-SPEC.md`).
 
