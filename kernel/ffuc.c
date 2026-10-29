@@ -1763,13 +1763,27 @@ static int ffuc_rule_buffer(struct snd_pcm_hw_params *params,
 	struct snd_interval *r = hw_param_interval(params, SNDRV_PCM_HW_PARAM_RATE);
 	/*
 	 * The ALSA ring must cover the USB URBs already in flight plus two
-	 * more URBs of margin.  Two periods are exactly the queue at the
-	 * 48-frame floor (no margin) and leave only 32 frames at 64, so the
-	 * transport underruns there.  The rule raises 48 samples to four
-	 * periods, 64 to three, and keeps 96 and 128 at two.
+	 * more URBs of margin.  It must also cover the UCX output lead: at
+	 * 96 frames the old 192-frame ring was smaller than the 204-frame
+	 * lead, which is the 96-and-below crackle threshold.  Add one URB
+	 * of margin beyond the lead.
 	 */
+	unsigned int urb = ffuc_urb_frames(chip, r->min);
+	unsigned int min = (chip->nurbs + 2) * urb;
+
+	if (chip->ucx) {
+		unsigned int fb_delay =
+			(chip->nurbs + (fb_extra_urb ? 1u : 0u)) *
+			chip->iso_packets;
+		unsigned int lead =
+			DIV_ROUND_CLOSEST(fb_delay * r->min, 8000) +
+			ucx_lead_frames;
+
+		min = max(min, lead + urb);
+	}
+
 	struct snd_interval t = {
-		.min = (chip->nurbs + 2) * ffuc_urb_frames(chip, r->min),
+		.min = min,
 		.max = UINT_MAX,
 		.integer = 1,
 	};
