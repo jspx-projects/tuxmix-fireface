@@ -1779,8 +1779,10 @@ static int ffuc_rule_buffer(struct snd_pcm_hw_params *params,
 			DIV_ROUND_CLOSEST(fb_delay * r->min, 8000) +
 			ucx_lead_frames;
 
-		min = max(min, lead + urb);
+		min = max(min, lead + 2 * urb);
 	}
+
+	min = round_up(min, urb);
 
 	struct snd_interval t = {
 		.min = min,
