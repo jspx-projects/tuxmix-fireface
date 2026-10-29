@@ -7680,7 +7680,10 @@ fn ucx_usb_frames(rate: u32, (urb_frames, urbs): (u32, u32)) -> (u32, u32) {
 
 /// Frames the UCX's ALSA ring needs: `nurbs + 2` URBs of margin.
 fn ucx_min_buffer_frames(rate: u32, (urb_frames, urbs): (u32, u32)) -> u32 {
-    (urbs + 2) * ucx_urb_frames(rate, urb_frames)
+    let urb = ucx_urb_frames(rate, urb_frames);
+    let (usb, lead) = ucx_usb_frames(rate, (urb_frames, urbs));
+    let min = ((urbs + 2) * urb).max(usb + lead + 2 * urb);
+    min.div_ceil(urb) * urb
 }
 
 fn frames_ms(frames: u32, rate: u32) -> f32 {
@@ -12063,9 +12066,10 @@ mod tests {
         assert_eq!(ucx_urb_frames(96_000, 48), 96);
         assert_eq!(ucx_usb_frames(48_000, (48, 2)), (144, 60));
         assert_eq!(ucx_usb_frames(96_000, (48, 2)), (288, 60));
-        // nurbs + 2 URBs of ring margin.
-        assert_eq!(ucx_min_buffer_frames(48_000, (48, 2)), 192);
-        assert_eq!(ucx_min_buffer_frames(96_000, (48, 2)), 384);
+        // The ring must cover the queue, the 60-frame lead and two URBs
+        // of margin, rounded to a whole URB.
+        assert_eq!(ucx_min_buffer_frames(48_000, (48, 2)), 336);
+        assert_eq!(ucx_min_buffer_frames(96_000, (48, 2)), 576);
         assert!((frames_ms(144, 48_000) - 3.0).abs() < 0.01);
         assert!((frames_ms(60, 48_000) - 1.25).abs() < 0.01);
     }
