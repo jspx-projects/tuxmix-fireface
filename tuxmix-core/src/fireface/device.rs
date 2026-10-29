@@ -1207,6 +1207,18 @@ impl Fireface {
         let width = self.inputs[base].width.clamp(-1.0, 1.0);
         let theta = (1.0 - width) * std::f32::consts::FRAC_PI_4;
         let (sin, cos) = theta.sin_cos();
+        if self.inputs[base].ms_proc {
+            // M/S encoder on top of the width matrix:
+            //   L' = (L + R) / 2, R' = (L - R) / 2
+            let a = gl * (cos + sin) * 0.5;
+            let b = gr * (sin + cos) * 0.5;
+            let c = gl * (cos - sin) * 0.5;
+            let d = gr * (sin - cos) * 0.5;
+            self.ucx_write_matrix(dsp as u8, Source::Input(base), a as f64)?;
+            self.ucx_write_matrix(dsp as u8, Source::Input(other), b as f64)?;
+            self.ucx_write_matrix(dsp as u8 + 1, Source::Input(base), c as f64)?;
+            return self.ucx_write_matrix(dsp as u8 + 1, Source::Input(other), d as f64);
+        }
         self.ucx_write_matrix(dsp as u8, Source::Input(base), (gl * cos) as f64)?;
         self.ucx_write_matrix(dsp as u8, Source::Input(other), (gr * sin) as f64)?;
         self.ucx_write_matrix(
@@ -1228,7 +1240,7 @@ impl Fireface {
         let base = idx & !1;
         if idx < 4 {
             let volume = self.inputs[idx].volumes.get(pair).copied().unwrap_or(0.0);
-            if self.inputs[base].width != 1.0 {
+            if self.inputs[base].width != 1.0 || self.inputs[base].ms_proc {
                 self.ucx_write_input_pair(base, pair)?;
             } else {
                 let (l, r) = pan_split(volume, pan);
@@ -1250,7 +1262,7 @@ impl Fireface {
         // Stereo strip: source `base` on the left, `base^1` on the right.
         let other = base ^ 1;
         let (gl, gr) = self.ucx_input_pair_gains(base, pair);
-        if self.inputs[base].width != 1.0 {
+        if self.inputs[base].width != 1.0 || self.inputs[base].ms_proc {
             self.ucx_write_input_pair(base, pair)?;
         } else {
             self.ucx_write_matrix(dsp as u8, Source::Input(base), gl as f64)?;
@@ -1281,6 +1293,20 @@ impl Fireface {
         let (sin, cos) = theta.sin_cos();
         let dev_l = self.playbacks[base].id;
         let dev_r = self.playbacks[other].id;
+        if self.playbacks[base].ms_proc {
+            let a = gl * (cos + sin) * 0.5;
+            let b = gr * (sin + cos) * 0.5;
+            let c = gl * (cos - sin) * 0.5;
+            let d = gr * (sin - cos) * 0.5;
+            self.ucx_write_matrix(dsp as u8, Source::Playback(dev_l), a as f64)?;
+            self.ucx_write_matrix(dsp as u8, Source::Playback(dev_r), b as f64)?;
+            self.ucx_write_matrix(dsp as u8 + 1, Source::Playback(dev_l), c as f64)?;
+            return self.ucx_write_matrix(
+                dsp as u8 + 1,
+                Source::Playback(dev_r),
+                d as f64,
+            );
+        }
         self.ucx_write_matrix(dsp as u8, Source::Playback(dev_l), (gl * cos) as f64)?;
         self.ucx_write_matrix(dsp as u8, Source::Playback(dev_r), (gr * sin) as f64)?;
         self.ucx_write_matrix(
@@ -1299,7 +1325,7 @@ impl Fireface {
         let dev = self.playbacks[idx].id;
         let dsp = ucx::output_pair_dsp(pair)
             .ok_or_else(|| Error::InvalidChannel(format!("output pair {pair}")))?;
-        if self.playbacks[idx & !1].width != 1.0 {
+        if self.playbacks[idx & !1].width != 1.0 || self.playbacks[idx & !1].ms_proc {
             return self.ucx_write_playback_pair(idx & !1, pair);
         }
         let side = dev % 2;
@@ -1764,6 +1790,60 @@ impl Fireface {
         }
         self.settings.word_clock_termination = on;
         self.ucx_write_options()
+    }
+
+    /// Toggle M/S processing on an input pair: `NN05` on both channels and
+    /// the M/S send rewrite.  Mono inputs reject it.
+    pub fn set_input_ms_proc(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        if self.is_uc() {
+            return Err(Error::InvalidChannel(
+                "MS Proc is not mapped on the UC".into(),
+            ));
+        }
+        if idx >= self.inputs.len() {
+            return Err(Error::InvalidChannel(format!("input {idx}")));
+        }
+        if idx < 4 && !self.input_pair_linked(idx / 2) {
+            return Err(Error::InvalidChannel(
+                "MS Proc needs a linked stereo pair".into(),
+            ));
+        }
+        let base = idx & !1;
+        let other = base ^ 1;
+        for i in [base, other] {
+            if let Some(input) = self.inputs.get_mut(i) {
+                input.ms_proc = on;
+            }
+            self.write_word(
+                ucx::channel_reg(ucx::input_channel(i), ucx::offset::MS_PROC),
+                on as u16,
+            )?;
+        }
+        for pair in 0..PAIRS {
+            self.ucx_write_input_pair(base, pair)?;
+        }
+        Ok(())
+    }
+
+    /// Toggle M/S processing on a software-playback pair.  There is no
+    /// register: every routing with a live send is rewritten.
+    pub fn set_playback_ms_proc(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        if self.is_uc() {
+            return Err(Error::InvalidChannel(
+                "MS Proc is not mapped on the UC".into(),
+            ));
+        }
+        let base = idx & !1;
+        let other = base ^ 1;
+        if other >= self.playbacks.len() {
+            return Err(Error::InvalidChannel(format!("playback {idx}")));
+        }
+        self.playbacks[base].ms_proc = on;
+        self.playbacks[other].ms_proc = on;
+        for pair in 0..PAIRS {
+            self.ucx_write_playback_pair(base, pair)?;
+        }
+        Ok(())
     }
 
     /// Re-apply the readable/queued device values after the user chooses
@@ -3876,6 +3956,10 @@ impl RmeDevice for Fireface {
                 }
                 let linked = self.input_pair_linked(idx / 2);
                 self.ucx_write_input_stereo(idx, linked)?;
+                self.write_word(
+                    ucx::channel_reg(ucx::input_channel(idx), ucx::offset::MS_PROC),
+                    self.inputs[idx].ms_proc as u16,
+                )?;
                 if idx < 2 {
                     self.ucx_write_autoset(idx, self.inputs[idx].autoset)?;
                 }
@@ -4858,6 +4942,55 @@ mod tests {
         assert_eq!(dev.inputs()[0].gain, Some(20));
         assert!(!dev.inputs()[0].phantom);
         assert_eq!(dev.settings().clock_source, "Internal");
+    }
+
+    #[test]
+    fn ucx_input_ms_proc_writes_nn05_and_the_ms_matrix() {
+        let (mut dev, writes) = open(Model::Ucx);
+        dev.settings.input_pair_link = vec![true, true];
+        dev.inputs[0].volumes[0] = 0.5;
+        dev.inputs[1].volumes[0] = 0.5;
+        dev.inputs[0].width = 1.0;
+        writes.lock().unwrap().clear();
+        dev.set_input_ms_proc(0, true).unwrap();
+        let w = writes.lock().unwrap();
+        assert!(w.contains(&Write::Words(vec![(0x0005, 1)])));
+        assert!(w.contains(&Write::Words(vec![(0x0105, 1)])));
+        // Pair 0 is Phones 7/8 (DSP 6/7).  For gl = gr = 0.5 the M/S
+        // encoder writes L/2, R/2, L/2, -R/2 = ±0.25.
+        let ms = ucx::matrix_gain(0.25);
+        let neg = ucx::matrix_gain(-0.25);
+        assert!(w.contains(&Write::Words(vec![(0x4180, ms)])));
+        assert!(w.contains(&Write::Words(vec![(0x4181, ms)])));
+        assert!(w.contains(&Write::Words(vec![(0x41C0, ms)])));
+        assert!(w.contains(&Write::Words(vec![(0x41C1, neg)])));
+        drop(w);
+
+        writes.lock().unwrap().clear();
+        dev.set_input_ms_proc(0, false).unwrap();
+        let w = writes.lock().unwrap();
+        assert!(w.contains(&Write::Words(vec![(0x0005, 0)])));
+        assert!(w.contains(&Write::Words(vec![(0x4180, ucx::matrix_gain(0.5))])));
+        assert!(w.contains(&Write::Words(vec![(0x41C1, ucx::matrix_gain(0.5))])));
+    }
+
+    #[test]
+    fn ucx_playback_ms_proc_rewrites_the_matrix() {
+        let (mut dev, writes) = open(Model::Ucx);
+        dev.playbacks[0].volumes[0] = 0.5;
+        dev.playbacks[1].volumes[0] = 0.5;
+        dev.playbacks[0].width = 1.0;
+        writes.lock().unwrap().clear();
+        dev.set_playback_ms_proc(0, true).unwrap();
+        let w = writes.lock().unwrap();
+        let ms = ucx::matrix_gain(0.25);
+        let neg = ucx::matrix_gain(-0.25);
+        assert!(w.contains(&Write::Words(vec![(0x41A0, ms)])));
+        assert!(w.contains(&Write::Words(vec![(0x41A1, ms)])));
+        assert!(w.contains(&Write::Words(vec![(0x41E0, ms)])));
+        assert!(w.contains(&Write::Words(vec![(0x41E1, neg)])));
+        // Playback coefficients keep their +0x180 mirror.
+        assert!(w.contains(&Write::Words(vec![(0x4320, ms)])));
     }
 
     #[test]
