@@ -567,6 +567,19 @@ in bits 1–2. Bit 10 is not an index of its own. No options-word readback is
 exposed: request `0x10` in returns a status word. The device-owned values are
 kept in the scene and written when they change.
 
+### 11.5 Control Room Dim and Talkback
+
+The Dim level is host state: editing it writes nothing. Pressing Dim writes
+the Main/Phones pair level (`0x1800`, `0x1900`) lowered by the Dim level and
+sets `0x3D03 = 1`; releasing it restores the previous level and clears
+`0x3D03`. The level registers use 10 units per dB, negative for attenuation.
+
+Talkback is one 19-word activation burst: the Phones/Main sends, the
+`0x1803`/`0x1903` FX-return values and `0x3F9E` bit 0. The OFF burst restores
+the same addresses. Source selection writes nothing, and the burst is
+invariant to the source and to the Dim level; both are host-side settings in
+the reference application.
+
 ## 12. Streaming
 
 ### 12.1 ISO interface 0
