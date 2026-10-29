@@ -21,7 +21,7 @@ the TuxMix latency line.
  | (class-compliant)    |          | (vendor protocol)           |
  |                      |          |                             |
  | URB queue            |          | URB queue                   |
- | implicit feedback    |          | fb_delay + out_lead         |
+ | UAC feedback         |          | fb_delay + out_lead         |
  | no vendor 60 lead    |          | 60-frame UCX lead           |
  +----------+-----------+          +--------------+--------------+
             |                                     |
@@ -105,7 +105,9 @@ measured cable path: 3.83 ms median, 3.47 ms mean
 ```
 
 The MR18 class-compliant reference measured **3.32 ms** on the same cable
-probe. Its class driver has implicit feedback and no 60-frame vendor lead.
+probe. Its class driver has UAC feedback and no 60-frame vendor lead. The
+MR18 descriptor exposes a sync endpoint, so its feedback is explicit rather
+than implicit.
 
 ## 4. Where the latency is spent
 
@@ -121,9 +123,25 @@ probe. Its class driver has implicit feedback and no 60-frame vendor lead.
 5. **Scheduling/start phase** — moves a single measurement by up to one USB
    frame; it cancels in cable-minus-internal and is not part of the budget.
 
-The class driver removes the 60-frame vendor lead and uses implicit feedback;
-that is why the MR18 can be lower even on the same Linux/PipeWire stack. The
-remaining UCX margin is a device property, not an ALSA setting.
+The class driver removes the 60-frame vendor lead and uses its own UAC
+feedback/queue; that is part of why the MR18 can be lower on the same
+Linux/PipeWire stack. The MR18's sync endpoint indicates explicit feedback,
+not implicit feedback. The remaining UCX margin is a device property, not an
+ALSA setting.
+
+### What implicit feedback means
+
+A USB Audio asynchronous playback endpoint needs the host to adapt its send
+rate to the device clock. The normal mechanism is an explicit feedback
+endpoint that reports the required rate. Some devices omit that endpoint; in
+that case `snd-usb-audio` can use the **capture stream** as the reference:
+playback URBs are queued from capture URB completion and the captured packet
+sizes are copied into the playback packets.
+
+That is implicit feedback. It is a UAC timing mechanism, not the same as the
+`lowlatency` URB-requeue mode. The `snd-usb-audio` module has an
+`implicit_fb` override for devices with broken descriptors; the MR18 is not
+an implicit-feedback example because its descriptor exposes a sync endpoint.
 
 ## 5. Experiment summary
 
