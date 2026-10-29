@@ -16,6 +16,8 @@ pub struct ModelSpec {
     pub card_id: &'static str,
     pub profile: &'static DeviceProfile,
     pub capabilities: DeviceCapabilities,
+    /// The clock sources the unit's Settings dialog offers, in order.
+    pub clock_sources: &'static [&'static str],
 }
 
 pub const UC: ModelSpec = ModelSpec {
@@ -50,6 +52,7 @@ pub const UC: ModelSpec = ModelSpec {
         eq_for_record: false,
         optical_out: true,
     },
+    clock_sources: &["Internal", "SPDIF Coaxial", "Optical", "Word Clock", "LTC"],
 };
 
 pub const UCX: ModelSpec = ModelSpec {
@@ -87,6 +90,9 @@ pub const UCX: ModelSpec = ModelSpec {
         eq_for_record: true,
         optical_out: true,
     },
+    // The UCX has no LTC clock source (manual 7.1): Internal, Word,
+    // SPDIF coax. and Optical In.  Its clock field is two bits.
+    clock_sources: &["Internal", "SPDIF Coaxial", "Optical", "Word Clock"],
 };
 
 pub fn for_model(model: Model) -> &'static ModelSpec {

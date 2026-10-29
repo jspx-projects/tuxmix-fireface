@@ -345,6 +345,16 @@ pub mod ucx {
         })
     }
 
+    /// Map an IF1 input-gain state address (`0x0007`, `0x0107`,
+    /// `0x0207`, `0x0307`) to the input index.
+    pub fn input_gain_index(addr: u16) -> Option<usize> {
+        if addr & 0xff != offset::GAIN_REFLEVEL_OR_PHASE as u16 {
+            return None;
+        }
+        let channel = (addr >> 8) as usize;
+        (channel < 4).then_some(channel)
+    }
+
     /// Map an IF1 output-volume state address (channel 0x12..0x23, offset
     /// 0) to TuxMix's Phones-first output-channel index.
     pub fn output_index_from_state(addr: u16) -> Option<usize> {

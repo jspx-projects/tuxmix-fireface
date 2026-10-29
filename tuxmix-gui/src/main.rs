@@ -135,6 +135,8 @@ fn main() -> iced::Result {
     );
     let start_out = arg_value(&args, "--select-out").and_then(|v| v.parse::<usize>().ok());
     let start_flyouts = arg_value(&args, "--flyouts");
+    // Open the device sheet before the first frame, for screenshots.
+    let start_device_panel = args.iter().any(|a| a == "--device-panel");
     let saved_prefs = prefs::path().map(|p| prefs::load(&p));
     let saved_size = saved_prefs
         .as_ref()
@@ -198,6 +200,10 @@ fn main() -> iced::Result {
             }
             if let Some(spec) = start_flyouts.as_deref() {
                 app::open_startup_flyouts(&mut state, spec);
+            }
+            if start_device_panel {
+                state.show_device_panel = true;
+                state.show_settings = false;
             }
             state.fullscreen = start_fullscreen;
             state.tray_active = tray_active;

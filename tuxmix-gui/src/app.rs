@@ -1153,6 +1153,9 @@ impl DeviceHandle {
         if let DeviceHandle::Fireface(d) = self {
             return d.set_spdif_professional(on);
         }
+        if let DeviceHandle::Mock(d) = self {
+            return d.set_spdif_professional(on);
+        }
         Ok(())
     }
 
@@ -1160,6 +1163,20 @@ impl DeviceHandle {
         #[cfg(feature = "alsa")]
         if let DeviceHandle::Fireface(d) = self {
             return d.set_word_clock_single_speed(on);
+        }
+        if let DeviceHandle::Mock(d) = self {
+            return d.set_word_clock_single_speed(on);
+        }
+        Ok(())
+    }
+
+    pub fn set_word_clock_termination(&mut self, on: bool) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_word_clock_termination(on);
+        }
+        if let DeviceHandle::Mock(d) = self {
+            return d.set_word_clock_termination(on);
         }
         Ok(())
     }
@@ -1287,6 +1304,18 @@ impl DeviceHandle {
             DeviceHandle::Uc(_) => true,
             #[cfg(feature = "alsa")]
             DeviceHandle::Fireface(d) => d.model() == FirefaceModel::Uc,
+            _ => false,
+        }
+    }
+
+    /// True for a Fireface UCX model regardless of which backend drives it.
+    pub fn is_ucx_model(&self) -> bool {
+        match self {
+            DeviceHandle::Mock(d) => d.is_ucx(),
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Ucx(_) => true,
+            #[cfg(feature = "alsa")]
+            DeviceHandle::Fireface(d) => d.model() == FirefaceModel::Ucx,
             _ => false,
         }
     }
@@ -1591,6 +1620,7 @@ pub enum Message {
     PhonesRefSelected(u16),
     SpdifProfessionalChanged(bool),
     WordClockSingleSpeedChanged(bool),
+    WordClockTerminationChanged(bool),
     /// The CUE button on an Output strip — exclusive across every
     /// output (see `RmeDevice::set_cue`'s own doc comment), so this
     /// always carries the *target* state, not a relative toggle.
@@ -1814,6 +1844,11 @@ pub(crate) const DB_INPUT_ID: &str = "strip-db";
 pub struct StartupMismatch {
     pub items: Vec<String>,
     pub device_state: tuxmix_core::fireface::ReadableState,
+    /// The saved scene, for "Use TuxMix settings": the connect write keeps
+    /// the unit's readable values, so choosing TuxMix has to write them.
+    pub tuxmix_scene: Scene,
+    /// The scene's input gains after the UCX half-dB migration.
+    pub tuxmix_gain: Vec<(usize, u32)>,
 }
 
 pub struct TuxMix {
@@ -2860,6 +2895,13 @@ pub fn apply_startup_sync(state: &mut TuxMix) {
     }
     if state.device.needs_scene_restore() {
         let model = state.device.canonical_model().to_string();
+        // The UCX state stream starts with the unit's current gain, output
+        // volumes and monitor flags.  Drain it before applying the scene so
+        // the read-back gain wins over the saved value.  The UC path keeps
+        // its startup suppression and is not drained here.
+        if state.device.is_ucx_model() {
+            let _ = state.device.poll_events();
+        }
         let scene = load_scene_for_current(state);
         let Some(scene) = scene else {
             log::warn!("no auto scene found for {model}");
@@ -2881,9 +2923,13 @@ pub fn apply_startup_sync(state: &mut TuxMix) {
             if let Some(device_state) = state.device.readable_state() {
                 let items = device_state.differences(&scene);
                 if !items.is_empty() {
+                    let tuxmix_gain =
+                        scene_gain_pairs(&scene, state.device.is_ucx_model());
                     state.startup_mismatch = Some(StartupMismatch {
                         items,
                         device_state,
+                        tuxmix_scene: scene.clone(),
+                        tuxmix_gain,
                     });
                 }
             }
@@ -2894,6 +2940,21 @@ pub fn apply_startup_sync(state: &mut TuxMix) {
                 // topology.  Keep that normalized view as the host scene so
                 // the next auto-save cannot write stale names/order back.
                 state.host_scene = Some(state.device.capture_scene());
+                if state.always_init_device {
+                    // "Always use TuxMix settings" skips the dialog, so the
+                    // same readable values it would write are pushed here.
+                    let tuxmix_gain =
+                        scene_gain_pairs(&scene, state.device.is_ucx_model());
+                    apply_tuxmix_mismatch(
+                        state,
+                        &StartupMismatch {
+                            items: Vec::new(),
+                            device_state: Default::default(),
+                            tuxmix_scene: scene.clone(),
+                            tuxmix_gain,
+                        },
+                    );
+                }
                 if state.device.is_uc_model() {
                     // Reapply this exact host scene after the engine has
                     // started.  Do not capture the model at that point: a
@@ -4107,6 +4168,7 @@ fn is_undoable(message: &Message) -> bool {
             | Message::PhonesRefSelected(_)
             | Message::SpdifProfessionalChanged(_)
             | Message::WordClockSingleSpeedChanged(_)
+            | Message::WordClockTerminationChanged(_)
             | Message::OpenRepoUrl
             | Message::Undo
             | Message::Redo
@@ -4137,6 +4199,100 @@ fn is_undoable(message: &Message) -> bool {
     )
 }
 
+/// Copy the non-undoable device group from the current saved scene into a
+/// scene that is about to be applied.  Undo/redo scenes are captured around
+/// mixer edits, so they can predate a later device-settings change; applying
+/// them must not roll that change back in the model without writing it.
+fn keep_device_settings(scene: &mut Scene, current: &Scene) {
+    let d = &current.settings;
+    let s = &mut scene.settings;
+    s.clock_source = d.clock_source.clone();
+    s.clock_sources = d.clock_sources.clone();
+    s.optical_out_spdif = d.optical_out_spdif;
+    s.spdif_professional = d.spdif_professional;
+    s.word_clock_single_speed = d.word_clock_single_speed;
+    s.word_clock_termination = d.word_clock_termination;
+    s.eq_for_record = d.eq_for_record;
+    s.line_in_ref = d.line_in_ref;
+    s.line_in_ref_58 = d.line_in_ref_58;
+    s.line_out_ref = d.line_out_ref;
+    s.phones_ref = d.phones_ref;
+    s.sample_rate = d.sample_rate;
+}
+
+/// The scene's input gains for "Use TuxMix", migrating the old UCX 3/4
+/// whole-dB scale (`gain_max = 12`) to raw half-dB units.
+fn scene_gain_pairs(scene: &Scene, ucx: bool) -> Vec<(usize, u32)> {
+    scene
+        .inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, input)| {
+            input.gain.map(|gain| {
+                let gain = if ucx && input.gain_max == Some(12) {
+                    (gain * 2).min(24)
+                } else {
+                    gain
+                };
+                (idx, gain)
+            })
+        })
+        .collect()
+}
+
+/// "Use TuxMix settings" on the startup mismatch: write the saved scene's
+/// readable values.  The connect write keeps the device's readable values,
+/// so the scene has to be pushed for the fields the dialog compared.
+fn apply_tuxmix_mismatch(state: &mut TuxMix, mismatch: &StartupMismatch) {
+    if state.device.is_ucx_model() {
+        for &(idx, gain) in &mismatch.tuxmix_gain {
+            if let Err(e) = state.device.set_gain(idx, gain) {
+                fail(state, "use TuxMix gain", &e);
+            }
+        }
+    } else {
+        let scene = &mismatch.tuxmix_scene;
+        if let Err(e) = state.device.set_clock_source(&scene.settings.clock_source) {
+            fail(state, "set_clock_source", &e);
+        }
+        if let Err(e) = state
+            .device
+            .set_optical_out_format(scene.settings.optical_out_spdif)
+        {
+            fail(state, "set_optical_out_format", &e);
+        }
+        if let Err(e) = state
+            .device
+            .set_spdif_professional(scene.settings.spdif_professional)
+        {
+            fail(state, "set_spdif_professional", &e);
+        }
+        for i in 0..2 {
+            if let Some(input) = scene.inputs.get(i) {
+                if let Err(e) = state.device.set_phantom(i, input.phantom) {
+                    fail(state, "set_phantom", &e);
+                }
+            }
+        }
+        for i in 2..4 {
+            if let Some(input) = scene.inputs.get(i) {
+                if let Err(e) = state.device.set_pad(i, input.pad) {
+                    fail(state, "set_pad", &e);
+                }
+                if let Err(e) = state.device.set_instrument(i, input.instrument) {
+                    fail(state, "set_instrument", &e);
+                }
+            }
+        }
+        for &(idx, gain) in &mismatch.tuxmix_gain {
+            if let Err(e) = state.device.set_gain(idx, gain) {
+                fail(state, "use TuxMix gain", &e);
+            }
+        }
+    }
+    state.host_scene = Some(state.device.capture_scene());
+}
+
 /// Whether `message` changes the mix away from the recalled snapshot:
 /// everything that would push an undo step, plus the steps of a fader
 /// drag (`VolumeChanged`, kept off the undo stack, see `is_undoable`) and
@@ -4146,6 +4302,22 @@ fn changes_mix(message: &Message) -> bool {
     match message {
         Message::SnapshotClicked(_) => false,
         Message::VolumeChanged(..) | Message::MatrixCellChanged(..) | Message::Undo | Message::Redo => true,
+        // Device-owned and host-mode settings that live in the saved scene
+        // but are not undo steps.  No UCX options-word readback is exposed,
+        // so its values reach the scene only through this merge.
+        Message::ClockSourceSelected(_)
+        | Message::MsProcChanged(_)
+        | Message::An12Changed(_)
+        | Message::InputLinkChanged(_)
+        | Message::EqForRecordChanged(_)
+        | Message::OpticalOutFormatChanged(_)
+        | Message::LineInRefSelected(_)
+        | Message::LineInRef58Selected(_)
+        | Message::LineOutRefSelected(_)
+        | Message::PhonesRefSelected(_)
+        | Message::SpdifProfessionalChanged(_)
+        | Message::WordClockSingleSpeedChanged(_)
+        | Message::WordClockTerminationChanged(_) => true,
         other => is_undoable(other),
     }
 }
@@ -4622,7 +4794,9 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             Err(e) => log::warn!("Could not change the autostart entry: {e}"),
         },
         Message::MismatchUseTuxmix => {
-            state.startup_mismatch = None;
+            if let Some(mismatch) = state.startup_mismatch.take() {
+                apply_tuxmix_mismatch(state, &mismatch);
+            }
             state.sync_direction = SyncDirection::GuiToDevice;
         }
         Message::MismatchUseDevice => {
@@ -4630,11 +4804,14 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 if let Err(e) = state.device.restore_readable(&mismatch.device_state) {
                     fail(state, "restore device settings", &e);
                 }
+                state.host_scene = Some(state.device.capture_scene());
             }
             state.sync_direction = SyncDirection::GuiToDevice;
         }
         Message::MismatchAlwaysTuxmix => {
-            state.startup_mismatch = None;
+            if let Some(mismatch) = state.startup_mismatch.take() {
+                apply_tuxmix_mismatch(state, &mismatch);
+            }
             state.always_init_device = true;
             state.prefs_dirty = true;
             state.sync_direction = SyncDirection::GuiToDevice;
@@ -5263,6 +5440,12 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
             notify_osc_bool(state, "/word_clock_single_speed", on);
         }
+        Message::WordClockTerminationChanged(on) => {
+            if let Err(e) = state.device.set_word_clock_termination(on) {
+                fail(state, "set_word_clock_termination", &e);
+            }
+            notify_osc_bool(state, "/word_clock_termination", on);
+        }
         Message::CueChanged(cid, on) => {
             select_strip(state, cid);
             if let ChannelId::Output(idx) = cid {
@@ -5620,12 +5803,13 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         // ── Right sidebar ────────────────────────────────────────────
         Message::Undo => {
             state.undo_gesture = None;
-            if let Some(scene) = state.undo_stack.pop() {
+            if let Some(mut scene) = state.undo_stack.pop() {
                 let current = state
                     .host_scene
                     .clone()
                     .unwrap_or_else(|| state.device.capture_scene());
-                state.redo_stack.push(current);
+                state.redo_stack.push(current.clone());
+                keep_device_settings(&mut scene, &current);
                 if let Err(e) = state.device.apply_scene(&scene) {
                     fail(state, "undo", &e);
                 } else {
@@ -5635,12 +5819,13 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         }
         Message::Redo => {
             state.undo_gesture = None;
-            if let Some(scene) = state.redo_stack.pop() {
+            if let Some(mut scene) = state.redo_stack.pop() {
                 let current = state
                     .host_scene
                     .clone()
                     .unwrap_or_else(|| state.device.capture_scene());
-                state.undo_stack.push(current);
+                state.undo_stack.push(current.clone());
+                keep_device_settings(&mut scene, &current);
                 if let Err(e) = state.device.apply_scene(&scene) {
                     fail(state, "redo", &e);
                 } else {
@@ -6024,8 +6209,13 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
     }
     if let Some(before) = host_before {
         let after = state.device.capture_scene();
+        // The UCX options word, references and 48 V/Inst/Level switches have
+        // no readback, so a host change is the only record.  Gain is read
+        // back from the state stream.  The UC reads its device group again
+        // at connect and keeps the unit's values.
+        let include_device = state.device.is_ucx_model();
         if let Some(host) = state.host_scene.as_mut() {
-            host.merge_host_changes(&before, &after);
+            host.merge_host_changes_with_device(&before, &after, include_device);
         } else {
             state.host_scene = Some(after);
         }
@@ -6547,7 +6737,8 @@ fn device_panel(state: &TuxMix) -> Element<'_, Message> {
     let modifiers = state.modifiers;
 
     // Caption column shared by every labelled row, so the controls line up.
-    const LABEL_W: f32 = 92.0;
+    // Wide enough for the longest device label, "Single speed word clock".
+    const LABEL_W: f32 = 138.0;
     let section = |label: &'static str| -> Element<'static, Message> {
         row![
             text(label)
@@ -6668,10 +6859,12 @@ fn device_panel(state: &TuxMix) -> Element<'_, Message> {
         if caps.input_link {
             flags.push(("Input Link", settings.input_link, Message::InputLinkChanged));
         }
-        if caps.eq_for_record {
+        // The Fireface options word lives in the device group above; its
+        // host-side modes stay here.
+        if caps.eq_for_record && !state.device.is_uc_family() {
             flags.push(("EQ for Record", settings.eq_for_record, Message::EqForRecordChanged));
         }
-        if caps.optical_out {
+        if caps.optical_out && !state.device.is_uc_family() {
             flags.push(("Opt Out: SPDIF", settings.optical_out_spdif, Message::OpticalOutFormatChanged));
         }
         if !flags.is_empty() {
@@ -6894,15 +7087,17 @@ pub(crate) fn sidebar_px(state: &TuxMix) -> f32 {
 /// attached.
 ///
 /// Rows are the unit's own, not the app's: a model with no register for one
-/// is left without it rather than shown inert. The UC's Gain-tab reference
-/// levels (`0x17`), SPDIF professional and word-clock rate live only in the
-/// UC's options word; the UCX sets output levels per channel and its own
-/// options word carries none of the three (`docs/work/UCX-OPEN-ITEMS.md`).
+/// is left without it rather than shown inert. The UC keeps its Gain-tab
+/// reference levels (`0x17`) and its options word; the UCX has no global
+/// reference register (they are per channel) and its options word carries
+/// the optical format, SPDIF professional, word-clock output rate and
+/// termination, and EQ+D for Record (`docs/spec/UCX-CONTROL-SPEC.md` §11).
 fn device_group(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
     let scale = state.ui_scale;
     let ts = scale * 1.15;
     let settings = state.device.settings();
     let uc = state.device.is_uc_model();
+    let ucx = state.device.is_ucx_model();
     let section = |label: &'static str| -> Element<'static, Message> {
         row![
             text(label)
@@ -6952,13 +7147,35 @@ fn device_group(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
         .align_y(iced::Alignment::Center)
         .into()
     };
-    let toggle = |label: &'static str, active: bool, message: Message| {
-        iced::widget::button(text(label).size(theme::TEXT_XS * ts).center())
-            .padding([theme::SPACE_SM * scale, theme::SPACE_MD * scale])
-            .width(Length::Fill)
-            .style(theme::toggle_button(active, theme::ACCENT))
-            .on_press(message)
+    let checkbox = |on: bool, message: Message| {
+        iced::widget::button(
+            text(if on { "\u{2713}" } else { "" })
+                .size(theme::TEXT_MD * ts)
+                .center(),
+        )
+        .padding(0)
+        .width(Length::Fixed(SETTINGS_CONTROL_H * scale))
+        .height(Length::Fixed(SETTINGS_CONTROL_H * scale))
+        .style(theme::toggle_button(on, theme::ACCENT))
+        .on_press(message)
     };
+    let check_row = |label: &'static str, on: bool, message: Message| {
+        row![caption(label), checkbox(on, message)]
+            .spacing(theme::SPACE_MD * scale)
+            .align_y(iced::Alignment::Center)
+    };
+    let choice = |options: [&'static str; 2], current: bool, message: fn(bool) -> Message| {
+        let list: Vec<String> = options.iter().map(|s| s.to_string()).collect();
+        let selected = options[if current { 1 } else { 0 }].to_string();
+        let second = options[1];
+        field(pick_list(list, Some(selected), move |s| message(s == second)))
+    };
+    let choice_row =
+        |label: &'static str, options: [&'static str; 2], current: bool, message: fn(bool) -> Message| {
+            row![caption(label), choice(options, current, message)]
+                .spacing(theme::SPACE_MD * scale)
+                .align_y(iced::Alignment::Center)
+        };
 
     let firmware = state
         .device
@@ -7027,9 +7244,13 @@ fn device_group(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
 
     let mut body = column![
         section("DEVICE"),
-        text("Read from the unit at connect; written only when changed here.")
-            .color(theme::TEXT_SEC)
-            .size(theme::TEXT_MICRO * ts),
+        text(if ucx {
+            "Kept in the saved scene; written only when changed here."
+        } else {
+            "Read from the unit at connect; written only when changed here."
+        })
+        .color(theme::TEXT_SEC)
+        .size(theme::TEXT_MICRO * ts),
         row![
             caption("Clock source"),
             field(pick_list(
@@ -7058,30 +7279,48 @@ fn device_group(state: &TuxMix, label_w: f32) -> Element<'_, Message> {
         );
     }
     if uc {
-        // UC-only: the Gain tab's reference levels and the two options-word
-        // flags. The UCX has no global register for any of them.
+        // UC-only: the Gain tab's reference levels are one word (`0x17`).
+        // The UCX sets them per channel, in the channel panels.
         body = body
             .push(ref_row("Line In", ["Lo Gain", "+4 dBu", "-10 dBV"], [0, 1, 3], settings.line_in_ref, Message::LineInRefSelected))
             .push(ref_row("Line Out", ["Hi Gain", "+4 dBu", "-10 dBV"], [2, 3, 1], settings.line_out_ref, Message::LineOutRefSelected))
-            .push(ref_row("Phones", ["Hi Gain", "+4 dBu", "-10 dBV"], [1, 3, 2], settings.phones_ref, Message::PhonesRefSelected))
-            .push(toggle(
-                if settings.optical_out_spdif { "Optical out: SPDIF" } else { "Optical out: ADAT" },
-                settings.optical_out_spdif,
-                Message::OpticalOutFormatChanged(!settings.optical_out_spdif),
-            ))
-            .push(toggle(
-                "SPDIF professional",
-                settings.spdif_professional,
-                Message::SpdifProfessionalChanged(!settings.spdif_professional),
-            ))
-            .push(toggle(
-                "Word clock out: single speed",
+            .push(ref_row("Phones", ["Hi Gain", "+4 dBu", "-10 dBV"], [1, 3, 2], settings.phones_ref, Message::PhonesRefSelected));
+    }
+    if uc || ucx {
+        // Both options words carry the output format.  The UCX adds
+        // word-clock input termination and EQ+D for Record (H67/H68/H75,
+        // H71/H101).
+        body = body
+            .push(check_row(
+                "Single speed word clock",
                 settings.word_clock_single_speed,
                 Message::WordClockSingleSpeedChanged(!settings.word_clock_single_speed),
+            ))
+            .push(choice_row(
+                "Optical",
+                ["ADAT", "SPDIF"],
+                settings.optical_out_spdif,
+                Message::OpticalOutFormatChanged,
+            ))
+            .push(choice_row(
+                "SPDIF",
+                ["Consumer", "Professional"],
+                settings.spdif_professional,
+                Message::SpdifProfessionalChanged,
             ));
-    } else if state.device.is_uc_family() {
-        // UCX references live in the channel panels (inputs 3-8 and the
-        // line-output pairs), next to the channels they apply to.
+        if ucx {
+            body = body
+                .push(check_row(
+                    "Word clock in",
+                    settings.word_clock_termination,
+                    Message::WordClockTerminationChanged(!settings.word_clock_termination),
+                ))
+                .push(check_row(
+                    "EQ for Record",
+                    settings.eq_for_record,
+                    Message::EqForRecordChanged(!settings.eq_for_record),
+                ));
+        }
     }
     if state.device.firmware().is_some() {
         body = body.push(
@@ -7257,6 +7496,20 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
                         theme::TEXT_SEC,
                     ));
                 }
+            } else if state.device.is_ucx_model() {
+                if let Some(queue) = state.driver_queue {
+                    let (usb, lead) = ucx_usb_frames(card.rate, queue);
+                    let total = card.buffer + usb + lead;
+                    col = col.push(line(
+                        format!(
+                            "{:.1} ms USB + {:.1} ms device lead ≈ {:.1} ms total",
+                            frames_ms(usb, card.rate),
+                            frames_ms(lead, card.rate),
+                            frames_ms(total, card.rate)
+                        ),
+                        theme::TEXT_SEC,
+                    ));
+                }
             }
             // Only when the user asked for a size and the card ignores it
             // (a fixed period in a WirePlumber rule); "Auto" follows clients.
@@ -7303,6 +7556,38 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
                     ));
                 }
                 col.into()
+            } else if state.device.is_ucx_model() {
+                let mut periods = 2;
+                if let Some(queue) = state.driver_queue {
+                    let minimum = ucx_min_buffer_frames(rate, queue);
+                    periods = minimum.div_ceil(quantum.max(1)).max(2);
+                }
+                let buffer = quantum.max(1).saturating_mul(periods);
+                let mut col = column![line(
+                    format!(
+                        "{:.1} ms buffer ({} × {}) at {}",
+                        frames_ms(buffer, rate),
+                        periods,
+                        quantum,
+                        rate_label(rate)
+                    ),
+                    theme::TEXT_PRIMARY,
+                )]
+                .spacing(theme::SPACE_TIGHT * scale);
+                if let Some(queue) = state.driver_queue {
+                    let (usb, lead) = ucx_usb_frames(rate, queue);
+                    let total = buffer + usb + lead;
+                    col = col.push(line(
+                        format!(
+                            "{:.1} ms USB + {:.1} ms device lead ≈ {:.1} ms total",
+                            frames_ms(usb, rate),
+                            frames_ms(lead, rate),
+                            frames_ms(total, rate)
+                        ),
+                        theme::TEXT_SEC,
+                    ));
+                }
+                col.into()
             } else {
                 line(
                     format!(
@@ -7335,6 +7620,25 @@ fn uc_usb_frames(rate: u32, (frames, urbs): (u32, u32)) -> (u32, u32) {
 fn uc_min_buffer_frames(rate: u32, queue: (u32, u32)) -> u32 {
     let (usb, endpoint) = uc_usb_frames(rate, queue);
     usb + 2 * endpoint
+}
+
+/// Frames in one UCX USB URB: up to eight 1 ms ISO packets of
+/// `ceil(rate / 8000)` frames each.
+fn ucx_urb_frames(rate: u32, urb_frames: u32) -> u32 {
+    let iso_packets = 8.min(urb_frames.max(1).div_ceil(6));
+    iso_packets * rate.max(1).div_ceil(8000)
+}
+
+/// Frames covered by the UCX's host queue and device lead at the current
+/// rate.  The queued depth is `nurbs + 1` URBs (`fb_delay`), and the unit
+/// adds a 60-frame output lead.
+fn ucx_usb_frames(rate: u32, (urb_frames, urbs): (u32, u32)) -> (u32, u32) {
+    ((urbs + 1) * ucx_urb_frames(rate, urb_frames), 60)
+}
+
+/// Frames the UCX's ALSA ring needs: `nurbs + 2` URBs of margin.
+fn ucx_min_buffer_frames(rate: u32, (urb_frames, urbs): (u32, u32)) -> u32 {
+    (urbs + 2) * ucx_urb_frames(rate, urb_frames)
 }
 
 fn frames_ms(frames: u32, rate: u32) -> f32 {
@@ -11623,10 +11927,13 @@ mod tests {
         channel_trim, trim_factor,
         apply_prefs, channel_is_muted, channel_is_soloed, choose_startup_kind,
         choose_startup_target,
-        frames_ms, is_undoable, new, new_with_device, apply_startup_sync, prefs_of,
-        mute_armed, power_sum_output_meters, reorder_pair_volumes,
-        uc_min_buffer_frames, uc_usb_frames, update, zoom, ChannelId, DeviceKind,
-        DeviceTarget, EditField, MeterAnim, Message, RowMode, View, ZOOM_STEP,
+        frames_ms, is_undoable, new, new_with_device,
+        apply_startup_sync, prefs_of, mute_armed, power_sum_output_meters,
+        reorder_pair_volumes,
+        uc_min_buffer_frames, uc_usb_frames, ucx_min_buffer_frames,
+        ucx_urb_frames, ucx_usb_frames, update, zoom, ChannelId, DeviceHandle,
+        DeviceKind, DeviceTarget, EditField, MeterAnim, Message, RowMode, View,
+        ZOOM_STEP,
         FX_ECHO_CONTROLS_H, FX_FADER_W, FX_HEADER_H, FX_KNOBS_W, FX_REV_CONTROLS_H,
         FX_REV_TAIL_H, FX_ROW_H, FX_TYPE_H, FX_W,
     };
@@ -11668,6 +11975,20 @@ mod tests {
         assert_eq!(uc_usb_frames(96_000, (48, 2)), (192, 96));
         assert_eq!(uc_min_buffer_frames(44_100, (48, 2)), 192);
         assert!((frames_ms(256, 44_100) - 5.805).abs() < 0.01);
+    }
+
+    #[test]
+    fn ucx_latency_chain_counts_queue_and_device_lead() {
+        // Eight 1 ms ISO packets per URB at the default 48-frame size.
+        assert_eq!(ucx_urb_frames(48_000, 48), 48);
+        assert_eq!(ucx_urb_frames(96_000, 48), 96);
+        assert_eq!(ucx_usb_frames(48_000, (48, 2)), (144, 60));
+        assert_eq!(ucx_usb_frames(96_000, (48, 2)), (288, 60));
+        // nurbs + 2 URBs of ring margin.
+        assert_eq!(ucx_min_buffer_frames(48_000, (48, 2)), 192);
+        assert_eq!(ucx_min_buffer_frames(96_000, (48, 2)), 384);
+        assert!((frames_ms(144, 48_000) - 3.0).abs() < 0.01);
+        assert!((frames_ms(60, 48_000) - 1.25).abs() < 0.01);
     }
 
     #[test]
@@ -12041,6 +12362,32 @@ mod tests {
     }
 
     #[test]
+    fn undo_does_not_roll_back_device_settings() {
+        let mut state = new(true, None, None);
+        state.device = DeviceHandle::open_mock_ucx();
+        state.host_scene = Some(state.device.capture_scene());
+        // A mixer edit creates the undo step.
+        let _ = update(
+            &mut state,
+            Message::VolumeChanged(ChannelId::Input(0), 0, 0.5),
+        );
+        // The option is not an undo step, and it changes the device.
+        let _ = update(&mut state, Message::WordClockTerminationChanged(true));
+        assert!(state.device.settings().word_clock_termination);
+        let _ = update(&mut state, Message::Undo);
+        assert!(
+            state.device.settings().word_clock_termination,
+            "undoing a mixer edit must not roll back a device setting"
+        );
+        assert!(state
+            .host_scene
+            .as_ref()
+            .unwrap()
+            .settings
+            .word_clock_termination);
+    }
+
+    #[test]
     fn redo_reapplies_after_undo() {
         let mut state = new(true, None, None);
         let cid = ChannelId::Input(0);
@@ -12364,6 +12711,26 @@ mod tests {
         let _ = update(&mut state, Message::CueChanged(b, false));
         assert!(!state.device.outputs()[2].cue, "explicit off clears it");
         assert!(!state.device.outputs()[3].cue);
+    }
+
+    #[test]
+    fn ucx_device_options_reach_the_mock_and_the_saved_scene() {
+        let mut state = new(true, None, None);
+        state.device = DeviceHandle::open_mock_ucx();
+        state.host_scene = Some(state.device.capture_scene());
+
+        let _ = update(&mut state, Message::WordClockTerminationChanged(true));
+        let _ = update(&mut state, Message::SpdifProfessionalChanged(true));
+        let _ = update(&mut state, Message::WordClockSingleSpeedChanged(true));
+
+        let settings = state.device.settings();
+        assert!(settings.word_clock_termination);
+        assert!(settings.spdif_professional);
+        assert!(settings.word_clock_single_speed);
+        let saved = &state.host_scene.as_ref().unwrap().settings;
+        assert!(saved.word_clock_termination);
+        assert!(saved.spdif_professional);
+        assert!(saved.word_clock_single_speed);
     }
 
     #[test]

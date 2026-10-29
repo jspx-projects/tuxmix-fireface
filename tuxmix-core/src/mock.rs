@@ -148,11 +148,12 @@ impl MockBabyfacePro {
             // AN3/4 are the instrument-capable pair on every Fireface
             // profile; the real device reports this at open.  Keep the mock
             // topology identical so the Settings row matches.  On the UCX
-            // the pair keeps a 0-12 dB gain and a +4 dBu reference.
+            // the pair keeps a 0-12 dB gain in 0.5 dB steps (0..24 raw)
+            // and a +4 dBu reference.
             if (2..4).contains(&i) {
                 ch.has_instrument = true;
                 if capabilities.input_level {
-                    ch.gain_max = Some(12);
+                    ch.gain_max = Some(24);
                     ch.gain = Some(0);
                     ch.level = Some(InputLevel::Plus4dBu);
                     ch.ref_level = 1;
@@ -191,11 +192,22 @@ impl MockBabyfacePro {
             outputs,
             settings: DeviceSettings {
                 clock_source: "Internal".into(),
-                // Mocked from the real Babyface Pro FS's own enum items
-                // (see `babyface.rs::attach_mixer_elements`), so the
-                // Quick Control clock picker has something real to show
-                // in --mock too.
-                clock_sources: vec!["Internal".into(), "AutoSync".into()],
+                // Matches the model's own Settings dialog: the Babyface
+                // Pro FS reports its enum items, the Fireface models use
+                // their fixed source list (the UCX has no LTC).
+                clock_sources: match model_name {
+                    "Fireface UC" => crate::fireface::models::UC
+                        .clock_sources
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
+                    "Fireface UCX" => crate::fireface::models::UCX
+                        .clock_sources
+                        .iter()
+                        .map(|s| (*s).to_string())
+                        .collect(),
+                    _ => vec!["Internal".into(), "AutoSync".into()],
+                },
                 spdif_optical: false,
                 spdif_emphasis: false,
                 spdif_professional: false,
@@ -326,6 +338,22 @@ impl MockBabyfacePro {
                 .map(|c| (&mut c.mute, &mut c.solo))
                 .ok_or_else(|| Error::InvalidChannel(format!("Output {}", idx))),
         }
+    }
+
+    /// Options-word flags, for the device sheet on the simulated models.
+    pub fn set_spdif_professional(&mut self, on: bool) -> Result<(), Error> {
+        self.settings.spdif_professional = on;
+        Ok(())
+    }
+
+    pub fn set_word_clock_single_speed(&mut self, on: bool) -> Result<(), Error> {
+        self.settings.word_clock_single_speed = on;
+        Ok(())
+    }
+
+    pub fn set_word_clock_termination(&mut self, on: bool) -> Result<(), Error> {
+        self.settings.word_clock_termination = on;
+        Ok(())
     }
 }
 
