@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //
-// Impulse-train latency probe for the Fireface family through the ALSA node.
+// Impulse-train latency probe for an ALSA PCM.
 //
 //   alsa-latency-probe <device> <rate> <period> <periods>
 //                      [play_ch] [capture_ch] [capture_ch_b] [channels]
 //
 // Plays a full-scale impulse every 1024 frames on `play_ch`, captures one or
 // two channels on the same PCM and reports the delay of the captured impulse
-// train.  The tool is not Fireface-specific: any ALSA PCM with S32_LE samples
-// and the requested channel count can be used.  The PCM streams are started separately; the capture trigger
+// train.  Any ALSA PCM with S32_LE samples and the requested channel count
+// can be used.  The PCM streams are started separately; the capture trigger
 // timestamp corrects the small start offset.  A second capture channel makes
 // it possible to measure an internal loopback and a cable path in the same
 // run, so the start phase cancels and only the difference remains.
@@ -19,7 +19,7 @@
 //   - cable: route playback to the output, cable output -> input, capture the
 //     input with the internal loopback disabled.
 //
-// Stop TuxMix/PipeWire first: the ALSA node must be free.
+// Stop any server or application that owns the PCM first.
 //
 // The peak detector clusters the phase of the impulse train instead of
 // averaging every local maximum, so ringing and reflections on an analog
