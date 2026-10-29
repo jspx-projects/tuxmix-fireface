@@ -7558,12 +7558,14 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
             if state.device.is_uc_model() {
                 if let Some(queue) = state.driver_queue {
                     let (usb, endpoint) = uc_usb_frames(card.rate, queue);
-                    let total = card.buffer + usb + endpoint;
+                    let converter = converter_frames(card.rate);
+                    let total = card.buffer + usb + endpoint + converter;
                     col = col.push(line(
                         format!(
-                            "{:.1} ms USB + {:.1} ms endpoint ≈ {:.1} ms total",
+                            "{:.1} ms USB + {:.1} ms endpoint + {:.1} ms converter ≈ {:.1} ms total",
                             frames_ms(usb, card.rate),
                             frames_ms(endpoint, card.rate),
+                            frames_ms(converter, card.rate),
                             frames_ms(total, card.rate)
                         ),
                         theme::TEXT_SEC,
@@ -7572,12 +7574,14 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
             } else if state.device.is_ucx_model() {
                 if let Some(queue) = state.driver_queue {
                     let (usb, lead) = ucx_usb_frames(card.rate, queue);
-                    let total = card.buffer + usb + lead;
+                    let converter = converter_frames(card.rate);
+                    let total = card.buffer + usb + lead + converter;
                     col = col.push(line(
                         format!(
-                            "{:.1} ms USB + {:.1} ms device lead ≈ {:.1} ms total",
+                            "{:.1} ms USB + {:.1} ms device lead + {:.1} ms converter ≈ {:.1} ms total",
                             frames_ms(usb, card.rate),
                             frames_ms(lead, card.rate),
+                            frames_ms(converter, card.rate),
                             frames_ms(total, card.rate)
                         ),
                         theme::TEXT_SEC,
@@ -7617,12 +7621,14 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
                 .spacing(theme::SPACE_TIGHT * scale);
                 if let Some(queue) = state.driver_queue {
                     let (usb, endpoint) = uc_usb_frames(rate, queue);
-                    let total = buffer + usb + endpoint;
+                    let converter = converter_frames(rate);
+                    let total = buffer + usb + endpoint + converter;
                     col = col.push(line(
                         format!(
-                            "{:.1} ms USB + {:.1} ms endpoint ≈ {:.1} ms total",
+                            "{:.1} ms USB + {:.1} ms endpoint + {:.1} ms converter ≈ {:.1} ms total",
                             frames_ms(usb, rate),
                             frames_ms(endpoint, rate),
+                            frames_ms(converter, rate),
                             frames_ms(total, rate)
                         ),
                         theme::TEXT_SEC,
@@ -7649,12 +7655,14 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
                 .spacing(theme::SPACE_TIGHT * scale);
                 if let Some(queue) = state.driver_queue {
                     let (usb, lead) = ucx_usb_frames(rate, queue);
-                    let total = buffer + usb + lead;
+                    let converter = converter_frames(rate);
+                    let total = buffer + usb + lead + converter;
                     col = col.push(line(
                         format!(
-                            "{:.1} ms USB + {:.1} ms device lead ≈ {:.1} ms total",
+                            "{:.1} ms USB + {:.1} ms device lead + {:.1} ms converter ≈ {:.1} ms total",
                             frames_ms(usb, rate),
                             frames_ms(lead, rate),
+                            frames_ms(converter, rate),
                             frames_ms(total, rate)
                         ),
                         theme::TEXT_SEC,
@@ -7712,6 +7720,14 @@ fn ucx_usb_frames(rate: u32, (urb_frames, urbs): (u32, u32)) -> (u32, u32) {
 /// Frames the UCX's ALSA ring needs: `nurbs + 2` URBs of margin.
 fn ucx_min_buffer_frames(rate: u32, (urb_frames, urbs): (u32, u32)) -> u32 {
     (urbs + 2) * ucx_urb_frames(rate, urb_frames)
+}
+
+/// Output converter delay in frames: half of the measured converter
+/// round-trip (25 frames at 1x and 2x, 23 at 4x).  The value is measured on
+/// the UCX and assumed to be the same on the UC.
+fn converter_frames(rate: u32) -> u32 {
+    let round_trip: u32 = if rate > 128_000 { 23 } else { 25 };
+    round_trip.div_ceil(2)
 }
 
 fn frames_ms(frames: u32, rate: u32) -> f32 {
@@ -12044,7 +12060,7 @@ mod tests {
         channel_trim, trim_factor,
         apply_prefs, channel_is_muted, channel_is_soloed, choose_startup_kind,
         choose_startup_target,
-        frames_ms, is_undoable, new, new_with_device,
+        frames_ms, converter_frames, is_undoable, new, new_with_device,
         apply_startup_sync, prefs_of, mute_armed, power_sum_output_meters,
         reorder_pair_volumes,
         uc_min_buffer_frames, uc_usb_frames, ucx_min_buffer_frames,
@@ -12106,6 +12122,11 @@ mod tests {
         assert_eq!(ucx_min_buffer_frames(96_000, (48, 2)), 384);
         assert!((frames_ms(144, 48_000) - 3.0).abs() < 0.01);
         assert!((frames_ms(60, 48_000) - 1.25).abs() < 0.01);
+        // Half of the measured 25-frame converter round trip, 23 at 4x.
+        assert_eq!(converter_frames(44_100), 13);
+        assert_eq!(converter_frames(48_000), 13);
+        assert_eq!(converter_frames(96_000), 13);
+        assert_eq!(converter_frames(192_000), 12);
     }
 
     #[test]
