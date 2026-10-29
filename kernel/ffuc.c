@@ -29,6 +29,8 @@ static unsigned int urb_frames = 48;
 static unsigned int nurbs = 2;
 static bool ucx_if5 = false;
 static unsigned int ucx_if5_frames = 1024;
+static unsigned int ucx_lead_frames = 60;
+static unsigned int fb_extra_urb = 1;
 static unsigned int fixed_rate;
 
 static DEFINE_MUTEX(devices_mutex);
@@ -50,6 +52,10 @@ module_param(ucx_if5, bool, 0444);
 MODULE_PARM_DESC(ucx_if5, "Fireface UCX: bind the Windows-style interrupt interface 5 (default false). The default binds the Mac-style ISO interface 0; set Y only for the Windows transport.");
 module_param(ucx_if5_frames, uint, 0444);
 MODULE_PARM_DESC(ucx_if5_frames, "Fireface UCX interrupt transport: frames per URB at 1x rates (8..1024, default 1024).");
+module_param(ucx_lead_frames, uint, 0444);
+MODULE_PARM_DESC(ucx_lead_frames, "Fireface UCX output lead in frames (0..1024, default 60).");
+module_param(fb_extra_urb, uint, 0444);
+MODULE_PARM_DESC(fb_extra_urb, "Feedback delay extra URB: 1 = (nurbs + 1), 0 = nurbs (default 1).");
 module_param(fixed_rate, uint, 0644);
 MODULE_PARM_DESC(fixed_rate, "Only allow this sample rate (0 = any supported rate).");
 
@@ -1437,13 +1443,14 @@ static void ffuc_iso_setup_urbs(struct ffuc *chip)
 	chip->iso_frames_ok = false;
 	chip->in_end = 0;
 	chip->fb_acc = 0;
-	chip->fb_delay = (chip->nurbs + 1) * chip->iso_packets;
+	chip->fb_delay = (chip->nurbs + (fb_extra_urb ? 1u : 0u)) *
+			 chip->iso_packets;
 	/* OUT data is placed this many frames after the IN position it
 	 * mirrors.  The UCX needs OUT_LEAD (60) frames of margin at the
 	 * unit; the UC path used the vendor's 2 * max_frames - 2 margin. */
 	chip->out_lead = (DIV_ROUND_CLOSEST(chip->fb_delay * chip->rate,
 					    8000) +
-			  (chip->ucx ? 60 : 2 * m->max_frames - 2)) &
+			  (chip->ucx ? ucx_lead_frames : 2 * m->max_frames - 2)) &
 			 (ffuc_iso_wrap(chip) - 1);
 
 	for (dir = 0; dir < 2; dir++) {
@@ -2156,6 +2163,8 @@ static int ffuc_probe(struct usb_interface *intf,
 	card->private_free = ffuc_card_free;
 
 	chip->nurbs = clamp(nurbs, 2u, (unsigned int)FFUC_MAX_URBS);
+	ucx_lead_frames = min(ucx_lead_frames, 1024u);
+	fb_extra_urb = fb_extra_urb ? 1u : 0u;
 	chip->base_urb_frames = clamp(round_up(
 		(chip->ucx && !chip->iso) ? ucx_if5_frames : urb_frames, 8),
 		8u, (chip->ucx && !chip->iso) ? 1024u : 256u);
