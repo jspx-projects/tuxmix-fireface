@@ -92,6 +92,10 @@ pub struct InputChannel {
     /// same as `gain`. `#[serde(default)]` so old scene JSON still loads.
     #[serde(default)]
     pub trim: f32,
+    /// Host-side stereo width, -1..+1 (+1 = full stereo).  Applied to the
+    /// pair's 2x2 send matrix when a send is written.
+    #[serde(default = "default_width")]
+    pub width: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display)]
@@ -247,6 +251,11 @@ pub struct Reverb {
 /// A channel whose send was never set is closed (-65 dB), not at unity.
 pub fn default_fx_send_channel_db() -> f32 {
     -65.0
+}
+
+/// Stereo width centre: +1.0 is full stereo, the no-op value.
+fn default_width() -> f32 {
+    1.0
 }
 
 fn default_attack_ms() -> u16 {
@@ -423,6 +432,10 @@ pub struct PlaybackChannel {
     /// of this channel (see `RmeDevice::set_trim`).
     #[serde(default)]
     pub trim: f32,
+    /// Host-side stereo width, -1..+1 (+1 = full stereo).  Applied to the
+    /// pair's 2x2 send matrix when a send is written.
+    #[serde(default = "default_width")]
+    pub width: f32,
     pub mute: bool,
     pub solo: bool,
 }
@@ -456,6 +469,15 @@ pub struct OutputChannel {
     /// UCX per-output FX Return, 0.1 dB signed (`0xNN03`).
     #[serde(default = "default_fx_return_db")]
     pub fx_return_db: f32,
+    /// Output phase, one side each (`base + 0x07`, `base + 0x107`).
+    #[serde(default)]
+    pub phase_l: bool,
+    #[serde(default)]
+    pub phase_r: bool,
+    /// Excludes this output from Trim Gain changes.  Host-side: the trim
+    /// factor is 1 for sends into a No-Trim destination.
+    #[serde(default)]
+    pub no_trim: bool,
     pub mute: bool,
     pub solo: bool,
     /// CUE engaged — this output's own dedicated playback pair (`PB
@@ -494,6 +516,7 @@ impl InputChannel {
             mute: false,
             solo: false,
             trim: 0.0,
+            width: 1.0,
         }
     }
 }
@@ -508,6 +531,7 @@ impl PlaybackChannel {
             fx_send_db: default_fx_send_channel_db(),
             split: false,
             trim: 0.0,
+            width: 1.0,
             mute: false,
             solo: false,
         }
@@ -525,6 +549,9 @@ impl OutputChannel {
             dynamics: None,
             balance: 0,
             fx_return_db: default_fx_return_db(),
+            phase_l: false,
+            phase_r: false,
+            no_trim: false,
             mute: false,
             solo: false,
             cue: false,

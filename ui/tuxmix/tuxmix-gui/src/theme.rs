@@ -920,6 +920,18 @@ pub fn pick_list(
     }
 }
 
+/// The same pick list surface with the selected label hidden: the Settings
+/// panel draws its own centred label on top, so long values can clip
+/// symmetrically without running under the handle.
+pub fn pick_list_no_text(
+    theme: &iced::Theme,
+    status: iced::widget::pick_list::Status,
+) -> iced::widget::pick_list::Style {
+    let mut style = pick_list(theme, status);
+    style.text_color = Color::TRANSPARENT;
+    style
+}
+
 /// The default 10px scrollbar/scroller reads chunky next to everything
 /// else we've thinned down — 4px is still comfortably grabbable but looks
 /// modern rather than like default browser chrome.

@@ -251,6 +251,7 @@ pub trait RmeDevice {
             loopback: self.loopback_supported(),
             phase: self.phase_supported(),
             phase_without_eq: false,
+            output_phase: false,
             output_balance: self.output_balance_supported(),
             stereo_split: self.stereo_split_supported(),
             matrix_cells: self.matrix_cells_supported(),
@@ -263,6 +264,7 @@ pub trait RmeDevice {
             fx: false,
             pitch: true,
             width: true,
+            channel_width: false,
             ms_proc: true,
             an12: true,
             input_link: true,
@@ -981,6 +983,24 @@ pub trait RmeDevice {
         ))
     }
 
+    /// Phase invert for one hardware output channel (`base + 0x07` for the
+    /// left side, `base + 0x107` for the right).
+    fn set_output_phase(&mut self, idx: usize, invert: bool) -> Result<(), Error> {
+        let _ = (idx, invert);
+        Err(Error::InvalidChannel(
+            "Output phase is not supported on this backend".into(),
+        ))
+    }
+
+    /// Exclude one hardware output from Trim Gain changes.  Host-side: no
+    /// device register, the trim factor is 1 for sends into this output.
+    fn set_no_trim(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        let _ = (idx, on);
+        Err(Error::InvalidChannel(
+            "No Trim is not supported on this backend".into(),
+        ))
+    }
+
     /// FX send level in dB (-65..0, 0 = max send). The backends whose send
     /// is a single global control (Babyface Pro's ALSA "FX Send") use this
     /// one; per-channel backends implement [`Self::set_channel_fx_send`].
@@ -1014,6 +1034,15 @@ pub trait RmeDevice {
         let _ = width;
         Err(Error::InvalidChannel(
             "Width is not supported on this backend".into(),
+        ))
+    }
+
+    /// Per-channel stereo width (-1..+1, +1 = full stereo): the pair's 2x2
+    /// send matrix is rewritten for every routing with a live send.
+    fn set_channel_width(&mut self, channel: ChannelId, width: f32) -> Result<(), Error> {
+        let _ = (channel, width);
+        Err(Error::InvalidChannel(
+            "Channel width is not supported on this backend".into(),
         ))
     }
 

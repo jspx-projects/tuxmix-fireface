@@ -126,10 +126,12 @@ stream live state changes.
 |---|---|
 | `0x3d03` | DIM |
 | `0x3f9e` | monitor flags; bit 1 = MS processing |
+| `0x0007`, `0x0107`, `0x0207`, `0x0307` | input gain 1–4, 0.1 dB |
 | `0x1200..0x2300`, offset 0 | hardware-output volume, signed 0.1 dB |
 
-Output-volume state is mapped to the Phones-first output order. The physical
-Phones encoder emits `0x1800` and `0x1900`.
+Input gains are reported when the physical encoder moves. Output-volume state
+is mapped to the Phones-first output order. The physical Phones encoder emits
+`0x1800` and `0x1900`.
 
 ## 4. Register model
 
@@ -309,6 +311,10 @@ Level values:
 | 1 | +4 dBu |
 | 2 | LoGain |
 
+Gain is reported back when the physical encoder moves: the IF1 state stream
+carries `NN07` in 0.1 dB. AN1/2 step in 1 dB; AN3/4 step in 0.5 dB, stored as
+raw half-dB units 0..24. 48 V, Level and Inst have no observed readback.
+
 ### 6.2 Signal processing
 
 | Control | Register | Encoding |
@@ -322,7 +328,12 @@ the affected sends:
 
 - **Width** — the pair's 2x2 send matrix, rewritten only while the pair
   has a live send; with every send at -infinity the sweep writes nothing.
-  The eight words of the pair (`0x4022/0x4062/…` family) carry the matrix.
+  The equal-power law is `theta = (1 - w) * pi / 4`, `a = G * cos(theta)`,
+  `b = G * sin(theta)`, where `G` is the send gain of each source. One
+  routing writes `(dsp L, src L) = a`, `(dsp L, src R) = b`,
+  `(dsp R, src L) = b`, `(dsp R, src R) = a`; the playback sources also
+  write their `+0x180` copy. The `0x44xx` anchors are the same matrix
+  family with the ADAT 7/8 submix (DSP outputs 16/17) selected.
 - **MS Proc on software playback** — the playback's send words
   (`0x4020…`, `0x4120…`, `0x41A0…` families).  On hardware inputs MS Proc
   uses `NN05` and the same send recompute.
@@ -400,6 +411,25 @@ A pair writes both indices. The whole 30-entry bank is available.
 ### 7.4 Cue
 
 Cue is a host-side monitoring flag on an output.
+
+### 7.5 Phase and No Trim
+
+Each hardware output side has its own phase register: left at `base + 0x07`,
+right at `base + 0x107`, with `base = 0x12 + 2 x pair`. The value is `1` for
+inverted, `0` for normal.
+
+| Pair | Ø L | Ø R |
+|---|---|---|
+| AN 1/2 | `0x1207` | `0x1307` |
+| AN 3/4 | `0x1407` | `0x1507` |
+| AN 5/6 | `0x1607` | `0x1707` |
+| Phones 7/8 / Main | `0x1807` | `0x1907` |
+| SPDIF | `0x1a07` | `0x1b07` |
+| ADAT 1/2 … 7/8 | `0x1c07` … `0x2307` | `+0x100` |
+
+No Trim is a host-side flag per output channel: sends into a No-Trim
+destination use a trim factor of 1, so Trim Gain changes leave that
+destination untouched.
 
 ## 8. Equalizer and low cut
 
@@ -492,7 +522,8 @@ mask  = 0x0006
 | 1 | SPDIF Coaxial |
 | 2 | Optical |
 | 3 | Word Clock |
-| 4 | LTC |
+
+The unit has no LTC source; the clock field is two bits.
 
 ### 11.3 Connect initialisation
 
@@ -515,6 +546,23 @@ The `0x1b` quad is:
 (0x8235, 0x5502)
 (0x7d00, 0x0003)
 ```
+
+### 11.4 Options word
+
+Request `0x10`, index 1487, carries the unit's options as one full word:
+
+| Bit | Mask | Meaning |
+|---|---|---|
+| 3 | `0x0008` | word-clock input termination |
+| 6 | `0x0040` | word-clock output single speed |
+| 7 | `0x0080` | SPDIF professional |
+| 8 | `0x0100` | EQ+D for Record disabled (active low) |
+| 10 | `0x0400` | optical output ADAT (0 = SPDIF) |
+
+Every option change writes the whole word, including the current clock source
+in bits 1–2. Bit 10 is not an index of its own. No options-word readback is
+exposed: request `0x10` in returns a status word. The device-owned values are
+kept in the scene and written when they change.
 
 ## 12. Streaming
 
@@ -617,9 +665,15 @@ A scene stores:
 - Reverb and Echo settings;
 - channel names and trim values.
 
-The backend writes the scene at connect and after relevant rate or stream
-changes. Front-panel output volume, DIM and MS state are read from the IF1
-state stream.
+The backend writes the mixer scene at connect and after relevant rate or
+stream changes.  The options word (clock source, optical format, SPDIF
+professional, word-clock rate and termination, EQ+D for Record), the reference
+levels and the 48 V/Inst/Level switches are held by the unit: TuxMix does not
+write them at connect and has no readback for them.  The saved scene keeps the
+last value written from TuxMix for display.
+
+Input gain, front-panel output volume, DIM and MS state are read from the IF1
+state stream.  A read-back gain is not overwritten by the saved scene.
 
 Scenes are keyed by unit serial. Each unit keeps its own scene file.
 
@@ -650,6 +704,10 @@ Scenes are keyed by unit serial. Each unit keeps its own scene file.
 | Input Link | host setting |
 | EQ for Record | yes |
 | Optical output format | yes |
+| SPDIF professional | yes |
+| Word clock output single speed | yes |
+| Word clock input termination | yes |
+| Clock sources | Internal, SPDIF coax., Optical, Word |
 
 ## 16. Code map
 

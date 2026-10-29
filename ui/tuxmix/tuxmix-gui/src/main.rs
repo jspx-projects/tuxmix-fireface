@@ -9,6 +9,7 @@
 //! cargo run -p tuxmix-gui -- --backend usb  # force libusb over the kernel driver
 //! cargo run -p tuxmix-gui -- --view mixer  # open straight on the Mixer page
 //! cargo run -p tuxmix-gui -- --fullscreen  # start fullscreen (F11 toggles)
+//! cargo run -p tuxmix-gui -- --mock-ucx --flyouts settings:input:0  # open a panel
 //! ```
 
 mod about;
@@ -26,6 +27,8 @@ mod tray;
 mod widgets;
 
 use std::net::{IpAddr, Ipv4Addr};
+
+use tuxmix_core::RmeDevice;
 
 use iced::window;
 use iced::{Font, Size};
@@ -125,6 +128,15 @@ fn main() -> iced::Result {
     });
 
     let start_view = parse_view(&args);
+    // Screenshot/automation overrides.  These are applied after the saved
+    // layout, so one launch can open exactly the panels a check needs.
+    let start_scale = arg_value(&args, "--scale").and_then(|v| v.parse::<f32>().ok()).map(
+        |scale| scale.clamp(theme::SCALE_MIN, theme::SCALE_MAX),
+    );
+    let start_out = arg_value(&args, "--select-out").and_then(|v| v.parse::<usize>().ok());
+    let start_flyouts = arg_value(&args, "--flyouts");
+    // Open the device sheet before the first frame, for screenshots.
+    let start_device_panel = args.iter().any(|a| a == "--device-panel");
     let saved_prefs = prefs::path().map(|p| prefs::load(&p));
     let saved_size = saved_prefs
         .as_ref()
@@ -178,6 +190,20 @@ fn main() -> iced::Result {
             app::restore_engine(&mut state);
             if let Some(view) = start_view {
                 state.view = view;
+            }
+            if let Some(scale) = start_scale {
+                state.ui_scale = scale;
+            }
+            if let Some(out) = start_out {
+                let pairs = state.device.output_pair_count().max(1);
+                state.sel_out = out.min(pairs - 1);
+            }
+            if let Some(spec) = start_flyouts.as_deref() {
+                app::open_startup_flyouts(&mut state, spec);
+            }
+            if start_device_panel {
+                state.show_device_panel = true;
+                state.show_settings = false;
             }
             state.fullscreen = start_fullscreen;
             state.tray_active = tray_active;

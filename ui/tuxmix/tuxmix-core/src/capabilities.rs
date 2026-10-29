@@ -18,6 +18,9 @@ pub struct DeviceCapabilities {
     /// Input phase works without an EQ section (the UC stores it in the
     /// matrix sign; the UCX has a channel register).
     pub phase_without_eq: bool,
+    /// The output pair has its own phase registers (`base + 0x07` /
+    /// `base + 0x107`); false when only the input phase path is mapped.
+    pub output_phase: bool,
     pub output_balance: bool,
     pub stereo_split: bool,
     /// Per-cell routing can be edited on the 36 x 18 matrix.
@@ -39,6 +42,10 @@ pub struct DeviceCapabilities {
     /// and cannot make the device do anything with it.
     pub pitch: bool,
     pub width: bool,
+    /// Per-channel stereo width (the pair's 2x2 send matrix).  The UCX
+    /// backend implements it; the global `width` flag stays for the units
+    /// that have one device-wide control.
+    pub channel_width: bool,
     pub ms_proc: bool,
     pub an12: bool,
     pub input_link: bool,

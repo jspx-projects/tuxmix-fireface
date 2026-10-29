@@ -311,14 +311,18 @@ fn scene_order_by_name(current: &[String], saved: &[String]) -> Vec<usize> {
 }
 
 
-/// The UC state that can be read back without an encoder event.
+/// The device state that can be read back.
 ///
-/// The matrix, masters, input gain, output volume, loopback and mute are
-/// write-only.  This snapshot is therefore deliberately partial: `0x10`
-/// and `0x17` are complete, while the gain/volume maps contain only the
-/// channels the front panel reported since the driver last started.
+/// The matrix, masters, loopback, mute, options word, references and the
+/// preamp switches are write-only.  This snapshot is therefore partial:
+/// the UC reads `0x10` and `0x17` completely; both models carry only the
+/// gain/volume channels the front panel or state stream reported.
 #[derive(Clone, Debug, Default)]
 pub struct ReadableState {
+    /// True for the UCX: only input gain and output volume are read back.
+    /// The clock, format, reference and preamp-switch registers are
+    /// unit-owned and write-only, so they are not compared.
+    pub ucx: bool,
     pub clock_source: String,
     pub optical_out_spdif: bool,
     pub spdif_professional: bool,
@@ -333,57 +337,59 @@ impl ReadableState {
     /// Parameters whose readable device value differs from `scene`.
     pub fn differences(&self, scene: &Scene) -> Vec<String> {
         let mut out = Vec::new();
-        if !self.clock_source.is_empty()
-            && self.clock_source != scene.settings.clock_source
-        {
-            out.push(format!(
-                "Clock source: device {}, TuxMix {}",
-                self.clock_source, scene.settings.clock_source
-            ));
-        }
-        if self.optical_out_spdif != scene.settings.optical_out_spdif {
-            out.push(format!(
-                "Optical output: device {}, TuxMix {}",
-                if self.optical_out_spdif { "SPDIF" } else { "ADAT" },
-                if scene.settings.optical_out_spdif { "SPDIF" } else { "ADAT" }
-            ));
-        }
-        if self.spdif_professional != scene.settings.spdif_professional {
-            out.push(format!(
-                "SPDIF format: device {}, TuxMix {}",
-                if self.spdif_professional { "professional" } else { "consumer" },
-                if scene.settings.spdif_professional { "professional" } else { "consumer" }
-            ));
-        }
-        for i in 0..2 {
-            if let Some(input) = scene.inputs.get(i) {
-                if self.phantom[i] != input.phantom {
-                    out.push(format!(
-                        "AN{} 48 V: device {}, TuxMix {}",
-                        i + 1,
-                        self.phantom[i],
-                        input.phantom
-                    ));
+        if !self.ucx {
+            if !self.clock_source.is_empty()
+                && self.clock_source != scene.settings.clock_source
+            {
+                out.push(format!(
+                    "Clock source: device {}, TuxMix {}",
+                    self.clock_source, scene.settings.clock_source
+                ));
+            }
+            if self.optical_out_spdif != scene.settings.optical_out_spdif {
+                out.push(format!(
+                    "Optical output: device {}, TuxMix {}",
+                    if self.optical_out_spdif { "SPDIF" } else { "ADAT" },
+                    if scene.settings.optical_out_spdif { "SPDIF" } else { "ADAT" }
+                ));
+            }
+            if self.spdif_professional != scene.settings.spdif_professional {
+                out.push(format!(
+                    "SPDIF format: device {}, TuxMix {}",
+                    if self.spdif_professional { "professional" } else { "consumer" },
+                    if scene.settings.spdif_professional { "professional" } else { "consumer" }
+                ));
+            }
+            for i in 0..2 {
+                if let Some(input) = scene.inputs.get(i) {
+                    if self.phantom[i] != input.phantom {
+                        out.push(format!(
+                            "AN{} 48 V: device {}, TuxMix {}",
+                            i + 1,
+                            self.phantom[i],
+                            input.phantom
+                        ));
+                    }
                 }
             }
-        }
-        for (slot, i) in (2..4).enumerate() {
-            if let Some(input) = scene.inputs.get(i) {
-                if self.pad[slot] != input.pad {
-                    out.push(format!(
-                        "AN{} PAD: device {}, TuxMix {}",
-                        i + 1,
-                        self.pad[slot],
-                        input.pad
-                    ));
-                }
-                if self.instrument[slot] != input.instrument {
-                    out.push(format!(
-                        "AN{} Inst: device {}, TuxMix {}",
-                        i + 1,
-                        self.instrument[slot],
-                        input.instrument
-                    ));
+            for (slot, i) in (2..4).enumerate() {
+                if let Some(input) = scene.inputs.get(i) {
+                    if self.pad[slot] != input.pad {
+                        out.push(format!(
+                            "AN{} PAD: device {}, TuxMix {}",
+                            i + 1,
+                            self.pad[slot],
+                            input.pad
+                        ));
+                    }
+                    if self.instrument[slot] != input.instrument {
+                        out.push(format!(
+                            "AN{} Inst: device {}, TuxMix {}",
+                            i + 1,
+                            self.instrument[slot],
+                            input.instrument
+                        ));
+                    }
                 }
             }
         }
@@ -621,8 +627,10 @@ impl Fireface {
                     if i < 4 {
                         input.gain = Some(0);
                         // The wire value is 0.1 dB for every front input.
-                        // AN1/2 reach 65 dB; AN3/4 reach 12 dB (manual).
-                        input.gain_max = Some(if i < 2 { 65 } else { 12 });
+                        // AN1/2 reach 65 dB in 1 dB steps; AN3/4 reach
+                        // 12 dB in 0.5 dB steps, stored as raw half-dB
+                        // units (0..24) like the UC.
+                        input.gain_max = Some(if i < 2 { 65 } else { 24 });
                     }
                     if i == 2 || i == 3 {
                         input.has_instrument = true;
@@ -646,13 +654,11 @@ impl Fireface {
         }
 
         let mut settings = Scene::new("").settings;
-        settings.clock_sources = vec![
-            "Internal".into(),
-            "SPDIF Coaxial".into(),
-            "Optical".into(),
-            "Word Clock".into(),
-            "LTC".into(),
-        ];
+        settings.clock_sources = spec
+            .clock_sources
+            .iter()
+            .map(|source| (*source).to_string())
+            .collect();
         settings.sample_rate = if info.rate > 0 { info.rate } else { 48_000 };
         if model == Model::Ucx {
             settings.reverb = Some(Reverb::default());
@@ -1172,34 +1178,84 @@ impl Fireface {
         Ok(())
     }
 
+    /// Gains of an input pair into one routing, after trim and balance.
+    fn ucx_input_pair_gains(&self, base: usize, pair: usize) -> (f32, f32) {
+        let other = base ^ 1;
+        let pan = self.inputs[base].pans.get(pair).copied().unwrap_or(0);
+        let left = self.inputs[base].volumes.get(pair).copied().unwrap_or(0.0)
+            * self.dest_trim(ChannelId::Input(base), pair * 2);
+        let right = self.inputs[other].volumes.get(pair).copied().unwrap_or(0.0)
+            * self.dest_trim(ChannelId::Input(other), pair * 2 + 1);
+        let balance = pan.clamp(-100, 100) as f32 / 100.0;
+        (
+            left * (1.0 - balance.max(0.0)),
+            right * (1.0 + balance.min(0.0)),
+        )
+    }
+
+    /// Rewrite one routing's 2x2 matrix for an input pair, applying the
+    /// pair's width.  Silent routings are left alone, matching the unit
+    /// (a full width sweep with every send at -inf writes nothing).
+    fn ucx_write_input_pair(&self, base: usize, pair: usize) -> Result<(), Error> {
+        let dsp = ucx::output_pair_dsp(pair)
+            .ok_or_else(|| Error::InvalidChannel(format!("output pair {pair}")))?;
+        let other = base ^ 1;
+        let (gl, gr) = self.ucx_input_pair_gains(base, pair);
+        if gl <= 0.0 && gr <= 0.0 {
+            return Ok(());
+        }
+        let width = self.inputs[base].width.clamp(-1.0, 1.0);
+        let theta = (1.0 - width) * std::f32::consts::FRAC_PI_4;
+        let (sin, cos) = theta.sin_cos();
+        self.ucx_write_matrix(dsp as u8, Source::Input(base), (gl * cos) as f64)?;
+        self.ucx_write_matrix(dsp as u8, Source::Input(other), (gr * sin) as f64)?;
+        self.ucx_write_matrix(
+            dsp as u8 + 1,
+            Source::Input(base),
+            (gl * sin) as f64,
+        )?;
+        self.ucx_write_matrix(
+            dsp as u8 + 1,
+            Source::Input(other),
+            (gr * cos) as f64,
+        )
+    }
+
     fn ucx_write_input(&self, idx: usize, pair: usize, _volume: f32) -> Result<(), Error> {
         let dsp = ucx::output_pair_dsp(pair)
             .ok_or_else(|| Error::InvalidChannel(format!("output pair {pair}")))?;
         let pan = self.inputs[idx].pans.get(pair).copied().unwrap_or(0);
+        let base = idx & !1;
         if idx < 4 {
-            let volume = self.inputs[idx].volumes.get(pair).copied().unwrap_or(0.0)
-                * self.trim_gain(ChannelId::Input(idx));
-            let (l, r) = pan_split(volume, pan);
-            let source = Source::Input(idx);
-            self.ucx_write_matrix(dsp as u8, source, l as f64)?;
-            self.ucx_write_matrix(dsp as u8 + 1, source, r as f64)?;
+            let volume = self.inputs[idx].volumes.get(pair).copied().unwrap_or(0.0);
+            if self.inputs[base].width != 1.0 {
+                self.ucx_write_input_pair(base, pair)?;
+            } else {
+                let (l, r) = pan_split(volume, pan);
+                let (l, r) = (
+                    l * self.dest_trim(ChannelId::Input(idx), pair * 2),
+                    r * self.dest_trim(ChannelId::Input(idx), pair * 2 + 1),
+                );
+                let source = Source::Input(idx);
+                self.ucx_write_matrix(dsp as u8, source, l as f64)?;
+                self.ucx_write_matrix(dsp as u8 + 1, source, r as f64)?;
+            }
             let table = ucx::fader_table_reg(dsp as u8, idx);
-            let level = ucx::linear_to_tenths(volume) as i16;
+            let level = ucx::linear_to_tenths(
+                volume * self.dest_trim(ChannelId::Input(idx), pair * 2),
+            ) as i16;
             self.write_word(table, ucx::fader_level(level))?;
             return self.write_word(table, ucx::fader_pan(pan as i16));
         }
         // Stereo strip: source `base` on the left, `base^1` on the right.
-        let base = idx & !1;
         let other = base ^ 1;
-        let left = self.inputs[base].volumes.get(pair).copied().unwrap_or(0.0)
-            * self.trim_gain(ChannelId::Input(base));
-        let right = self.inputs[other].volumes.get(pair).copied().unwrap_or(0.0)
-            * self.trim_gain(ChannelId::Input(other));
-        let balance = pan.clamp(-100, 100) as f32 / 100.0;
-        let gl = left * (1.0 - balance.max(0.0));
-        let gr = right * (1.0 + balance.min(0.0));
-        self.ucx_write_matrix(dsp as u8, Source::Input(base), gl as f64)?;
-        self.ucx_write_matrix(dsp as u8 + 1, Source::Input(other), gr as f64)?;
+        let (gl, gr) = self.ucx_input_pair_gains(base, pair);
+        if self.inputs[base].width != 1.0 {
+            self.ucx_write_input_pair(base, pair)?;
+        } else {
+            self.ucx_write_matrix(dsp as u8, Source::Input(base), gl as f64)?;
+            self.ucx_write_matrix(dsp as u8 + 1, Source::Input(other), gr as f64)?;
+        }
         let t0 = ucx::fader_table_reg(dsp as u8, base);
         let t1 = ucx::fader_table_reg(dsp as u8, other);
         self.write_word(t0, ucx::fader_level(ucx::linear_to_tenths(gl) as i16))?;
@@ -1208,12 +1264,46 @@ impl Fireface {
         self.write_word(t1, ucx::fader_pan(0))
     }
 
+    /// Rewrite one routing's 2x2 matrix for a playback pair.
+    fn ucx_write_playback_pair(&self, base: usize, pair: usize) -> Result<(), Error> {
+        let dsp = ucx::output_pair_dsp(pair)
+            .ok_or_else(|| Error::InvalidChannel(format!("output pair {pair}")))?;
+        let other = base ^ 1;
+        let gl = self.playbacks[base].volumes.get(pair).copied().unwrap_or(0.0)
+            * self.dest_trim(ChannelId::Playback(base), pair * 2);
+        let gr = self.playbacks[other].volumes.get(pair).copied().unwrap_or(0.0)
+            * self.dest_trim(ChannelId::Playback(other), pair * 2 + 1);
+        if gl <= 0.0 && gr <= 0.0 {
+            return Ok(());
+        }
+        let width = self.playbacks[base].width.clamp(-1.0, 1.0);
+        let theta = (1.0 - width) * std::f32::consts::FRAC_PI_4;
+        let (sin, cos) = theta.sin_cos();
+        let dev_l = self.playbacks[base].id;
+        let dev_r = self.playbacks[other].id;
+        self.ucx_write_matrix(dsp as u8, Source::Playback(dev_l), (gl * cos) as f64)?;
+        self.ucx_write_matrix(dsp as u8, Source::Playback(dev_r), (gr * sin) as f64)?;
+        self.ucx_write_matrix(
+            dsp as u8 + 1,
+            Source::Playback(dev_l),
+            (gl * sin) as f64,
+        )?;
+        self.ucx_write_matrix(
+            dsp as u8 + 1,
+            Source::Playback(dev_r),
+            (gr * cos) as f64,
+        )
+    }
+
     fn ucx_write_playback(&self, idx: usize, pair: usize, volume: f32) -> Result<(), Error> {
         let dev = self.playbacks[idx].id;
         let dsp = ucx::output_pair_dsp(pair)
             .ok_or_else(|| Error::InvalidChannel(format!("output pair {pair}")))?;
+        if self.playbacks[idx & !1].width != 1.0 {
+            return self.ucx_write_playback_pair(idx & !1, pair);
+        }
         let side = dev % 2;
-        let volume = volume * self.trim_gain(ChannelId::Playback(idx));
+        let volume = volume * self.dest_trim(ChannelId::Playback(idx), pair * 2 + side);
         self.ucx_write_matrix(
             (dsp + side) as u8,
             Source::Playback(dev),
@@ -1255,11 +1345,12 @@ impl Fireface {
         self.ucx_write_output_mode(idx, mute)
     }
 
-    fn ucx_write_input_gain(&self, idx: usize, gain_db: u32) -> Result<(), Error> {
+    /// Write the gain in 0.1 dB units (`NN07`).
+    fn ucx_write_input_gain(&self, idx: usize, tenths_db: u32) -> Result<(), Error> {
         let channel = ucx::input_channel(idx);
         self.write_word(
             ucx::channel_reg(channel, ucx::offset::GAIN_REFLEVEL_OR_PHASE),
-            (gain_db * 10).min(0xffff) as u16,
+            tenths_db.min(0xffff) as u16,
         )
     }
 
@@ -1502,7 +1593,7 @@ impl Fireface {
     /// front-panel event.  Returns `None` for the UCX, whose readback path
     /// is not implemented yet.
     pub fn readable_state(&self) -> Option<ReadableState> {
-        if !self.is_uc() {
+        if !self.is_uc() && self.model != Model::Ucx {
             return None;
         }
         let mut input_gain: Vec<(usize, u32)> =
@@ -1514,7 +1605,18 @@ impl Fireface {
             .map(|(&i, &v)| (i, v))
             .collect();
         output_volume.sort_unstable_by_key(|(i, _)| *i);
+        if !self.is_uc() {
+            // The UCX reports only the gain and output-volume maps.  The
+            // options word, references and preamp switches are write-only.
+            return Some(ReadableState {
+                ucx: true,
+                input_gain,
+                output_volume,
+                ..ReadableState::default()
+            });
+        }
         Some(ReadableState {
+            ucx: false,
             clock_source: self.settings.clock_source.clone(),
             optical_out_spdif: self.settings.optical_out_spdif,
             spdif_professional: self.settings.spdif_professional,
@@ -1552,11 +1654,20 @@ impl Fireface {
 
     /// The UCX settings word (`0x10` / wIndex 1487), composed from the model.
     /// Measured bits (H69–H101), and no others were ever observed:
-    /// `0x008` word-clock input termination, `0x040` word-clock out single
-    /// speed, `0x080` SPDIF professional, `0x100` EQ for Record *disabled*
-    /// (active low), `0x400` optical out ADAT (0 = SPDIF).
+    /// bits 1–2 clock source, `0x008` word-clock input termination, `0x040`
+    /// word-clock out single speed, `0x080` SPDIF professional, `0x100`
+    /// EQ for Record *disabled* (active low), `0x400` optical out ADAT
+    /// (0 = SPDIF).
     fn ucx_options_word(&self) -> u16 {
-        let mut word = 0u16;
+        // Index 1487 is a full-word update: leave the clock source in place
+        // when an unrelated option is toggled.
+        let clock = match self.settings.clock_source.as_str() {
+            "SPDIF Coaxial" | "SPDIF" => 1,
+            "Optical" | "ADAT" => 2,
+            "Word Clock" => 3,
+            _ => 0,
+        };
+        let mut word = (clock & 0x3) << 1;
         if self.settings.word_clock_termination {
             word |= 0x0008;
         }
@@ -1644,11 +1755,14 @@ impl Fireface {
     }
 
     /// Word-clock input termination (`0x008` in the UCX options word).
+    /// The UC has no termination bit.
     pub fn set_word_clock_termination(&mut self, on: bool) -> Result<(), Error> {
-        self.settings.word_clock_termination = on;
         if self.is_uc() {
-            return Ok(());
+            return Err(Error::InvalidChannel(
+                "Word clock termination does not exist on the UC".into(),
+            ));
         }
+        self.settings.word_clock_termination = on;
         self.ucx_write_options()
     }
 
@@ -1657,6 +1771,13 @@ impl Fireface {
     /// values stay at the TuxMix scene.
     pub fn restore_readable(&mut self, state: &ReadableState) -> Result<(), Error> {
         if !self.is_uc() {
+            // UCX: only the gain and output-volume maps are read back.
+            for &(idx, gain) in &state.input_gain {
+                self.set_gain(idx, gain)?;
+            }
+            for &(idx, volume) in &state.output_volume {
+                self.set_volume(ChannelId::Output(idx), 0, volume)?;
+            }
             return Ok(());
         }
         if !state.clock_source.is_empty() {
@@ -1773,10 +1894,28 @@ impl Fireface {
     }
 
     fn apply_ucx_state_word(&mut self, addr: u16, value: u16) {
-        if let Some(idx) = ucx::output_index_from_state(addr) {
-            if let Some(output) = self.outputs.get_mut(idx) {
-                output.volume = ucx::tenths_to_linear(value);
+        if let Some(idx) = ucx::input_gain_index(addr) {
+            // The unit reports physical gain moves here in 0.1 dB units.
+            // Inputs 1/2 use whole dB; inputs 3/4 use 0.5 dB steps.
+            let raw = value as u32;
+            let (gain, max) = if idx < 2 {
+                ((raw + 5) / 10, 65)
+            } else {
+                ((raw + 2) / 5, 24)
+            };
+            let gain = gain.min(max);
+            if let Some(input) = self.inputs.get_mut(idx) {
+                input.gain = Some(gain);
             }
+            self.device_input_gain.insert(idx, gain);
+            return;
+        }
+        if let Some(idx) = ucx::output_index_from_state(addr) {
+            let volume = ucx::tenths_to_linear(value);
+            if let Some(output) = self.outputs.get_mut(idx) {
+                output.volume = volume;
+            }
+            self.device_output_volume.insert(idx, volume);
             return;
         }
         match addr {
@@ -1854,6 +1993,16 @@ impl Fireface {
             ChannelId::Output(_) => 0.0,
         };
         10f32.powf(db.clamp(-65.0, 0.0) / 20.0)
+    }
+
+    /// The trim factor for one send into `output`.  A No-Trim destination
+    /// is excluded, so the send keeps its untrimmed level.
+    fn dest_trim(&self, channel: ChannelId, output: usize) -> f32 {
+        if self.outputs.get(output).is_some_and(|o| o.no_trim) {
+            1.0
+        } else {
+            self.trim_gain(channel)
+        }
     }
 
     fn apply_input_volume(&mut self, idx: usize, output: usize, volume: f32) -> Result<(), Error> {
@@ -2603,21 +2752,21 @@ impl RmeDevice for Fireface {
         if idx >= 4 {
             return Err(Error::InvalidChannel(format!("input {idx} has no preamp")));
         }
-        // UC inputs 3/4 use half-dB codes (0..36); UCX inputs use 0.1 dB
-        // wire values but the UI stores whole dB.  Inputs 1/2 use whole dB
-        // (0..65) on both.
+        // Inputs 1/2 use whole dB (0..65).  Inputs 3/4 use half-dB units:
+        // 0..36 on the UC, 0..24 on the UCX.  The UCX wire value is 0.1 dB.
         let max = if idx < 2 {
             65
         } else if self.is_uc() {
             36
         } else {
-            12
+            24
         };
         let gain = gain.min(max);
         if self.is_uc() {
             self.vendor_out(protocol::req::PGA, gain as u16, idx as u16)?;
         } else {
-            self.ucx_write_input_gain(idx, gain)?;
+            let tenths = if idx < 2 { gain * 10 } else { gain * 5 };
+            self.ucx_write_input_gain(idx, tenths)?;
         }
         if let Some(input) = self.inputs.get_mut(idx) {
             input.gain = Some(gain);
@@ -2954,6 +3103,72 @@ impl RmeDevice for Fireface {
         Ok(())
     }
 
+    fn set_output_phase(&mut self, idx: usize, invert: bool) -> Result<(), Error> {
+        // `base + 0x07` / `base + 0x107`: one word per side, no send
+        // recompute (measured Q103).
+        if self.is_uc() {
+            return Err(Error::InvalidChannel(
+                "Output phase is not mapped on the UC".into(),
+            ));
+        }
+        if idx >= self.outputs.len() {
+            return Err(Error::InvalidChannel(format!("output {idx}")));
+        }
+        let dsp = ucx::output_pair_dsp(idx / 2)
+            .ok_or_else(|| Error::InvalidChannel(format!("output {idx}")))?;
+        let channel = ucx::output_channel(dsp + idx % 2);
+        self.write_word(
+            ucx::channel_reg(channel, ucx::offset::GAIN_REFLEVEL_OR_PHASE),
+            invert as u16,
+        )?;
+        let out = &mut self.outputs[idx];
+        if idx % 2 == 0 {
+            out.phase_l = invert;
+        } else {
+            out.phase_r = invert;
+        }
+        Ok(())
+    }
+
+    fn set_no_trim(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        if idx >= self.outputs.len() {
+            return Err(Error::InvalidChannel(format!("output {idx}")));
+        }
+        self.outputs[idx].no_trim = on;
+        // A linked pair is one monitor destination: both sides carry the
+        // flag.  A split pair keeps the two mono channels independent.
+        if self.output_linked(idx / 2) {
+            let other = idx ^ 1;
+            if let Some(out) = self.outputs.get_mut(other) {
+                out.no_trim = on;
+            }
+        }
+        // Re-write the sends into this output so the exclusion applies to
+        // what is already playing, not only to the next fader move.
+        let pair = idx / 2;
+        let sends: Vec<(ChannelId, f32)> = self
+            .inputs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| {
+                c.volumes
+                    .get(pair)
+                    .filter(|v| **v > 0.0)
+                    .map(|v| (ChannelId::Input(i), *v))
+            })
+            .chain(self.playbacks.iter().enumerate().filter_map(|(i, c)| {
+                c.volumes
+                    .get(pair)
+                    .filter(|v| **v > 0.0)
+                    .map(|v| (ChannelId::Playback(i), *v))
+            }))
+            .collect();
+        for (channel, volume) in sends {
+            self.set_volume(channel, pair, volume)?;
+        }
+        Ok(())
+    }
+
     fn set_channel_fx_send(&mut self, channel: ChannelId, db: f32) -> Result<(), Error> {
         if self.is_uc() {
             return Err(Error::InvalidChannel(
@@ -3006,6 +3221,47 @@ impl RmeDevice for Fireface {
         self.settings.width = width;
         for w in &mut self.playback_width {
             *w = (width * 100.0).round().clamp(-100.0, 100.0) as i16;
+        }
+        Ok(())
+    }
+
+    fn set_channel_width(&mut self, channel: ChannelId, width: f32) -> Result<(), Error> {
+        if self.is_uc() {
+            return Err(Error::InvalidChannel(
+                "Channel width is not mapped on the UC".into(),
+            ));
+        }
+        let width = width.clamp(-1.0, 1.0);
+        match channel {
+            ChannelId::Input(idx) => {
+                let base = idx & !1;
+                let other = base ^ 1;
+                if other >= self.inputs.len() {
+                    return Err(Error::InvalidChannel(format!("input {idx}")));
+                }
+                self.inputs[base].width = width;
+                self.inputs[other].width = width;
+                for pair in 0..PAIRS {
+                    self.ucx_write_input_pair(base, pair)?;
+                }
+            }
+            ChannelId::Playback(idx) => {
+                let base = idx & !1;
+                let other = base ^ 1;
+                if other >= self.playbacks.len() {
+                    return Err(Error::InvalidChannel(format!("playback {idx}")));
+                }
+                self.playbacks[base].width = width;
+                self.playbacks[other].width = width;
+                for pair in 0..PAIRS {
+                    self.ucx_write_playback_pair(base, pair)?;
+                }
+            }
+            ChannelId::Output(_) => {
+                return Err(Error::InvalidChannel(
+                    "width applies to inputs and playbacks".into(),
+                ))
+            }
         }
         Ok(())
     }
@@ -3285,6 +3541,13 @@ impl RmeDevice for Fireface {
             self.settings.clock_source = source.to_string();
             self.uc_write_options()?;
         } else {
+            // The UCX clock field is two bits (mask 0x0006).  Index 4 is
+            // the UC's LTC source and does not exist on this unit.
+            if index > 3 {
+                return Err(Error::InvalidChannel(format!(
+                    "clock source {source} does not exist on the UCX"
+                )));
+            }
             self.ucx_write_clock(index)?;
             self.settings.clock_source = source.to_string();
         }
@@ -3323,8 +3586,10 @@ impl RmeDevice for Fireface {
         }
         // The device-owned group (preamp gain, phantom/PAD/Inst, reference
         // levels, clock/rate/optical) is not part of the connect write.
-        // Keep the values already read from the unit so the UI reflects the
-        // device, not a stale scene.  Only the mixer group is applied.
+        // The UC reads it at connect, so its live values win over a stale
+        // scene.  On the UCX, gain is read from the 0x8d stream; the
+        // switches, references and options have no readback, so the scene
+        // keeps their last written values.  Only the mixer group is applied.
         let device_inputs: Vec<_> = self
             .inputs
             .iter()
@@ -3431,29 +3696,79 @@ impl RmeDevice for Fireface {
         }
         self.settings = scene.settings.clone();
         self.matrix_overrides.clear();
-        for (idx, (input, saved)) in self.inputs.iter_mut().zip(device_inputs).enumerate() {
-            if let Some(gain) = known_gains.get(&idx) {
-                input.gain = Some(*gain);
+        if self.is_uc() {
+            for (idx, (input, saved)) in self.inputs.iter_mut().zip(device_inputs).enumerate() {
+                if let Some(gain) = known_gains.get(&idx) {
+                    input.gain = Some(*gain);
+                }
+                input.phantom = saved.0;
+                input.pad = saved.1;
+                input.instrument = saved.2;
+                input.gain_max = saved.3;
+                input.has_pad = saved.4;
+                input.has_instrument = saved.5;
+                input.ref_level = saved.6;
+                input.level = InputLevel::from_code(saved.6);
+                input.autoset = saved.7;
             }
-            input.phantom = saved.0;
-            input.pad = saved.1;
-            input.instrument = saved.2;
-            input.gain_max = saved.3;
-            input.has_pad = saved.4;
-            input.has_instrument = saved.5;
-            input.ref_level = saved.6;
-            input.level = InputLevel::from_code(saved.6);
-            input.autoset = saved.7;
+        } else {
+            // The gain is read back from the 0x8d stream; use the value the
+            // unit reported if it has arrived.  Otherwise keep the scene's
+            // value.  Scenes written before the half-dB model stored inputs
+            // 3/4 as whole dB with `gain_max = 12`; convert those to raw
+            // half-dB units (0..24).
+            for (idx, input) in self.inputs.iter_mut().enumerate() {
+                if let Some(gain) = known_gains.get(&idx) {
+                    input.gain = Some(*gain);
+                } else if scene
+                    .inputs
+                    .get(idx)
+                    .is_some_and(|saved| saved.gain_max == Some(12))
+                    && input.gain_max == Some(24)
+                {
+                    input.gain = input.gain.map(|gain| (gain * 2).min(24));
+                }
+                if (2..4).contains(&idx) {
+                    if input.level.is_none() {
+                        input.level = InputLevel::from_code(input.ref_level);
+                    }
+                    if let Some(level) = input.level {
+                        input.ref_level = level.code();
+                    }
+                }
+            }
         }
-        self.settings.clock_source = device_clock;
+        // The UC reads its options word at connect, so the live values win
+        // over a scene that may predate a change made elsewhere.  No UCX
+        // options-word readback is exposed (request 0x10 returns a status
+        // word, not the options).  There the scene is the only record: keep
+        // its values so a restart does not reset the visible settings.
         self.settings.clock_sources = device_clock_sources;
-        self.settings.optical_out_spdif = device_optical;
-        self.settings.spdif_professional = device_spdif_pro;
         self.settings.sample_rate = device_rate;
-        self.settings.line_in_ref = device_line_in;
-        self.settings.line_out_ref = device_line_out;
-        self.settings.phones_ref = device_phones;
-        self.settings.word_clock_single_speed = device_wc_single;
+        if !self
+            .settings
+            .clock_sources
+            .iter()
+            .any(|source| *source == self.settings.clock_source)
+        {
+            // A scene written for the UC can carry LTC, which the UCX does
+            // not offer.
+            self.settings.clock_source = self
+                .settings
+                .clock_sources
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "Internal".into());
+        }
+        if self.is_uc() {
+            self.settings.clock_source = device_clock;
+            self.settings.optical_out_spdif = device_optical;
+            self.settings.spdif_professional = device_spdif_pro;
+            self.settings.line_in_ref = device_line_in;
+            self.settings.line_out_ref = device_line_out;
+            self.settings.phones_ref = device_phones;
+            self.settings.word_clock_single_speed = device_wc_single;
+        }
         if self.settings.reverb.is_none() {
             self.settings.reverb = device_reverb;
         }
@@ -3527,6 +3842,18 @@ impl RmeDevice for Fireface {
                 let loopback = self.outputs[pair * 2].loopback
                     || self.outputs[pair * 2 + 1].loopback;
                 self.set_loopback(pair, loopback)?;
+            }
+            // Output phase is a per-side register pair; only the inverted
+            // sides need a write (the unit defaults to normal).
+            for idx in 0..self.outputs.len() {
+                let inverted = if idx % 2 == 0 {
+                    self.outputs[idx].phase_l
+                } else {
+                    self.outputs[idx].phase_r
+                };
+                if inverted {
+                    self.set_output_phase(idx, true)?;
+                }
             }
             for idx in 0..self.outputs.len() {
                 if self.outputs[idx].eq.is_some() {
@@ -3957,8 +4284,97 @@ mod tests {
     }
 
     #[test]
-    fn ucx_control_room_speaker_b_and_dim_write_registers() {
+    fn ucx_channel_width_rewrites_the_pair_matrix() {
         let (mut dev, writes) = open(Model::Ucx);
+        dev.set_volume(ChannelId::Input(0), 1, 1.0).unwrap();
+        dev.set_volume(ChannelId::Input(1), 1, 1.0).unwrap();
+        writes.lock().unwrap().clear();
+        dev.set_channel_width(ChannelId::Input(0), 0.0).unwrap();
+        // At width 0 the pair is an equal-power sum: cos = sin = 0.7071.
+        let mixed = ucx::matrix_gain(std::f32::consts::FRAC_1_SQRT_2 as f64);
+        {
+            let w = writes.lock().unwrap();
+            // AN1/2 is pair 1: DSP outputs 0/1, sources 0/1.
+            assert!(w.contains(&Write::Words(vec![(0x4000, mixed)])));
+            assert!(w.contains(&Write::Words(vec![(0x4001, mixed)])));
+            assert!(w.contains(&Write::Words(vec![(0x4040, mixed)])));
+            assert!(w.contains(&Write::Words(vec![(0x4041, mixed)])));
+        }
+        assert_eq!(dev.inputs()[0].width, 0.0);
+        assert_eq!(dev.inputs()[1].width, 0.0);
+
+        // +1 restores the diagonals and clears the cross terms.
+        writes.lock().unwrap().clear();
+        dev.set_channel_width(ChannelId::Input(0), 1.0).unwrap();
+        {
+            let w = writes.lock().unwrap();
+            assert!(w.contains(&Write::Words(vec![(0x4000, ucx::matrix_gain(1.0))])));
+            assert!(w.contains(&Write::Words(vec![(0x4001, 0)])));
+            assert!(w.contains(&Write::Words(vec![(0x4040, 0)])));
+        }
+
+        // A routing with no live send is left alone.
+        dev.set_volume(ChannelId::Input(0), 1, 0.0).unwrap();
+        dev.set_volume(ChannelId::Input(1), 1, 0.0).unwrap();
+        writes.lock().unwrap().clear();
+        dev.set_channel_width(ChannelId::Input(0), 0.5).unwrap();
+        let w = writes.lock().unwrap();
+        assert!(!w.iter().any(|x| matches!(
+            x,
+            Write::Words(v) if v.iter().any(|(reg, _)| (0x4000..=0x4041).contains(reg))
+        )));
+    }
+
+    #[test]
+    fn ucx_output_phase_writes_one_register_per_side() {
+        let (mut dev, writes) = open(Model::Ucx);
+        writes.lock().unwrap().clear();
+        // AN 1/2 is internal pair 1, DSP channels 0x12/0x13.
+        dev.set_output_phase(2, true).unwrap();
+        dev.set_output_phase(3, true).unwrap();
+        let w = writes.lock().unwrap();
+        assert!(w.contains(&Write::Words(vec![(0x1207, 1)])));
+        assert!(w.contains(&Write::Words(vec![(0x1307, 1)])));
+        drop(w);
+        assert!(dev.outputs()[2].phase_l);
+        assert!(dev.outputs()[3].phase_r);
+
+        writes.lock().unwrap().clear();
+        dev.set_output_phase(2, false).unwrap();
+        assert!(writes.lock().unwrap().contains(&Write::Words(vec![(0x1207, 0)])));
+        assert!(!dev.outputs()[2].phase_l);
+    }
+
+    #[test]
+    fn ucx_no_trim_excludes_the_destination_from_trim() {
+        let (mut dev, writes) = open(Model::Ucx);
+        dev.set_trim(ChannelId::Input(0), -6.0).unwrap();
+        dev.set_volume(ChannelId::Input(0), 1, 1.0).unwrap();
+        let trimmed = ucx::matrix_gain(10f64.powf(-6.0 / 20.0));
+        {
+            let w = writes.lock().unwrap();
+            assert!(w.contains(&Write::Words(vec![(0x4000, trimmed)])));
+        }
+
+        writes.lock().unwrap().clear();
+        dev.set_no_trim(2, true).unwrap();
+        {
+            let w = writes.lock().unwrap();
+            assert!(w.contains(&Write::Words(vec![(0x4000, ucx::matrix_gain(1.0))])));
+        }
+        assert!(dev.outputs()[2].no_trim);
+
+        writes.lock().unwrap().clear();
+        dev.set_no_trim(2, false).unwrap();
+        {
+            let w = writes.lock().unwrap();
+            assert!(w.contains(&Write::Words(vec![(0x4000, trimmed)])));
+        }
+        assert!(!dev.outputs()[2].no_trim);
+    }
+
+    #[test]
+    fn ucx_control_room_speaker_b_and_dim_write_registers() {        let (mut dev, writes) = open(Model::Ucx);
         writes.lock().unwrap().clear();
         dev.set_speaker_b(true).unwrap();
         {
@@ -4442,6 +4858,181 @@ mod tests {
         assert_eq!(dev.inputs()[0].gain, Some(20));
         assert!(!dev.inputs()[0].phantom);
         assert_eq!(dev.settings().clock_source, "Internal");
+    }
+
+    #[test]
+    fn ucx_input_gain_state_words_update_the_model() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        dev.apply_ucx_state_word(0x0007, 400);
+        dev.apply_ucx_state_word(0x0207, 15);
+        assert_eq!(dev.inputs()[0].gain, Some(40));
+        assert_eq!(dev.inputs()[2].gain, Some(3));
+        assert_eq!(dev.inputs()[2].gain_max, Some(24));
+    }
+
+    #[test]
+    fn ucx_set_gain_writes_tenths_db_and_keeps_half_db_units() {
+        let (mut dev, writes) = open(Model::Ucx);
+        writes.lock().unwrap().clear();
+        dev.set_gain(0, 40).unwrap();
+        dev.set_gain(2, 3).unwrap();
+        let w = writes.lock().unwrap();
+        assert!(w.contains(&Write::Words(vec![(0x0007, 400)])));
+        assert!(w.contains(&Write::Words(vec![(0x0207, 15)])));
+        assert_eq!(dev.inputs()[2].gain, Some(3));
+    }
+
+    #[test]
+    fn ucx_scene_adopts_a_read_back_gain_over_the_saved_value() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        dev.apply_ucx_state_word(0x0207, 15);
+        let mut scene = dev.capture_scene();
+        scene.inputs[2].gain = Some(0);
+        dev.apply_scene(&scene).unwrap();
+        assert_eq!(dev.inputs()[2].gain, Some(3));
+    }
+
+    #[test]
+    fn ucx_old_scene_gain_max_12_is_migrated_to_half_db_units() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        let mut scene = dev.capture_scene();
+        scene.inputs[2].gain = Some(6);
+        scene.inputs[2].gain_max = Some(12);
+        dev.apply_scene(&scene).unwrap();
+        assert_eq!(dev.inputs()[2].gain, Some(12));
+        assert_eq!(dev.inputs()[2].gain_max, Some(24));
+    }
+
+    #[test]
+    fn ucx_readable_state_reports_gain_and_volume_only() {
+        let (mut dev, writes) = open(Model::Ucx);
+        dev.apply_ucx_state_word(0x0007, 400);
+        dev.apply_ucx_state_word(0x1800, 0xfdda);
+        let state = dev.readable_state().expect("UCX readable state");
+        assert!(state.ucx);
+        assert_eq!(state.input_gain, vec![(0, 40)]);
+        assert_eq!(state.output_volume.len(), 1);
+
+        let mut scene = dev.capture_scene();
+        scene.inputs[0].gain = Some(0);
+        scene.outputs[0].volume = 1.0;
+        let differences = state.differences(&scene);
+        assert!(differences.iter().any(|item| item.contains("AN1 gain")));
+        assert!(differences.iter().any(|item| item.contains("volume")));
+        assert!(
+            !differences.iter().any(|item| item.contains("Clock")),
+            "the UCX does not read back the options word"
+        );
+
+        writes.lock().unwrap().clear();
+        dev.restore_readable(&state).unwrap();
+        let w = writes.lock().unwrap();
+        assert!(w.contains(&Write::Words(vec![(0x0007, 400)])));
+        assert!(w.iter().any(|write| matches!(
+            write,
+            Write::Words(words) if words.iter().any(|(addr, _)| *addr == 0x1800)
+        )));
+    }
+
+    #[test]
+    fn ucx_options_word_composes_the_measured_bits() {
+        let (mut dev, writes) = open(Model::Ucx);
+        writes.lock().unwrap().clear();
+        dev.set_word_clock_termination(true).unwrap();
+        dev.set_spdif_professional(true).unwrap();
+        dev.set_word_clock_single_speed(true).unwrap();
+        dev.set_eq_for_record(true).unwrap();
+        dev.set_optical_out_format(true).unwrap();
+        // EQ+D on clears bit 8; SPDIF optical clears bit 10.
+        assert!(writes
+            .lock()
+            .unwrap()
+            .contains(&Write::Vendor(protocol::req::SETTINGS, 0x00C8, 1487)));
+        dev.set_eq_for_record(false).unwrap();
+        dev.set_optical_out_format(false).unwrap();
+        dev.set_word_clock_termination(false).unwrap();
+        assert!(writes
+            .lock()
+            .unwrap()
+            .contains(&Write::Vendor(protocol::req::SETTINGS, 0x05C0, 1487)));
+    }
+
+    #[test]
+    fn ucx_option_writes_keep_the_clock_source() {
+        let (mut dev, writes) = open(Model::Ucx);
+        dev.set_clock_source("Word Clock").unwrap();
+        writes.lock().unwrap().clear();
+        dev.set_optical_out_format(true).unwrap();
+        dev.set_word_clock_termination(true).unwrap();
+        // Word Clock = index 3 (bits 1–2), EQ+D off, SPDIF optical,
+        // termination on.
+        let w = writes.lock().unwrap();
+        assert!(w.contains(&Write::Vendor(protocol::req::SETTINGS, 0x0106, 1487)));
+        assert!(w.contains(&Write::Vendor(protocol::req::SETTINGS, 0x010E, 1487)));
+    }
+
+    #[test]
+    fn ucx_clock_sources_exclude_ltc() {
+        let (dev, _writes) = open(Model::Ucx);
+        assert_eq!(
+            dev.settings().clock_sources,
+            vec!["Internal", "SPDIF Coaxial", "Optical", "Word Clock"]
+        );
+        let (mut dev, _writes) = open(Model::Ucx);
+        assert!(dev.set_clock_source("LTC").is_err());
+        assert_eq!(dev.settings().clock_source, "Internal");
+    }
+
+    #[test]
+    fn ucx_scene_keeps_its_preamp_group_at_connect() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        let mut scene = dev.capture_scene();
+        scene.inputs[0].gain = Some(20);
+        scene.inputs[0].phantom = true;
+        scene.inputs[0].autoset = true;
+        scene.inputs[2].level = Some(InputLevel::LoGain);
+        scene.inputs[2].ref_level = 2;
+        scene.inputs[2].instrument = true;
+        dev.apply_scene(&scene).unwrap();
+
+        let inputs = dev.inputs();
+        assert_eq!(inputs[0].gain, Some(20));
+        assert!(inputs[0].phantom);
+        assert!(inputs[0].autoset);
+        assert_eq!(inputs[2].level, Some(InputLevel::LoGain));
+        assert_eq!(inputs[2].ref_level, 2);
+        assert!(inputs[2].instrument);
+    }
+
+    #[test]
+    fn ucx_scene_keeps_its_device_group_at_connect() {
+        // The UCX options word has no readback, so the saved scene is the
+        // only record of the device-owned settings.  Applying it must not
+        // replace them with a fresh model's defaults.
+        let (mut dev, writes) = open(Model::Ucx);
+        let mut scene = dev.capture_scene();
+        scene.settings.clock_source = "Word Clock".into();
+        scene.settings.optical_out_spdif = true;
+        scene.settings.spdif_professional = true;
+        scene.settings.word_clock_single_speed = true;
+        scene.settings.word_clock_termination = true;
+        scene.settings.eq_for_record = true;
+        writes.lock().unwrap().clear();
+        dev.apply_scene(&scene).unwrap();
+
+        let settings = dev.settings();
+        assert_eq!(settings.clock_source, "Word Clock");
+        assert!(settings.optical_out_spdif);
+        assert!(settings.spdif_professional);
+        assert!(settings.word_clock_single_speed);
+        assert!(settings.word_clock_termination);
+        assert!(settings.eq_for_record);
+        // Device-owned settings are never part of the connect write.
+        assert!(!writes
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|w| matches!(w, Write::Vendor(protocol::req::SETTINGS, _, 1487))));
     }
 
     #[test]
