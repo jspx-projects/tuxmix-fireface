@@ -1207,6 +1207,17 @@ impl DeviceHandle {
         Ok(())
     }
 
+    pub fn set_talkback(&mut self, on: bool) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_talkback(on);
+        }
+        if let DeviceHandle::Mock(_) = self {
+            return Ok(());
+        }
+        Ok(())
+    }
+
     /// Apply the readable/queued device values after the user chooses
     /// "Device -> TuxMix".  Unreadable state stays on the TuxMix scene.
     pub fn restore_readable(
@@ -1786,6 +1797,8 @@ pub enum Message {
     ControlRoomMono(bool),
     /// Control-room Mute FX option (host-side).
     ControlRoomMuteFx(bool),
+    /// Control-room Talkback on/off.
+    TalkbackChanged(bool),
     /// Recalls "Mix `u8`" (1-8) and marks it as the slot `SnapshotStore`
     /// will save into.
     SnapshotClicked(u8),
@@ -2077,6 +2090,8 @@ pub struct TuxMix {
     /// Docked Settings panel (device group, clock source, SPDIF
     /// flags) — same pattern as `show_osc_log`, see `device_panel`.
     pub show_device_panel: bool,
+    /// Talkback is engaged.  Performance state, not part of the scene.
+    pub talkback_on: bool,
     /// The FX column beside the mixer: Reverb and Echo, in TotalMix's own
     /// place for them. Only meaningful when the backend reports `fx`.
     pub show_fx_panel: bool,
@@ -2570,6 +2585,7 @@ pub fn new_with_device(
         osc_log: VecDeque::new(),
         show_osc_log: false,
         show_device_panel: false,
+        talkback_on: false,
         show_fx_panel: true,
         assign: [None; 7],
         assign_menu: AssignMenu::Closed,
@@ -4206,6 +4222,7 @@ fn is_undoable(message: &Message) -> bool {
             | Message::SetRowMode(_)
             | Message::DimToggle
             | Message::Dim(_)
+            | Message::TalkbackChanged(_)
             | Message::MatrixHover(..)
             | Message::PointerPressed
             | Message::FieldFocus(..)
@@ -4367,6 +4384,7 @@ fn needs_protocol_features(message: &Message) -> bool {
             | Message::DynamicsEnabled(..)
             | Message::DynamicsChanged(..)
             | Message::SpeakerB(..)
+            | Message::TalkbackChanged(_)
             | Message::ReverbChanged(..)
             | Message::EchoChanged(..)
             | Message::FxVolume(..)
@@ -4855,6 +4873,12 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         // (see the 3 s auto-save in `Message::Tick`). The mock never
         // persists (same reasoning as the auto-save).
         Message::SaveNow => {
+            // Talkback is a performance state; never leave the unit talking
+            // back after TuxMix closes.
+            if state.talkback_on {
+                let _ = state.device.set_talkback(false);
+                state.talkback_on = false;
+            }
             // Closing writes the window size, which no resize step does.
             state.prefs_dirty = true;
             flush_prefs(state);
@@ -6154,6 +6178,13 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
             state.device.settings_mut().mute_fx = on;
             notify_osc_bool(state, "/mute_fx", on);
+        }
+        Message::TalkbackChanged(on) => {
+            if let Err(e) = state.device.set_talkback(on) {
+                fail(state, "talkback", &e);
+            }
+            state.talkback_on = on;
+            notify_osc_bool(state, "/talkback", on);
         }
         Message::SnapshotClicked(n) => {
             state.active_snapshot = Some(n as usize);
@@ -11173,7 +11204,14 @@ fn control_room_panel(
                     .then_some(Message::ControlRoomMuteFx(!settings.mute_fx)),
             ),
         ]),
-        group(vec![cell("talkback", false, None)]),
+        group(vec![cell(
+            "talkback",
+            state.talkback_on,
+            state
+                .device
+                .is_ucx_model()
+                .then_some(Message::TalkbackChanged(!state.talkback_on)),
+        )]),
     ]
     .spacing(theme::SPACE_MD * scale)
     .padding(theme::SPACE_SM * scale)
