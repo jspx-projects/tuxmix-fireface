@@ -16,7 +16,7 @@
 //! and collected in `docs/PROTOCOL-COMPLETE.md`.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::channel::{
@@ -40,6 +40,15 @@ const BLOCKS: usize = 18;
 /// 1 ms was enough for input-only scenes; writing the 18 output EQ blocks
 /// as well doubles the burst count and needs more headroom.
 const UCX_WRITE_GAP: Duration = Duration::from_millis(5);
+/// Pause after a multi-word IF1 burst.  The device drains a 63-word
+/// burst slower than a single register; TotalMix's Windows capture spaces
+/// its connect bursts by roughly 16-33 ms.  5 ms per burst overflows the
+/// receive FIFO (ETIMEDOUT).
+const UCX_WRITE_BURST_GAP: Duration = Duration::from_millis(16);
+/// Largest IF1 burst the hwdep ABI accepts.  Scene writes are coalesced
+/// into chunks of this size so the pacing applies once per burst rather
+/// than once per register.
+const UCX_WRITE_CHUNK: usize = HWDEP_MAX_WORDS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Model {
@@ -465,7 +474,7 @@ fn output_balance(left: f32, right: f32) -> i8 {
 
 /// A Fireface UC or UCX opened over the kernel hwdep transport.
 pub struct Fireface {
-    transport: Mutex<Box<dyn ControlTransport>>,
+    transport: Arc<Mutex<Box<dyn ControlTransport>>>,
     info: DeviceInfo,
     model: Model,
     spec: &'static super::models::ModelSpec,
@@ -517,6 +526,55 @@ pub struct Fireface {
     /// UC input metering through the PipeWire source tap.  The PCM device
     /// stays with PipeWire and the DAW.  The UCX uses its 0x85 input pages.
     input_tap: Option<crate::pw_input::InputTap>,
+    /// UCX IF1 words collected during one scene apply.  `Some` while a
+    /// batch is open; `write_word`/`write_words` then append instead of
+    /// sending one USB transfer per register.  `vendor_out`/`vendor_in`
+    /// flush it first, so control transfers keep their original order.
+    write_batch: Arc<Mutex<Option<Vec<(u16, u16)>>>>,
+}
+
+/// Flushes the open UCX scene batch when `apply_scene` returns early.
+/// It holds its own handles into the device, so it does not borrow `self`
+/// across the mutable scene update.
+struct WriteBatchGuard {
+    transport: Arc<Mutex<Box<dyn ControlTransport>>>,
+    batch: Arc<Mutex<Option<Vec<(u16, u16)>>>>,
+    active: bool,
+}
+
+impl WriteBatchGuard {
+    fn flush(&self) -> Result<(), Error> {
+        let words = {
+            let mut slot = self.batch.lock().unwrap();
+            match slot.as_mut() {
+                Some(batch) => std::mem::take(batch),
+                None => return Ok(()),
+            }
+        };
+        if words.is_empty() {
+            return Ok(());
+        }
+        Fireface::send_words_paced(&self.transport, &words)
+    }
+
+    fn finish(mut self) -> Result<(), Error> {
+        self.active = false;
+        let result = self.flush();
+        *self.batch.lock().unwrap() = None;
+        result
+    }
+}
+
+impl Drop for WriteBatchGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Err(e) = self.flush() {
+            log::warn!("Flushing the coalesced IF1 scene failed: {e:?}");
+        }
+        *self.batch.lock().unwrap() = None;
+    }
 }
 
 impl Fireface {
@@ -695,7 +753,7 @@ impl Fireface {
         };
 
         let mut dev = Self {
-            transport: Mutex::new(transport),
+            transport: Arc::new(Mutex::new(transport)),
             info,
             model,
             spec,
@@ -721,6 +779,7 @@ impl Fireface {
             ignore_output_until: None,
             matrix_overrides: HashMap::new(),
             input_tap,
+            write_batch: Arc::new(Mutex::new(None)),
         };
         if model == Model::Uc {
             dev.read_uc_levels();
@@ -768,6 +827,8 @@ impl Fireface {
     }
 
     fn vendor_out(&self, req: u8, value: u16, index: u16) -> Result<(), Error> {
+        // A vendor request cannot be reordered behind queued IF1 words.
+        self.flush_write_batch()?;
         self.transport()
             .vendor(req, Direction::Out, value, index, &[])?;
         Ok(())
@@ -780,30 +841,119 @@ impl Fireface {
         index: u16,
         len: usize,
     ) -> Result<Vec<u8>, Error> {
+        self.flush_write_batch()?;
         self.transport()
             .vendor(req, Direction::In, value, index, &vec![0u8; len])
     }
 
     fn write_word(&self, addr: u16, value: u16) -> Result<(), Error> {
+        if self.model == Model::Ucx {
+            if self.queue_words(&[(addr, value)]) {
+                return Ok(());
+            }
+            return self.write_words_paced(&[(addr, value)]);
+        }
         let result = self.transport().write_words(&[(addr, value)]);
         if let Err(e) = &result {
             log::warn!("IF1 word write 0x{addr:04x}=0x{value:04x} failed: {e:?}");
-        }
-        if self.model == Model::Ucx && result.is_ok() {
-            std::thread::sleep(UCX_WRITE_GAP);
         }
         result
     }
 
     fn write_words(&self, words: &[(u16, u16)]) -> Result<(), Error> {
+        if self.model == Model::Ucx {
+            if self.queue_words(words) {
+                return Ok(());
+            }
+            return self.write_words_paced(words);
+        }
         let result = self.transport().write_words(words);
         if let Err(e) = &result {
-            log::warn!("IF1 burst of {} words starting 0x{:04x} failed: {e:?}", words.len(), words.first().map(|w| w.0).unwrap_or(0));
-        }
-        if self.model == Model::Ucx && result.is_ok() {
-            std::thread::sleep(UCX_WRITE_GAP);
+            log::warn!(
+                "IF1 burst of {} words starting 0x{:04x} failed: {e:?}",
+                words.len(),
+                words.first().map(|w| w.0).unwrap_or(0)
+            );
         }
         result
+    }
+
+    /// Append words to the open scene batch.  `false` means no batch is
+    /// open, so the caller must send them now.
+    fn queue_words(&self, words: &[(u16, u16)]) -> bool {
+        if words.is_empty() {
+            return false;
+        }
+        let mut slot = self.write_batch.lock().unwrap();
+        match slot.as_mut() {
+            Some(batch) => {
+                batch.extend_from_slice(words);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Send a word list in ABI-sized bursts, pacing each burst so the
+    /// device FIFO can drain.  The hwdep layer splits at the same limit,
+    /// but without the gap, so keep the chunking here.
+    fn send_words_paced(
+        transport: &Mutex<Box<dyn ControlTransport>>,
+        words: &[(u16, u16)],
+    ) -> Result<(), Error> {
+        for chunk in words.chunks(UCX_WRITE_CHUNK) {
+            let result = transport.lock().unwrap().write_words(chunk);
+            if let Err(e) = &result {
+                log::warn!(
+                    "IF1 burst of {} words starting 0x{:04x} failed: {e:?}",
+                    chunk.len(),
+                    chunk.first().map(|w| w.0).unwrap_or(0)
+                );
+                return result;
+            }
+            // Small bursts are the live-parameter path; a full 63-word
+            // scene burst needs the device's drain time.
+            let gap = if chunk.len() <= 8 {
+                UCX_WRITE_GAP
+            } else {
+                UCX_WRITE_BURST_GAP
+            };
+            std::thread::sleep(gap);
+        }
+        Ok(())
+    }
+
+    fn write_words_paced(&self, words: &[(u16, u16)]) -> Result<(), Error> {
+        Self::send_words_paced(&self.transport, words)
+    }
+
+    /// Start coalescing UCX IF1 words.  A no-op for the UC, whose writes
+    /// are vendor requests rather than register bursts.
+    fn begin_write_batch(&self) -> Option<WriteBatchGuard> {
+        if self.model != Model::Ucx {
+            return None;
+        }
+        *self.write_batch.lock().unwrap() = Some(Vec::with_capacity(UCX_WRITE_CHUNK));
+        Some(WriteBatchGuard {
+            transport: Arc::clone(&self.transport),
+            batch: Arc::clone(&self.write_batch),
+            active: true,
+        })
+    }
+
+    /// Send everything queued so far but keep the batch open.
+    fn flush_write_batch(&self) -> Result<(), Error> {
+        let words = {
+            let mut slot = self.write_batch.lock().unwrap();
+            match slot.as_mut() {
+                Some(batch) => std::mem::take(batch),
+                None => return Ok(()),
+            }
+        };
+        if words.is_empty() {
+            return Ok(());
+        }
+        self.write_words_paced(&words)
     }
 
     // ── UC write paths ────────────────────────────────────────────────
@@ -1416,9 +1566,11 @@ impl Fireface {
         )
     }
 
-    /// Write the 12 dynamics / Auto Level registers of one hardware input
-    /// or output.  The measured UCX block is `NN60..NN67` + `NN80..NN83`.
-    fn ucx_write_dynamics(
+    /// Fold a channel's dynamics / Auto Level values into the cached
+    /// `ChannelSettings` without writing them.  `ucx_write_channel_settings`
+    /// writes the same 12 registers, so a scene apply can update the cache
+    /// first and then send the whole block once.
+    fn ucx_update_dynamics_settings(
         &mut self,
         channel: ChannelId,
         dynamics: &Dynamics,
@@ -1464,6 +1616,27 @@ impl Fireface {
         } else {
             self.input_settings[idx] = settings;
         }
+        Ok(())
+    }
+
+    /// Write the 12 dynamics / Auto Level registers of one hardware input
+    /// or output.  The measured UCX block is `NN60..NN67` + `NN80..NN83`.
+    fn ucx_write_dynamics(
+        &mut self,
+        channel: ChannelId,
+        dynamics: &Dynamics,
+    ) -> Result<(), Error> {
+        self.ucx_update_dynamics_settings(channel, dynamics)?;
+        let (idx, is_output) = match channel {
+            ChannelId::Input(i) => (i, false),
+            ChannelId::Output(i) => (i, true),
+            ChannelId::Playback(_) => unreachable!("checked above"),
+        };
+        let settings = if is_output {
+            self.output_settings[idx]
+        } else {
+            self.input_settings[idx]
+        };
         let channel_no = if is_output {
             let dsp = ucx::output_pair_dsp(idx / 2)
                 .ok_or_else(|| Error::InvalidChannel(format!("output {idx}")))?;
@@ -3655,6 +3828,11 @@ impl RmeDevice for Fireface {
     }
 
     fn apply_scene(&mut self, scene: &Scene) -> Result<(), Error> {
+        // The UCX scene is thousands of register words.  Queue them and
+        // send 63-word bursts with the device's drain gap; sending each
+        // word separately made a connect take several seconds.
+        let started = Instant::now();
+        let batch = self.begin_write_batch();
         scene.check_compatible(self.canonical_model())?;
         if scene.inputs.len() != self.inputs.len()
             || scene.playbacks.len() != self.playbacks.len()
@@ -3938,10 +4116,18 @@ impl RmeDevice for Fireface {
             for idx in 0..self.outputs.len() {
                 if self.outputs[idx].eq.is_some() {
                     self.sync_output_eq(idx);
+                    // `channel_settings` already includes the dynamics and
+                    // Auto Level block; fold them in instead of writing
+                    // those 12 registers a second time.
+                    if let Some(dynamics) = self.outputs[idx].dynamics {
+                        self.ucx_update_dynamics_settings(
+                            ChannelId::Output(idx),
+                            &dynamics,
+                        )?;
+                    }
                     let s = self.output_settings[idx];
                     self.ucx_write_channel_settings(idx, true, &s)?;
-                }
-                if let Some(dynamics) = self.outputs[idx].dynamics {
+                } else if let Some(dynamics) = self.outputs[idx].dynamics {
                     self.ucx_write_dynamics(ChannelId::Output(idx), &dynamics)?;
                 }
                 let fx = self.outputs[idx].fx_return_db;
@@ -3950,9 +4136,15 @@ impl RmeDevice for Fireface {
         }
         for idx in 0..self.inputs.len() {
             if !self.is_uc() {
-                for p in 0..PAIRS {
-                    let volume = self.inputs[idx].volumes[p];
-                    self.apply_input_volume(idx, p, volume)?;
+                // `ucx_write_input` rewrites both sides of a stereo pair
+                // from either channel, so the odd channel would repeat the
+                // same 9-pair row.  Its scene values are already in the
+                // model; only the first side needs the device write.
+                if idx < 4 || idx % 2 == 0 {
+                    for p in 0..PAIRS {
+                        let volume = self.inputs[idx].volumes[p];
+                        self.apply_input_volume(idx, p, volume)?;
+                    }
                 }
                 let linked = self.input_pair_linked(idx / 2);
                 self.ucx_write_input_stereo(idx, linked)?;
@@ -3967,13 +4159,18 @@ impl RmeDevice for Fireface {
             if self.inputs[idx].mute {
                 self.set_mute(ChannelId::Input(idx), true)?;
             }
-            if !self.is_uc() && self.inputs[idx].eq.is_some() {
-                self.sync_input_eq(idx);
-                let s = self.input_settings[idx];
-                self.ucx_write_channel_settings(idx, false, &s)?;
-            }
             if !self.is_uc() {
-                if let Some(dynamics) = self.inputs[idx].dynamics {
+                if self.inputs[idx].eq.is_some() {
+                    self.sync_input_eq(idx);
+                    if let Some(dynamics) = self.inputs[idx].dynamics {
+                        self.ucx_update_dynamics_settings(
+                            ChannelId::Input(idx),
+                            &dynamics,
+                        )?;
+                    }
+                    let s = self.input_settings[idx];
+                    self.ucx_write_channel_settings(idx, false, &s)?;
+                } else if let Some(dynamics) = self.inputs[idx].dynamics {
                     self.ucx_write_dynamics(ChannelId::Input(idx), &dynamics)?;
                 }
             }
@@ -4012,7 +4209,18 @@ impl RmeDevice for Fireface {
                 self.set_dim(true)?;
             }
         }
-        Ok(())
+        let result = match batch {
+            Some(batch) => batch.finish(),
+            None => Ok(()),
+        };
+        if result.is_ok() {
+            log::info!(
+                "applied the {} mixer scene in {:?}",
+                self.model.name(),
+                started.elapsed()
+            );
+        }
+        result
     }
 
     fn poll_events(&mut self) -> Result<(), Error> {
@@ -5203,6 +5411,41 @@ mod tests {
         assert!(w.contains(&Write::Vendor(protocol::req::PGA, 36, 2)));
         assert!(w.contains(&Write::Vendor(protocol::req::PGA, 1, 3)));
         assert_eq!(dev.inputs()[2].gain_max, Some(36));
+    }
+
+    #[test]
+    fn ucx_scene_apply_is_sent_in_paced_bursts() {
+        let (mut dev, writes) = open(Model::Ucx);
+        let scene = dev.capture_scene();
+        writes.lock().unwrap().clear();
+        let start = Instant::now();
+        dev.apply_scene(&scene).unwrap();
+        let elapsed = start.elapsed();
+        let w = writes.lock().unwrap();
+        let bursts: Vec<&Vec<(u16, u16)>> = w
+            .iter()
+            .filter_map(|x| match x {
+                Write::Words(v) => Some(v),
+                Write::Vendor(..) => None,
+            })
+            .collect();
+        let words: usize = bursts.iter().map(|v| v.len()).sum();
+        assert!(words > 1000, "scene shrank to {words} words");
+        assert!(
+            bursts.iter().all(|v| !v.is_empty() && v.len() <= HWDEP_MAX_WORDS),
+            "a burst exceeded the ABI limit"
+        );
+        assert!(
+            bursts.iter().any(|v| v.len() > 1),
+            "words were still sent one at a time"
+        );
+        assert!(
+            w.len() < 100,
+            "scene still used {} USB transfers",
+            w.len()
+        );
+        // Full bursts at the 16 ms drain gap, plus the loopback vendors.
+        assert!(elapsed < Duration::from_secs(2), "scene took {elapsed:?}");
     }
 
     #[test]

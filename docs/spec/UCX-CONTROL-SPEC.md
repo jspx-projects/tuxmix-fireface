@@ -79,8 +79,10 @@ for stream open/close or a 44.1↔48 kHz change.
 
 ### 2.4 Write pacing
 
-The backend waits 5 ms after each IF1 write or burst. A full scene
-(18 input and 18 output DSP blocks) exceeds the device receive FIFO at 1 ms.
+IF1 words are coalesced into bursts of up to 63 words (252 bytes). The
+backend waits 5 ms after a burst of up to 8 words and 16 ms after a larger
+burst. A full scene is sent as 63-word bursts; closer spacing overflows the
+device receive FIFO and the bulk transfer times out.
 
 ### 2.5 MIDI
 

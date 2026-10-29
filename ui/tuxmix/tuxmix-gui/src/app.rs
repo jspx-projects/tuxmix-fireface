@@ -3111,6 +3111,12 @@ pub fn restore_engine(state: &mut TuxMix) {
     }
     state.engine = pw_clock::read();
     state.card_stream = pw_clock::card_stream(state.device.card_id());
+    // The scene was just written at this rate/stream state.  Seed the
+    // detectors so the first EnginePoll only reacts to a change made after
+    // the write; otherwise a sink that was already running at launch causes
+    // a second full scene push.
+    state.last_card_rate = state.card_stream.map(|stream| stream.rate);
+    state.last_sink_running = !state.device.is_mock() && pw_clock::fireface_sink_running();
     state.driver_floor = pw_clock::driver_period_floor();
     state.driver_queue = pw_clock::driver_urb_queue();
 }
