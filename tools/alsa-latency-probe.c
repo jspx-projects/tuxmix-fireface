@@ -4,6 +4,7 @@
 //
 //   alsa-latency-probe <device> <rate> <period> <periods>
 //                      [play_ch] [capture_ch] [capture_ch_b] [channels]
+//                      [amplitude]
 //
 // Plays a full-scale impulse every 1024 frames on `play_ch`, captures one or
 // two channels on the same PCM and reports the delay of the captured impulse
@@ -148,6 +149,7 @@ int main(int argc, char **argv) {
                 "[capture_ch] [capture_ch_b] [channels]\n"
                 "  device      ALSA PCM name, e.g. hw:2,0\n"
                 "  channels    interleaved channel count (default 2)\n"
+                "  amplitude   impulse level 0..1 (default 1.0)\n"
                 "  format      fixed to S32_LE\n",
                 argv[0]);
         return 2;
@@ -160,8 +162,13 @@ int main(int argc, char **argv) {
     int cap_ch = argc > 6 ? atoi(argv[6]) : 2;
     int cap_ch_b = argc > 7 ? atoi(argv[7]) : -1;
     unsigned channels = argc > 8 ? (unsigned)atoi(argv[8]) : 2;
+    double amplitude = argc > 9 ? atof(argv[9]) : 1.0;
     if (!channels || channels > 4096) {
         fprintf(stderr, "channels outside 1..4096\n");
+        return 2;
+    }
+    if (amplitude <= 0.0 || amplitude > 1.0) {
+        fprintf(stderr, "amplitude outside 0..1\n");
         return 2;
     }
     if (play_ch < 0 || (unsigned)play_ch >= channels || cap_ch < 0 ||
@@ -204,7 +211,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     for (snd_pcm_uframes_t i = PRE; i < total; i += TRAIN) {
-        out[(size_t)i * (size_t)channels + (size_t)play_ch] = 1000000000;
+        out[(size_t)i * (size_t)channels + (size_t)play_ch] =
+            (int32_t)(1000000000.0 * amplitude);
     }
 
     if ((r = snd_pcm_prepare(p)) < 0) {
@@ -270,6 +278,15 @@ int main(int argc, char **argv) {
     }
     snd_pcm_drop(p);
     snd_pcm_drop(c);
+
+    const char *dump = getenv("DUMP");
+    if (dump && *dump) {
+        FILE *f = fopen(dump, "wb");
+        if (f) {
+            fwrite(in, sizeof(int32_t), (size_t)rd * channels, f);
+            fclose(f);
+        }
+    }
 
     double offset_frames = start_offset_ms * (double)rate / 1000.0;
     int na = 0, nb = 0;
