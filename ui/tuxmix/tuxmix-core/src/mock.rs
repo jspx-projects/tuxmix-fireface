@@ -355,6 +355,26 @@ impl MockBabyfacePro {
         self.settings.word_clock_termination = on;
         Ok(())
     }
+
+    pub fn set_input_ms_proc(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        let base = idx & !1;
+        for i in [base, base ^ 1] {
+            if let Some(input) = self.inputs.get_mut(i) {
+                input.ms_proc = on;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_playback_ms_proc(&mut self, idx: usize, on: bool) -> Result<(), Error> {
+        let base = idx & !1;
+        for i in [base, base ^ 1] {
+            if let Some(playback) = self.playbacks.get_mut(i) {
+                playback.ms_proc = on;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl RmeDevice for MockBabyfacePro {

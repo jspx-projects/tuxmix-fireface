@@ -1181,6 +1181,32 @@ impl DeviceHandle {
         Ok(())
     }
 
+    pub fn set_input_ms_proc(&mut self, idx: usize, on: bool) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_input_ms_proc(idx, on);
+        }
+        if let DeviceHandle::Mock(d) = self {
+            return d.set_input_ms_proc(idx, on);
+        }
+        Ok(())
+    }
+
+    pub fn set_playback_ms_proc(
+        &mut self,
+        idx: usize,
+        on: bool,
+    ) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_playback_ms_proc(idx, on);
+        }
+        if let DeviceHandle::Mock(d) = self {
+            return d.set_playback_ms_proc(idx, on);
+        }
+        Ok(())
+    }
+
     /// Apply the readable/queued device values after the user chooses
     /// "Device -> TuxMix".  Unreadable state stays on the TuxMix scene.
     pub fn restore_readable(
@@ -1609,6 +1635,8 @@ pub enum Message {
     /// Per-channel stereo width (inputs and playbacks), -1..+1.
     ChannelWidthChanged(ChannelId, f32),
     MsProcChanged(bool),
+    InputMsProcChanged(usize, bool),
+    PlaybackMsProcChanged(usize, bool),
     An12Changed(bool),
     InputLinkChanged(bool),
     EqForRecordChanged(bool),
@@ -4352,6 +4380,8 @@ fn needs_protocol_features(message: &Message) -> bool {
             | Message::WidthChanged(_)
             | Message::ChannelWidthChanged(..)
             | Message::MsProcChanged(_)
+            | Message::InputMsProcChanged(..)
+            | Message::PlaybackMsProcChanged(..)
             | Message::An12Changed(_)
             | Message::InputLinkChanged(_)
             | Message::EqForRecordChanged(_)
@@ -5379,6 +5409,18 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                 fail(state, "set_ms_proc", &e);
             }
             notify_osc_bool(state, "/ms_proc", on);
+        }
+        Message::InputMsProcChanged(idx, on) => {
+            if let Err(e) = state.device.set_input_ms_proc(idx, on) {
+                fail(state, "set_input_ms_proc", &e);
+            }
+            notify_osc_bool(state, format!("/input/{idx}/ms_proc"), on);
+        }
+        Message::PlaybackMsProcChanged(idx, on) => {
+            if let Err(e) = state.device.set_playback_ms_proc(idx, on) {
+                fail(state, "set_playback_ms_proc", &e);
+            }
+            notify_osc_bool(state, format!("/playback/{idx}/ms_proc"), on);
         }
         Message::An12Changed(on) => {
             if let Err(e) = state.device.set_an12(on) {
@@ -8942,8 +8984,26 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
         });
         col = col.push(settings_slot(send, SETTINGS_ROW_KNOB, scale));
 
-        // Row 8 — MS proc (no per-channel value yet).
-        col = col.push(settings_slot(None, SETTINGS_ROW_CTRL, scale));
+        // Row 8 — MS proc.  A mono input pair cannot process M/S, so the
+        // button is inert until the pair is linked.  Stereo inputs (5-8,
+        // SPDIF, ADAT) are always a pair.
+        let ms_on = state.device.inputs()[idx].ms_proc;
+        let can_ms = idx >= 4 || p.stereo_linked;
+        let ms = ucx.then(|| {
+            hint(
+                button(strip::centered_label("MS Proc", theme::TEXT_SM * scale))
+                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                    .width(Length::Fill)
+                    .height(Length::Fixed(SETTINGS_CONTROL_H * scale))
+                    .style(theme::stereo_button(ms_on))
+                    .on_press_maybe(
+                        can_ms.then_some(Message::InputMsProcChanged(idx, !ms_on)),
+                    ),
+                "Mid/side processing on the stereo pair",
+                scale,
+            )
+        });
+        col = col.push(settings_slot(ms, SETTINGS_ROW_CTRL, scale));
 
         // Row 9 — the phase pair.
         let phase = p.has_phase.then(|| {
@@ -9036,7 +9096,26 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
             )
         });
         col = col.push(settings_slot(send, SETTINGS_ROW_KNOB, scale));
-        col = col.push(settings_slot(None, SETTINGS_ROW_CTRL, scale));
+        // Row 4 — MS proc.  The transform is per stereo pair, so a split
+        // playback pair keeps the button inert.
+        let ms_on = state.device.playbacks()[i].ms_proc;
+        let ms = ucx.then(|| {
+            hint(
+                button(strip::centered_label("MS Proc", theme::TEXT_SM * scale))
+                    .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
+                    .width(Length::Fill)
+                    .height(Length::Fixed(SETTINGS_CONTROL_H * scale))
+                    .style(theme::stereo_button(ms_on))
+                    .on_press_maybe(
+                        p.stereo_linked
+                            .then_some(Message::PlaybackMsProcChanged(i, !ms_on)),
+                    ),
+                "Mid/side processing on the stereo pair",
+                scale,
+            )
+        });
+        col = col.push(settings_slot(ms, SETTINGS_ROW_CTRL, scale));
+        // Row 5 — playback has no phase.
         col = col.push(settings_slot(None, SETTINGS_ROW_CTRL, scale));
         return settings_card(col, width, scale);
     }
