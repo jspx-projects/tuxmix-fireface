@@ -336,7 +336,10 @@ the affected sends:
   family with the ADAT 7/8 submix (DSP outputs 16/17) selected.
 - **MS Proc on software playback** — the playback's send words
   (`0x4020…`, `0x4120…`, `0x41A0…` families).  On hardware inputs MS Proc
-  uses `NN05` and the same send recompute.
+  writes `NN05` on both channels and the same send recompute.  With source
+  gains `gl`/`gr` and the width angle `theta`, the coefficients are
+  `gl*(cos+sin)/2`, `gr*(sin+cos)/2`, `gl*(cos-sin)/2` and
+  `gr*(sin-cos)/2` for L→L, R→L, L→R and R→R.  Mono inputs reject MS Proc.
 - **Talkback receive per output** and **No Trim** — host-side flags; they
   write nothing.  With a talkback source selected, enabling talkback on an
   output injects that source as ordinary send words into the output, dims

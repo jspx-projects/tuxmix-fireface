@@ -96,6 +96,10 @@ pub struct InputChannel {
     /// pair's 2x2 send matrix when a send is written.
     #[serde(default = "default_width")]
     pub width: f32,
+    /// Mid/side processing on the pair.  Inputs also carry `NN05`; the
+    /// send matrix is rewritten with the M/S encoder.
+    #[serde(default)]
+    pub ms_proc: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Display)]
@@ -436,6 +440,10 @@ pub struct PlaybackChannel {
     /// pair's 2x2 send matrix when a send is written.
     #[serde(default = "default_width")]
     pub width: f32,
+    /// Mid/side processing on the pair; the send matrix is rewritten with
+    /// the M/S encoder.  Playback has no register, only the matrix.
+    #[serde(default)]
+    pub ms_proc: bool,
     pub mute: bool,
     pub solo: bool,
 }
@@ -517,6 +525,7 @@ impl InputChannel {
             solo: false,
             trim: 0.0,
             width: 1.0,
+            ms_proc: false,
         }
     }
 }
@@ -532,6 +541,7 @@ impl PlaybackChannel {
             split: false,
             trim: 0.0,
             width: 1.0,
+            ms_proc: false,
             mute: false,
             solo: false,
         }

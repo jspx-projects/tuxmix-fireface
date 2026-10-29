@@ -169,11 +169,11 @@ Empty rows keep the height of the control the grid reserves for them.
 
 | Channel | Contents, top to bottom |
 |---|---|
-| Input 1/2 | Stereo, space, 48V, AutoSet, Gain, Width, Send FX, MS slot, Ø L / R Ø |
-| Input 3/4 | Stereo, `ref.`, Inst + reference dropdown, AutoSet, Gain, Width, Send FX, MS slot, Ø L / R Ø |
-| Inputs 5–8 | Stereo, `ref.`, reference dropdown, two empty rows, Width, Send FX, MS slot, Ø L / R Ø |
-| Inputs 9+ | Stereo, four empty rows, Width, Send FX, MS slot, Ø L / R Ø |
-| Software playback | Stereo, Width, Send FX, MS slot, phase slot |
+| Input 1/2 | Stereo, space, 48V, AutoSet, Gain, Width, Send FX, MS Proc, Ø L / R Ø |
+| Input 3/4 | Stereo, `ref.`, Inst + reference dropdown, AutoSet, Gain, Width, Send FX, MS Proc, Ø L / R Ø |
+| Inputs 5–8 | Stereo, `ref.`, reference dropdown, two empty rows, Width, Send FX, MS Proc, Ø L / R Ø |
+| Inputs 9+ | Stereo, four empty rows, Width, Send FX, MS Proc, Ø L / R Ø |
+| Software playback | Stereo, Width, Send FX, MS Proc, phase slot |
 | Hardware output | Stereo, `ref.`, reference dropdown, Return FX, Ø L / R Ø, No Trim, space, Talkback, Loopback |
 
 - 48 V is available on inputs 1/2; AutoSet on inputs 1–4; Inst and a gain
@@ -183,6 +183,10 @@ Empty rows keep the height of the control the grid reserves for them.
 - Width is a pair control, -1.00 … +1.00, +1.00 full stereo. It rewrites
   the pair's 2x2 send matrix in every routing that carries a live send;
   silent routings are untouched. Inputs and software playback share it.
+- MS Proc is a pair button on inputs and software playback. On the UCX it
+  writes `NN05` on both input channels and rewrites the same 2x2 send matrix
+  with the M/S encoder (`L' = (L + R) / 2`, `R' = (L - R) / 2`); software
+  playback rewrites the matrix only. A mono input pair cannot enable it.
 - One control spans the panel content width; two controls share it with one
   gap, so a single button and a phase pair end at the same right edge.
 - Knobs keep one fixed column at the right: gain, width, send FX and return
