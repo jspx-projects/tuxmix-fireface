@@ -9,7 +9,7 @@ use iced::{alignment, mouse, Color, Element, Length, Point, Rectangle, Renderer,
 use std::time::Instant;
 use tuxmix_core::ChannelId;
 
-use crate::app::{db_text, short_label, Message};
+use crate::app::{short_label, Message};
 use crate::theme;
 use crate::widgets::fader::{fader, vu_meter, Fader, MeterFrame};
 use crate::widgets::knob::{knob, Knob};
@@ -327,7 +327,7 @@ pub struct StripParams<'a> {
 /// default 1.2x line-height also reserves descender space these glyphs
 /// (M, S, no descenders) never use, which reads as "sitting too high" once
 /// centered — tightening it to 1:1 removes that residual vertical bias.
-fn centered_label<'a>(s: &'a str, size: f32) -> Element<'a, Message> {
+pub(crate) fn centered_label<'a>(s: &'a str, size: f32) -> Element<'a, Message> {
     container(
         text(s)
             .size(size)
@@ -1101,7 +1101,11 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
             "-inf".into()
         };
         mouse_area(
-            text(db_text(p.vol))
+            text(if p.vol > 0.0 {
+                format!("{:.1}", 20.0 * p.vol.log10())
+            } else {
+                "-∞".into()
+            })
                 .color(theme::TEXT_PRIMARY)
                 .size(theme::TEXT_XS * scale)
                 .wrapping(advanced_text::Wrapping::None),
@@ -1140,10 +1144,14 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // (`toggle_button` at `ICON_BTN_W` x `ICON_BTN_H`, a true minus sign
     // centered in it) instead of a `plain_button` of its own height, so
     // the strip's small controls are one family.
+    // A little wider than the other icon buttons when the strip has the
+    // room; the left spacer matches it exactly so the dB readout stays
+    // centred on the fader.
+    let collapse_w = (ICON_BTN_W + 4.0) * scale;
     let collapse_btn = hint(
         button(centered_label("−", theme::TEXT_SM * scale))
             .padding(0)
-            .width(ICON_BTN_W * scale)
+            .width(Length::Fixed(collapse_w))
             .height(ICON_BTN_H * scale)
             .style(theme::toggle_button(false, theme::ACCENT))
             .on_press(Message::ToggleCollapse(cid)),
@@ -1166,8 +1174,10 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     // row itself used to (see `Fader::layout_x`'s doc comment).
     rows = rows.push(
         row![
-            iced::widget::Space::new().width(Length::Fixed(ICON_BTN_W * scale)),
-            container(db_display),
+            iced::widget::Space::new().width(Length::Fixed(collapse_w)),
+            container(db_display)
+                .width(Length::Fill)
+                .center_x(Length::Fill),
             collapse_btn,
         ]
         .spacing(theme::SPACE_TIGHT)
@@ -1193,11 +1203,17 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
                         text(p.bus_label.clone())
                             .size(theme::TEXT_XS * scale)
                             .wrapping(advanced_text::Wrapping::None),
+                        iced::widget::Space::new().width(Length::Fill),
                         text("▸").size(theme::TEXT_XS * scale),
                     ]
-                    .spacing(theme::SPACE_TIGHT),
+                    .spacing(theme::SPACE_TIGHT)
+                    .align_y(iced::Alignment::Center)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
                 )
-                .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
+                .width(Length::Fill)
+                .height(Length::Fixed(btn_h))
+                .padding([0.0, theme::SPACE_SM * scale])
                 .style(theme::toggle_button(p.open_flyout == Some(FlyoutKind::Route), theme::ACCENT))
                 .on_press(Message::ToggleFlyout(cid, FlyoutKind::Route)),
                 "Change output bus",

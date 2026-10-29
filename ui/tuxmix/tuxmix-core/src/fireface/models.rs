@@ -16,6 +16,8 @@ pub struct ModelSpec {
     pub card_id: &'static str,
     pub profile: &'static DeviceProfile,
     pub capabilities: DeviceCapabilities,
+    /// The clock sources the unit's Settings dialog offers, in order.
+    pub clock_sources: &'static [&'static str],
 }
 
 pub const UC: ModelSpec = ModelSpec {
@@ -30,6 +32,7 @@ pub const UC: ModelSpec = ModelSpec {
         loopback: true,
         phase: true,
         phase_without_eq: true,
+        output_phase: false,
         output_balance: true,
         stereo_split: true,
         matrix_cells: true,
@@ -42,12 +45,14 @@ pub const UC: ModelSpec = ModelSpec {
         fx: false,
         pitch: false,
         width: true,
+        channel_width: false,
         ms_proc: true,
         an12: true,
         input_link: true,
         eq_for_record: false,
         optical_out: true,
     },
+    clock_sources: &["Internal", "SPDIF Coaxial", "Optical", "Word Clock", "LTC"],
 };
 
 pub const UCX: ModelSpec = ModelSpec {
@@ -62,6 +67,7 @@ pub const UCX: ModelSpec = ModelSpec {
         loopback: true,
         phase: true,
         phase_without_eq: false,
+        output_phase: true,
         output_balance: true,
         stereo_split: true,
         matrix_cells: false,
@@ -77,12 +83,16 @@ pub const UCX: ModelSpec = ModelSpec {
         // These globals currently have no UCX write path in this backend.
         pitch: false,
         width: false,
+        channel_width: true,
         ms_proc: false,
         an12: false,
         input_link: true,
         eq_for_record: true,
         optical_out: true,
     },
+    // The UCX has no LTC clock source (manual 7.1): Internal, Word,
+    // SPDIF coax. and Optical In.  Its clock field is two bits.
+    clock_sources: &["Internal", "SPDIF Coaxial", "Optical", "Word Clock"],
 };
 
 pub fn for_model(model: Model) -> &'static ModelSpec {

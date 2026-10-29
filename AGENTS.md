@@ -2,69 +2,22 @@
 
 Read this file before starting work in this repository.
 
-## What lives here
-
-- `kernel/` — the `snd-fireface-uc` out-of-tree kernel module: USB
-  transport, ALSA PCM, the `snd-hwdep` control ABI and a rawmidi port.
-  The device table covers the RME Fireface UC and UCX in both USB vendor
-  personalities.
-- `ui/tuxmix/` — TuxMix, the mixer application, a Cargo workspace
-  (`tuxmix-core`,
-  `tuxmix-gui`, `tuxmix-tui`, `tuxmix-usb`, `tuxmix-sys`). It develops
-  independently of the kernel. Babyface Pro FS support lives here, in
-  userspace.
-- `tools/` — probe and analysis sources.
-- `docs/spec/` — the authoritative specifications.
-- `docs/captures/` — cleaned descriptor dumps.
-- `scripts/` — build, install, load and capture helpers.
-- The root `Makefile` builds the `rme-probe` tool.
-
-The only interface between driver and UI is the hwdep ABI in
-`kernel/ffuc-uapi.h`, mirrored in
-`ui/tuxmix/tuxmix-core/src/fireface/abi.rs`.
-Changing one means updating the other in the same change.
-
-## Build and test
-
-- Driver: `make -C kernel`; install through DKMS with
-  `scripts/install-dkms.sh`.
-- UI: from `ui/tuxmix/`, `cargo test -p tuxmix-core --lib --features alsa` and
-  `cargo test -p tuxmix-gui`.
-- Tools: `make` in the repository root.
-
-## Publishing rules
-
-- No proprietary RME material may be published in this repository: manuals
-  (PDFs or excerpts), drivers, firmware, or graphics copied from RME
-  assets. Protocol descriptions and register maps derived from USB
-  captures are fine.
-- No per-unit identifiers: device serial numbers, product-string unit
-  suffixes, hostnames, usernames or absolute personal paths.
-- The commit history is part of the publication. Before pushing, audit the
-  history for the identifiers above (`git log -S`); anything once
-  committed stays recoverable from old commits.
-- Local-only material (manuals, the RME Windows driver package, capture
-  data, working notes) stays out of the published tree through
-  `.git/info/exclude`. Do not list private paths in a committed
-  `.gitignore` — the names themselves would leak.
-
 ## Documentation rules
 
 `docs/spec/` contains authoritative specifications. Write them as reference
 documents for the current implementation, not as a work log.
 
-- State **what something is** and how it behaves. Do not describe what it
-  is not, what it used to be, or what went wrong before.
-- No historical notes, retractions, changelogs, capture diaries, or
-  narration of individual findings in a specification.
+- State **what something is** and how it behaves. Do not describe what it is
+  not, what it used to be, or what went wrong before.
+- No historical notes, retractions, changelogs, capture diaries, or "oracle
+  said" narration in a specification.
 - No personal identifying information. Do not put serial numbers, USB
-  vendor/product IDs tied to a unit, hostnames, usernames, file paths with
-  a home directory, or device addresses in a specification.
+  vendor/product IDs, hostnames, usernames, file paths with a home directory,
+  or device addresses in a specification.
 - Keep specifications minimal. Tables and short normative paragraphs are
   preferred over prose.
 - Put open questions, TODO lists, capture requests and working notes in
-  `docs/work/`. They are not part of the specification and are not
-  published.
+  `docs/work/`. They are not part of the specification.
 - The specification describes the shipped model and its device writes. When
   evidence is incomplete, state the implemented mapping positively and keep
   the open question in `docs/work/`.
@@ -73,6 +26,7 @@ Authoritative files:
 
 - `docs/spec/UCX-CONTROL-SPEC.md` — UCX transport, registers, controls,
   metering.
+- `docs/spec/TUXMIX-SPEC.md` — visible UI, panels, state and persistence.
 - `docs/spec/UC-CONTROL-SPEC.md` — UC-specific protocol and controls.
 - `docs/spec/BABYFACE-PRO-CONTROL-SPEC.md` — Babyface Pro FS channel model,
   ALSA surface, vendor USB protocol, DSP EQ blocks and metering.
@@ -81,24 +35,42 @@ Authoritative files:
 
 - For UI layout, use current TotalMix FX screenshots when a manual figure
   shows an older layout. Manuals can lag the shipping application.
+
 - On/off switches sit at the left of their row when the row has a label.
-- Buttons are only as wide as their label needs. Do not stretch a button
-  across its container by default; list and menu rows are the exception.
-- Section headers use one style everywhere: uppercase label, accent tick
-  and a trailing rule closed by a small block. A header spans its own
-  section's elements, and the slack in the row is the break before the
-  next section.
-- Faders: every fader slides in one dark slot drawn by the fader itself.
-  The main fader's rail sits inside a wider slot; the thin FX fader *is*
-  the slot — one line, thinner, scaled with its smaller body. Both slots
-  use the same dark colour.
-- FX faders show colour only when raised: the rail fills with the send
-  colour (orange) or return colour (green), and a fader at the bottom
-  shows none. No extra marker line.
-- The thin FX fader sits at the top of the strip's control column, level
-  with the top of the main fader in every row. The T / gear / EQ / D column
-  starts directly below it, as high as the strip allows; spare height stays
-  below the column.
+- Settings panels use one control width: a single control spans the content
+  width; two controls share it with one gap, so their combined width equals
+  a single control. `stereo`, `48V`, `autoset`, `no trim`, `loopback` and a
+  phase pair therefore all end at the same right edge.
+- A panel's knob rows share one vertical centre line: `gain`, `width`,
+  `send FX` and `return FX` knobs are pinned to the same column. `send`/`FX`
+  and `return`/`FX` use two lines so the label column stays narrow.
+- Button labels are centred, and so are dropdown values.
+- Every button and dropdown in a Settings panel shares one control height.
+- Standalone labels in the Settings grid, such as `ref.`, are centred and
+  sit at the bottom of their slot, just above the control they name.
+- The strip's submix label box spans the strip width at the standard strip
+  button height, with the name vertically centred at the left and the arrow
+  at the right.
+- The dB readout under the main fader is centred on the fader track and has
+  no unit suffix; the numeric scale stays in the lane beside the track. The
+  collapse button sits at the right edge of that row.
+- Outside the Settings control grid, buttons are only as wide as their label
+  needs. Do not stretch a button across its container by default; list and
+  menu rows are the exception.
+- Section headers use one style everywhere: uppercase label, accent tick and a
+  trailing rule closed by a small block. A header spans its own section's
+  elements, and the slack in the row is the break before the next section.
+- Faders: every fader slides in one dark slot drawn by the fader itself. The
+  main fader's rail sits inside a wider slot; the thin FX fader *is* the slot —
+  one line, thinner, scaled with its smaller body. Both slots use the same
+  dark colour.
+- FX faders show colour only when raised: the rail fills with the send colour
+  (orange) or return colour (green), and a fader at the bottom shows none. No
+  extra marker line.
+- The thin FX fader sits at the top of the strip's control column, level with
+  the top of the main fader in every row. The T / gear / EQ / D column starts
+  directly below it, as high as the strip allows; spare height stays below
+  the column.
 - Every strip has a main fader, and the symbol column is anchored to it: it
   sits below the FX fader when the unit has one, directly below the fader top
   otherwise. The column holds the symbols the unit has, in the fixed order
@@ -106,8 +78,8 @@ Authoritative files:
   strip keeps each symbol at the same absolute height as the hardware-input
   row; a channel that lacks one keeps its empty slot (same height, same gap),
   so no symbol below moves.
-- The pointer never changes over a fader or a knob; the grab hand hides
-  the values underneath it.
+- The pointer never changes over a fader or a knob; the grab hand hides the
+  values underneath it.
 - Knobs carry a neutral full-range track; a coloured arc appears only while
   the control is live. No always-on coloured outline.
 - Phase buttons use the `Ø` symbol, never the word: `Ø L` / `R Ø` for a
@@ -117,39 +89,44 @@ Authoritative files:
   per-channel grid is in `docs/spec/TUXMIX-SPEC.md` §3.
 - Every slideout fits the strip height at normal size: everything visible at
   a glance, no scrolling.
-- Slideouts always open to the right of their own channel. In the Control
-  Room the section shifts its own channels left by one slot to make the
-  space; its left edge may overlap the channel row but never moves it.
-- Slideout panels never show a scrollbar at normal size. Keep the
-  scrollable wrapper in the code as a safety net while tuning, so missing
-  content is reachable instead of silently clipped.
-- Slideouts have no close button; the strip tab that opened the panel
-  closes it.
+- Slideouts always open to the right of their own channel. In the Control Room
+  the section shifts its own channels left by one slot to make the space; its
+  left edge may overlap the channel row but never moves it.
+- Slideout panels never show a scrollbar at normal size. Keep the scrollable
+  wrapper in the code as a safety net while tuning, so missing content is
+  reachable instead of silently clipped.
+- Slideouts have no close button; the strip tab that opened the panel closes
+  it.
 - A knob label may overlap the unused bottom margin of its knob when space
   is tight; use the panel background behind the label.
 - Align related controls and values in rows and columns whenever possible.
 - Keep at least `theme::SPACE_TIGHT` (2 px at scale 1) between distinct
   controls.
-- Ordinary nouns in slideouts are lowercase (`gain`, `attack`,
-  `compressor`, `auto level`).
+- Ordinary nouns in slideouts are lowercase (`gain`, `attack`, `compressor`,
+  `auto level`).
 - Knob labels use the standard `theme::KNOB_LABEL_GAP`; the `attack` label
   and its knob are the reference distance.
 - The channel-strip icon order is fixed: `T`, settings gear, `EQ`, `D`.
   Never reorder these.
-- Colours follow the signal section: compressor red, expander green, EQ
-  bands red/green/blue, shared controls neutral white.
+- Colours follow the signal section: compressor red, expander green,
+  EQ bands red/green/blue, shared controls neutral white.
 
 ## Working rules
 
-- One Fireface device at a time.
-- Do not kill or restart the running mixer application without letting it
-  save its state; leave the unit on the user's scene after hardware tests.
-- Any new UI control needs its simulation (mock) implementation in the
-  same change as the real device path.
-- Do not replace device-backed behaviour with host-side approximations. If
-  the unit supports something and the register is unknown, add it to
+- Use the NAS mailbox in `/media/nas_data/John/Electronica/rme/coordination/`
+  for Windows/oracle questions and acknowledgements. Linux owns
+  `LINUX-STATUS.md`, `LINUX-REQUESTS.md`, `DECISIONS.md`, `analysis/*` and
+  `coordination/inbox/windows/*`.
+- Push only to our own repository,
+  `jspx-projects/tuxmix-fireface`. Never push to `ismail-bahloul/TuxMix`;
+  that is the upstream TuxMix application.
+- Do not commit, reset, clean or publish the nested `ui/tuxmix` worktree
+  unless the user asks for a commit or push.
+- Preserve the user scene and `~/.config/tuxmix/gui.json`. Leave the device on
+  the user's scene after hardware tests.
+- One Fireface at a time.
+- Verify with `cargo test -p tuxmix-core --lib --features alsa` and
+  `cargo test -p tuxmix-gui`.
+- Do not replace device-backed behaviour with host-side approximations. If the
+  unit supports something and the register is unknown, add it to
   `docs/work/` and request a capture.
-- Verify driver changes by reloading the module and reading the kernel
-  log.
-- Never run `git clean -x` in this repository: it deletes excluded
-  local-only files.

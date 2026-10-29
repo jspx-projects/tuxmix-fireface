@@ -28,22 +28,32 @@ pub fn mismatch_modal(state: &TuxMix) -> Element<'_, Message> {
         );
     }
 
+    let ucx = state.device.is_ucx_model();
     let card = opaque(
         container(
             column![
                 text("Mismatch detected")
                     .color(theme::TEXT_PRIMARY)
                     .size(theme::TEXT_XL * scale),
-                text("Channel and FX settings of the device and TuxMix are different.")
-                    .color(theme::TEXT_SEC)
-                    .size(theme::TEXT_XS * scale),
+                text(if ucx {
+                    "Input gain and output volume of the device and TuxMix are different."
+                } else {
+                    "Channel and FX settings of the device and TuxMix are different."
+                })
+                .color(theme::TEXT_SEC)
+                .size(theme::TEXT_XS * scale),
                 differences,
-                text(
+                text(if ucx {
+                    "The UCX reports input gain and output volume. Choosing Use device \
+                     settings restores those values on the unit and in TuxMix. The options \
+                     word, reference levels and the 48 V/Inst/Level switches are not read \
+                     back and stay at the TuxMix scene."
+                } else {
                     "The UC stores its matrix, faders and loopback, but only the clock, \
                      optical format, 48 V, PAD and Inst registers can be read back. \
                      Choosing Device -> TuxMix applies the readable values; the matrix, \
                      faders and loopback stay at the TuxMix scene."
-                )
+                })
                 .color(theme::TEXT_SEC)
                 .size(theme::TEXT_MICRO * scale),
                 row![

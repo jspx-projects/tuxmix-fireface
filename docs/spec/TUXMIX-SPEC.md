@@ -143,28 +143,58 @@ applies to Dynamics, Auto Level, Reverb and Echo.
 - The active tab carries the panel's dark surface behind its glyph.
 - The glyph is centred in the tab before and after opening.
 
+### 2.5 Control sizing
+
+There are two sizing families, one per surface:
+
+| Surface | Standard control height at scale 1 |
+|---|---|
+| Channel strip (`M`/`S`/`CUE`, tabs, collapse, submix box) | 18 px |
+| Settings slideout (buttons and dropdowns) | 24 px |
+
+- The strip's submix box spans the strip width at the strip height, with the
+  bus name vertically centred at the left and the arrow at the right.
+- The dB readout under the main fader is centred on the fader track and has
+  no unit suffix; the numeric scale stays in the lane beside the track. The
+  collapse button sits at the right edge of the readout row.
+
 ## 3. Settings panel
 
 The panel follows the channel type.
 
 The layout is one vertical stack per channel type. Inputs share a nine-row
 grid; a control a channel lacks leaves its row empty, so the rows below never
-move and `width`, `send FX`, `MS proc` and the phase pair sit at the same
-height on every input.
+move and `send FX` and the phase pair sit at the same height on every input.
+Empty rows keep the height of the control the grid reserves for them.
 
 | Channel | Contents, top to bottom |
 |---|---|
-| Input 1/2 | Stereo, space, 48V, AutoSet, Gain, Width, Send FX, MS Proc, Ø L / R Ø |
-| Input 3/4 | Stereo, `ref. dBu`, Inst + reference dropdown, AutoSet, Gain, Width, Send FX, MS Proc, Ø L / R Ø |
-| Inputs 5–8 | Stereo, `ref. level`, reference dropdown, two empty rows, Width, Send FX, MS Proc, Ø L / R Ø |
-| Inputs 9+ | Stereo, four empty rows, Width, Send FX, MS Proc, Ø L / R Ø |
-| Software playback | Stereo, Width, Send FX, MS Proc, Ø L / R Ø |
-| Hardware output | Stereo, `ref. level`, reference dropdown, Return FX, Ø L / R Ø, No Trim, space, Talkback, Loopback |
+| Input 1/2 | Stereo, space, 48V, AutoSet, Gain, Width, Send FX, MS slot, Ø L / R Ø |
+| Input 3/4 | Stereo, `ref.`, Inst + reference dropdown, AutoSet, Gain, Width, Send FX, MS slot, Ø L / R Ø |
+| Inputs 5–8 | Stereo, `ref.`, reference dropdown, two empty rows, Width, Send FX, MS slot, Ø L / R Ø |
+| Inputs 9+ | Stereo, four empty rows, Width, Send FX, MS slot, Ø L / R Ø |
+| Software playback | Stereo, Width, Send FX, MS slot, phase slot |
+| Hardware output | Stereo, `ref.`, reference dropdown, Return FX, Ø L / R Ø, No Trim, space, Talkback, Loopback |
 
 - 48 V is available on inputs 1/2; AutoSet on inputs 1–4; Inst and a gain
   knob on 3/4; a reference dropdown on 3–8; none from channel 9 on.
 - The reference levels for 5–8 move together: any change to one applies to
   all four. Inputs 3 and 4 keep separate levels unless linked.
+- Width is a pair control, -1.00 … +1.00, +1.00 full stereo. It rewrites
+  the pair's 2x2 send matrix in every routing that carries a live send;
+  silent routings are untouched. Inputs and software playback share it.
+- One control spans the panel content width; two controls share it with one
+  gap, so a single button and a phase pair end at the same right edge.
+- Knobs keep one fixed column at the right: gain, width, send FX and return
+  FX share a vertical centre line. `send`/`FX` and `return`/`FX` break over
+  two lines to keep the label column narrow.
+- Button labels and dropdown values are centred. Every button and dropdown
+  shares one control height (24 px at scale 1).
+- A standalone label such as `ref.` is centred and sits at the bottom of its
+  row, directly above the control it names. It is used only where the panel
+  has a reference dropdown.
+- A reference dropdown reserves the handle's width, so its label clips at
+  the sides and the arrow stays visible.
 - Input reference values are `-10 dBV`, `+4 dBu`, `Lo Gain`; output
   reference values are `-10 dBV`, `+4 dBu`, `Hi Gain`. Reference levels
   follow register groups: the three line-output pairs share one setting and
@@ -198,14 +228,17 @@ buttons use green text and a green outline.
 ### 3.2 Gain
 
 Gain is a knob in the Settings panel for the four front inputs. Inputs 1/2
-use the microphone range; inputs 3/4 use the instrument/line range. The knob
-writes the per-channel preamp gain and follows the stereo link.
+use the microphone range; inputs 3/4 use the instrument/line range, in 0.5 dB
+steps on the UCX. The knob writes the per-channel preamp gain and follows the
+stereo link. On the UCX it also follows physical encoder moves, which the unit
+reports in the IF1 state stream.
 
 ### 3.3 Device sheet
 
 The device card at the top of the sidebar (or the gear on the folded rail)
 opens the device sheet. It starts with the group the unit itself owns, read at
-connect and written only when changed there.
+connect where the unit has readback and otherwise kept in the saved scene.
+A value is written only when it changes there.
 
 | Row | UC | UCX |
 |---|---|---|
@@ -214,11 +247,27 @@ connect and written only when changed there.
 | Line In reference | yes | — |
 | Line Out reference | yes | — |
 | Phones reference | yes | — |
-| Optical out: ADAT/SPDIF | yes | global grid |
-| SPDIF professional | yes | — |
-| Word clock out: single speed | yes | — |
+| Optical | yes | yes |
+| SPDIF | yes | yes |
+| Single speed word clock | yes | yes |
+| Word clock in | — | yes |
+| EQ for Record | — | yes |
 | Firmware | yes | yes |
 | Serial | yes | yes |
+
+On/off options are checkboxes after their caption. `Optical` and `SPDIF` are
+dropdowns (`ADAT`/`SPDIF`, `Consumer`/`Professional`). Every caption and
+control shares one left edge, and every dropdown has the same width.
+
+The options rows belong to the unit's own group. The UC offers five clock
+sources, including LTC; the UCX offers four: Internal, SPDIF coax., Optical
+and Word. Host-side modes (`MS Proc`, `AN 1>2`, `Input Link`) appear in the
+GLOBAL grid, apart from the device-owned rows.
+
+On the UCX the options word, the reference levels and the 48 V/Inst/Level
+switches are held by the unit: they are not read back and not written at
+connect. The sheet shows the last value written from TuxMix. Input gain is
+read back from the unit and the Gain knob follows it.
 
 The UC reference rows are the unit's global options word. The UCX handles
 input and output sensitivity per channel instead, in per-channel registers
@@ -512,8 +561,23 @@ For 44.1 kHz:
 | 96 | 4.4 ms | 2.2 ms | 1.1 ms | 7.6 ms |
 | 128 | 5.8 ms | 2.2 ms | 1.1 ms | 9.1 ms |
 
-The Settings **Latency** line shows the card ring buffer, USB queue, endpoint
-and total. The **Buffer size** picker shows the graph quantum.
+On the UCX each URB carries up to eight 1 ms ISO packets of
+`ceil(rate / 8000)` frames. The queue is `nurbs + 1` URBs and the unit adds a
+60-frame output lead. With the default `urb_frames = 48` and `nurbs = 2`:
+
+| Rate | Frames/URB | USB queue | Device lead | Device side |
+|---|---|---|---|---|
+| 48 kHz | 48 | 144 (3.0 ms) | 60 (1.25 ms) | 204 frames (4.25 ms) |
+| 96 kHz | 96 | 288 (3.0 ms) | 60 (0.63 ms) | 348 frames (3.63 ms) |
+| 192 kHz | 192 | 576 (3.0 ms) | 60 (0.31 ms) | 636 frames (3.31 ms) |
+
+The idle ring estimate is
+`max(2 × quantum, ceil((nurbs + 2) × frames_per_urb / quantum) × quantum)`.
+
+The Settings **Latency** line shows the card ring buffer and, on the Fireface
+models, the USB queue and device lead (the UC reports the queued URBs as an
+endpoint; the UCX adds the 60-frame lead). The **Buffer size** picker shows
+the graph quantum.
 
 The RME Pro Audio nodes use polled scheduling, a graph-owned quantum and at
 least two ALSA periods. TuxMix's graph-quantum override reaches the card at
@@ -535,13 +599,59 @@ A scene stores:
 The UC device group is read at connect: input gain, 48 V, PAD, Inst, reference
 levels, clock source and optical format.
 
-The UCX host scene is authoritative. Reverb, Echo, dynamics and AutoLevel are
-host-owned and re-applied from the scene.
+The UCX mixer scene is host-owned and applied at connect. Reverb, Echo,
+dynamics and AutoLevel are host-owned. The options word, reference levels and
+the 48 V/Inst/Level switches are unit-owned: the saved scene keeps the last
+value written from TuxMix, and they are neither read nor written at connect.
+Input gain and output volume are read from the IF1 state stream.
 
 TuxMix restores its remembered engine rate on startup and reconnect. The UC
 sample rate follows the host stream; `Auto` follows the device or graph rate.
 
 The matrix is written before PCM opens. Loopback is written live.
+
+### 13.1 Startup mismatch
+
+At connect the backend drains the readable state, compares it with the saved
+scene, and shows a modal when they differ. `Always use TuxMix settings` is a
+preference that suppresses the comparison.
+
+| Model | Compared | Not compared |
+|---|---|---|
+| UC | clock source, optical format, SPDIF professional, AN1/2 48 V, AN3/4 PAD, AN3/4 Inst, the input gains the front panel reported, the output volumes the front panel reported | matrix, masters, loopback, mute |
+| UCX | the input gains and output volumes the IF1 state stream reported | options word, reference levels, 48 V/Inst/Level, PAD, matrix, faders, pans, EQ, dynamics, FX, loopback |
+
+The UCX comparison therefore covers only the channels the state stream has
+reported; a channel that has not moved can be absent.
+
+The scene is applied before the modal is shown. The choices then correct the
+readable values:
+
+| Choice | UC | UCX |
+|---|---|---|
+| Use TuxMix settings | write the scene's clock, optical, SPDIF, 48 V, PAD, Inst and input gains; output volumes were already applied with the scene | write the scene's input gains; output volumes and mixer were already applied with the scene |
+| Use device settings | write the device's readable clock, optical, SPDIF, 48 V, PAD, Inst, gain and output-volume values back; matrix, faders and loopback stay at the TuxMix scene | write the device's reported gains and output volumes back; options, references, 48 V/Inst/Level and the mixer stay at the TuxMix scene |
+| Always use TuxMix settings | as Use TuxMix settings, and stop asking | as Use TuxMix settings, and stop asking |
+
+The dialog never writes a value that was not compared. In particular, the UCX
+options word, reference levels and 48 V/Inst/Level are not restored by
+`Use device settings`; they remain at the TuxMix scene for display and are
+unchanged on the unit.
+
+The connect write is host → device for the mixer group on both models:
+matrix, faders, pans, sends, EQ, dynamics, FX, loopback and output volume.
+`Use TuxMix settings` adds the scene's input gain host → device.
+`Use device settings` is the only device → host direction: it copies the
+compared values from the device into the scene.
+
+Not read back, so never device → host and never part of the mismatch: the UC
+matrix, masters, loopback and mute; the UCX matrix, faders, pans, EQ,
+dynamics, FX and loopback. They are still written host → device from the
+scene at connect.
+
+The UCX options word, reference levels and 48 V/Inst/Level switches are
+unit-owned: not written at connect, not read back. Only the last value written
+from TuxMix is kept in the scene for display.
 
 ## 14. Control invariants
 
@@ -561,5 +671,6 @@ The matrix is written before PCM opens. Loopback is written live.
   each send is written, so it adds no device register.  `T` is the first
   icon in the strip's column on hardware inputs and software playbacks; it
   lights while trim is below 0 dB, and its tooltip states the applied value.
-- Width, playback stereo/mono, Mono, No Trim and Talkback receive are
+- Width is host-side and has no width register: it rewrites the pair's
+  matrix cells. Playback stereo/mono, Mono, No Trim and Talkback receive are
   host-side and do not produce device writes.

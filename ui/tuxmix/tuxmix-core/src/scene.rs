@@ -205,6 +205,19 @@ impl Scene {
     /// (preamp gain, switches, references, clock/rate/format) are never
     /// copied, matching the Windows TotalMix state file.
     pub fn merge_host_changes(&mut self, before: &Scene, after: &Scene) {
+        self.merge_host_changes_with_device(before, after, false);
+    }
+
+    /// Like [`Self::merge_host_changes`], with the device-owned group
+    /// included.  Used for the UCX for the values the unit does not report
+    /// back (options word, references and the 48 V/Inst/Level switches):
+    /// a host-originated change is the only record and must reach the scene.
+    pub fn merge_host_changes_with_device(
+        &mut self,
+        before: &Scene,
+        after: &Scene,
+        include_device: bool,
+    ) {
         if self.inputs.len() == after.inputs.len() {
             for (host, (b, a)) in self
                 .inputs
@@ -226,6 +239,9 @@ impl Scene {
                 if a.trim != b.trim {
                     host.trim = a.trim;
                 }
+                if a.width != b.width {
+                    host.width = a.width;
+                }
                 if a.phase != b.phase {
                     host.phase = a.phase;
                 }
@@ -237,6 +253,29 @@ impl Scene {
                 }
                 if a.dynamics != b.dynamics {
                     host.dynamics = a.dynamics;
+                }
+                if include_device {
+                    if a.gain != b.gain {
+                        host.gain = a.gain;
+                    }
+                    if a.phantom != b.phantom {
+                        host.phantom = a.phantom;
+                    }
+                    if a.pad != b.pad {
+                        host.pad = a.pad;
+                    }
+                    if a.instrument != b.instrument {
+                        host.instrument = a.instrument;
+                    }
+                    if a.level != b.level {
+                        host.level = a.level;
+                    }
+                    if a.ref_level != b.ref_level {
+                        host.ref_level = a.ref_level;
+                    }
+                    if a.sensitivity != b.sensitivity {
+                        host.sensitivity = a.sensitivity;
+                    }
                 }
                 if a.name != b.name {
                     host.name = a.name.clone();
@@ -289,6 +328,15 @@ impl Scene {
                 }
                 if a.loopback != b.loopback {
                     host.loopback = a.loopback;
+                }
+                if a.phase_l != b.phase_l {
+                    host.phase_l = a.phase_l;
+                }
+                if a.phase_r != b.phase_r {
+                    host.phase_r = a.phase_r;
+                }
+                if a.no_trim != b.no_trim {
+                    host.no_trim = a.no_trim;
                 }
                 if a.name != b.name {
                     host.name = a.name.clone();
@@ -354,6 +402,35 @@ impl Scene {
         if a.input_pair_link != b.input_pair_link {
             h.input_pair_link = a.input_pair_link.clone();
         }
+        if include_device {
+            if a.clock_source != b.clock_source {
+                h.clock_source = a.clock_source.clone();
+            }
+            if a.optical_out_spdif != b.optical_out_spdif {
+                h.optical_out_spdif = a.optical_out_spdif;
+            }
+            if a.spdif_professional != b.spdif_professional {
+                h.spdif_professional = a.spdif_professional;
+            }
+            if a.word_clock_single_speed != b.word_clock_single_speed {
+                h.word_clock_single_speed = a.word_clock_single_speed;
+            }
+            if a.word_clock_termination != b.word_clock_termination {
+                h.word_clock_termination = a.word_clock_termination;
+            }
+            if a.line_in_ref != b.line_in_ref {
+                h.line_in_ref = a.line_in_ref;
+            }
+            if a.line_in_ref_58 != b.line_in_ref_58 {
+                h.line_in_ref_58 = a.line_in_ref_58;
+            }
+            if a.line_out_ref != b.line_out_ref {
+                h.line_out_ref = a.line_out_ref;
+            }
+            if a.phones_ref != b.phones_ref {
+                h.phones_ref = a.phones_ref;
+            }
+        }
 
         if after.matrix_overrides != before.matrix_overrides {
             self.matrix_overrides = after.matrix_overrides.clone();
@@ -413,6 +490,38 @@ mod tests {
         assert!(host.settings.dim);
         assert_eq!(host.inputs[0].gain, Some(10), "input gain is device-owned");
         assert_eq!(host.settings.line_in_ref, 0, "reference is device-owned");
+    }
+
+    #[test]
+    fn merge_host_changes_with_device_records_the_ucx_group() {
+        // No UCX readback is mapped for these registers, so a host-originated
+        // change is the only record and must reach the saved scene.
+        let mut host = Scene::new("auto");
+        let mut input = InputChannel::new(0, "AN1", ChannelType::Mic, 1);
+        input.gain = Some(10);
+        host.inputs = vec![input];
+        let before = host.clone();
+        let mut after = host.clone();
+        after.inputs[0].gain = Some(30);
+        after.inputs[0].phantom = true;
+        after.inputs[0].ref_level = 2;
+        after.settings.clock_source = "Word Clock".into();
+        after.settings.optical_out_spdif = true;
+        after.settings.spdif_professional = true;
+        after.settings.word_clock_single_speed = true;
+        after.settings.word_clock_termination = true;
+        after.settings.line_out_ref = 2;
+
+        host.merge_host_changes_with_device(&before, &after, true);
+
+        assert_eq!(host.inputs[0].gain, Some(30));
+        assert!(host.inputs[0].phantom);
+        assert_eq!(host.settings.clock_source, "Word Clock");
+        assert!(host.settings.optical_out_spdif);
+        assert!(host.settings.spdif_professional);
+        assert!(host.settings.word_clock_single_speed);
+        assert!(host.settings.word_clock_termination);
+        assert_eq!(host.settings.line_out_ref, 2);
     }
 
     #[test]
