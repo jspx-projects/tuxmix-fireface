@@ -553,35 +553,58 @@ margin. At 1x rates that is 192 frames: four periods at 48 samples, three at
 
 ```text
 ring = max(2 × quantum, ceil(192 / quantum) × quantum)
-output latency ≈ ring + 2 × 48 + 48 frames
+output latency ≈ ring + USB queue + endpoint/lead + output converter
 ```
+
+The output converter is half the measured converter round trip:
+
+| Rate | Converter round trip | Output converter |
+|---|---|---|
+| 44.1, 48, 96 kHz | 25 frames | 13 frames |
+| 192 kHz | 23 frames | 12 frames |
+
+The same values are used for the UC and the UCX.
 
 For 44.1 kHz:
 
-| Quantum | ALSA buffer | USB queue | Endpoint | Total |
-|---|---|---|---|---|
-| 48 | 4.4 ms | 2.2 ms | 1.1 ms | 7.6 ms |
-| 64 | 4.4 ms | 2.2 ms | 1.1 ms | 7.6 ms |
-| 96 | 4.4 ms | 2.2 ms | 1.1 ms | 7.6 ms |
-| 128 | 5.8 ms | 2.2 ms | 1.1 ms | 9.1 ms |
+| Quantum | ALSA buffer | USB queue | Endpoint | Converter | Total |
+|---|---|---|---|---|---|
+| 48 | 4.4 ms | 2.2 ms | 1.1 ms | 0.3 ms | 8.0 ms |
+| 64 | 4.4 ms | 2.2 ms | 1.1 ms | 0.3 ms | 8.0 ms |
+| 96 | 4.4 ms | 2.2 ms | 1.1 ms | 0.3 ms | 8.0 ms |
+| 128 | 5.8 ms | 2.2 ms | 1.1 ms | 0.3 ms | 9.4 ms |
 
 On the UCX each URB carries up to eight 1 ms ISO packets of
 `ceil(rate / 8000)` frames. The queue is `nurbs + 1` URBs and the unit adds a
 60-frame output lead. With the default `urb_frames = 48` and `nurbs = 2`:
 
-| Rate | Frames/URB | USB queue | Device lead | Device side |
-|---|---|---|---|---|
-| 48 kHz | 48 | 144 (3.0 ms) | 60 (1.25 ms) | 204 frames (4.25 ms) |
-| 96 kHz | 96 | 288 (3.0 ms) | 60 (0.63 ms) | 348 frames (3.63 ms) |
-| 192 kHz | 192 | 576 (3.0 ms) | 60 (0.31 ms) | 636 frames (3.31 ms) |
+| Rate | Frames/URB | USB queue | Device lead | Converter | Total |
+|---|---|---|---|---|---|
+| 48 kHz | 48 | 144 (3.0 ms) | 60 (1.25 ms) | 13 (0.27 ms) | 217 frames (4.52 ms) |
+| 96 kHz | 96 | 288 (3.0 ms) | 60 (0.63 ms) | 13 (0.14 ms) | 361 frames (3.76 ms) |
+| 192 kHz | 192 | 576 (3.0 ms) | 60 (0.31 ms) | 12 (0.06 ms) | 648 frames (3.38 ms) |
 
 The idle ring estimate is
 `max(2 × quantum, ceil((nurbs + 2) × frames_per_urb / quantum) × quantum)`.
 
+The internal loopback confirms the USB queue and device lead. Its absolute
+delay moves by one USB frame with the ALSA start phase and with the playback
+buffer occupancy; the cable-minus-internal difference cancels both. The
+converter round trip is that difference: 25 frames at 44.1, 48 and 96 kHz and
+23 frames at 192 kHz. The internal loopback is before the converters and does
+not include the host ring.
+
+A full output-to-input round trip adds the capture ring, the input USB queue
+and lead, and the other converter half:
+
+```text
+round trip ≈ 2 × (ring + USB queue + lead) + converter round trip
+```
+
 The Settings **Latency** line shows the card ring buffer and, on the Fireface
-models, the USB queue and device lead (the UC reports the queued URBs as an
-endpoint; the UCX adds the 60-frame lead). The **Buffer size** picker shows
-the graph quantum.
+models, the USB queue, device lead and output converter (the UC reports the
+queued URBs as an endpoint; the UCX adds the 60-frame lead). The **Buffer
+size** picker shows the graph quantum.
 
 The RME Pro Audio nodes use polled scheduling, a graph-owned quantum and at
 least two ALSA periods. TuxMix's graph-quantum override reaches the card at
