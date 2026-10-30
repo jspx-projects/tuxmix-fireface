@@ -8974,7 +8974,7 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
                 knob(Knob {
                     value,
                     range: (-1.0, 1.0),
-                    label: format!("{value:+.2}"),
+                    label: format!("{value:.2}"),
                     arc_from_center: true,
                     level_arc_color: Some(theme::PHANTOM),
                     interactive: true,
@@ -9082,7 +9082,7 @@ fn settings_popover(state: &TuxMix, cid: ChannelId, width: f32, scale: f32) -> E
                 knob(Knob {
                     value,
                     range: (-1.0, 1.0),
-                    label: format!("{value:+.2}"),
+                    label: format!("{value:.2}"),
                     arc_from_center: true,
                     level_arc_color: Some(theme::PHANTOM),
                     interactive: true,

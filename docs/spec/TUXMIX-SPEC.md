@@ -193,9 +193,10 @@ Empty rows keep the height of the control the grid reserves for them.
   knob on 3/4; a reference dropdown on 3–8; none from channel 9 on.
 - The reference levels for 5–8 move together: any change to one applies to
   all four. Inputs 3 and 4 keep separate levels unless linked.
-- Width is a pair control, -1.00 … +1.00, +1.00 full stereo. It rewrites
-  the pair's 2x2 send matrix in every routing that carries a live send;
-  silent routings are untouched. Inputs and software playback share it.
+- Width is a pair control, -1.00 … 1.00: 1.00 full stereo, 0.00 mono and
+  -1.00 swapped channels. It rewrites the pair's 2x2 send matrix in every
+  routing that carries a live send; silent routings are untouched. Inputs and
+  software playback share it.
 - MS Proc is a pair button on inputs and software playback. On the UCX it
   writes `NN05` on both input channels and rewrites the same 2x2 send matrix
   with the M/S encoder (`L' = (L + R) / 2`, `R' = (L - R) / 2`); software
