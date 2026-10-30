@@ -114,6 +114,9 @@ Authoritative files:
   the drag continues outside the control and ends on release.
 - Linking an input pair restores the pan captured when it was split; the
   split itself sets the two channels hard left and hard right.
+- Splitting an output pair converts its pair level and balance into two
+  channel volumes; linking recomputes both from those volumes. The round
+  trip must preserve the original values.
 - Slideouts have no close button; the strip tab that opened the panel closes
   it.
 - A knob label may overlap the unused bottom margin of its knob when space

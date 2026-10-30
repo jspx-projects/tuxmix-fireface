@@ -25,7 +25,10 @@ use crate::channel::{
     ChannelId, ChannelType, Dynamics, Echo, EqBandType, InputChannel, InputEq, InputLevel,
     OutputChannel, PlaybackChannel, Reverb, Sensitivity,
 };
-use crate::device::{DeviceSettings, RmeDevice, average_pan};
+use crate::device::{
+    DeviceSettings, RmeDevice, average_pan, output_balance_from_volumes,
+    output_balance_to_volumes,
+};
 use crate::error::Error;
 use crate::scene::{MatrixOverride, Scene};
 
@@ -452,26 +455,6 @@ fn pan_split(volume: f32, pan: i8) -> (f32, f32) {
     let l = v * if p > 0.0 { 1.0 - p } else { 1.0 };
     let r = v * if p < 0.0 { 1.0 + p } else { 1.0 };
     (l, r)
-}
-
-/// The same balance law for hardware outputs, whose faders reach +6 dB.
-fn pan_split_output(volume: f32, pan: i8) -> (f32, f32) {
-    let v = volume.clamp(0.0, 2.0);
-    let p = pan.clamp(-100, 100) as f32 / 100.0;
-    let l = v * if p > 0.0 { 1.0 - p } else { 1.0 };
-    let r = v * if p < 0.0 { 1.0 + p } else { 1.0 };
-    (l, r)
-}
-
-fn output_balance(left: f32, right: f32) -> i8 {
-    let peak = left.max(right);
-    if peak <= 0.0 {
-        0
-    } else {
-        (((right - left) / peak) * 100.0)
-            .round()
-            .clamp(-100.0, 100.0) as i8
-    }
 }
 
 /// A Fireface UC or UCX opened over the kernel hwdep transport.
@@ -2958,7 +2941,7 @@ impl RmeDevice for Fireface {
                     let current = self.outputs[left]
                         .volume
                         .max(self.outputs[right].volume);
-                    let (gl, gr) = pan_split_output(current, pan);
+                    let (gl, gr) = output_balance_to_volumes(current, pan);
                     self.outputs[left].volume = gl;
                     self.outputs[right].volume = gr;
                     if self.outputs[left].mute || self.outputs[right].mute {
@@ -3011,7 +2994,7 @@ impl RmeDevice for Fireface {
                 if self.is_uc() {
                     let left = idx & !1;
                     let right = left + 1;
-                    Ok(output_balance(
+                    Ok(output_balance_from_volumes(
                         self.outputs[left].volume,
                         self.outputs[right].volume,
                     ))
@@ -3109,7 +3092,21 @@ impl RmeDevice for Fireface {
     }
 
     fn set_output_linked(&mut self, pair: usize, linked: bool) -> Result<(), Error> {
+        let was_linked = self.output_linked(pair);
+        if was_linked == linked {
+            return Ok(());
+        }
         let (left, right) = (pair * 2, pair * 2 + 1);
+        let left_volume = self.outputs[left].volume;
+        let right_volume = self.outputs[right].volume;
+        let pair_volume = left_volume.max(right_volume);
+        let balance = if was_linked && !self.is_uc() {
+            // A linked UCX pair keeps its balance in the register; its two
+            // volumes are already flattened to the pair level.
+            self.outputs[left].balance
+        } else {
+            output_balance_from_volumes(left_volume, right_volume)
+        };
         if !self.is_uc() {
             self.ucx_write_output_stereo(left, linked)?;
             self.ucx_write_output_stereo(right, linked)?;
@@ -3126,6 +3123,24 @@ impl RmeDevice for Fireface {
             if let Some(mute) = saved_mute {
                 self.set_mute(ChannelId::Output(right), mute)?;
             }
+            if self.is_uc() {
+                // No balance register: splitting comes back from the two
+                // volumes; rewriting the balance here restores L/R.
+                self.set_pan(ChannelId::Output(left), 0, balance)?;
+            } else {
+                // UCX: the linked fader is the pair level and the balance
+                // is its own register. Flatten the volumes, then write the
+                // balance derived from the split channels.
+                self.set_volume(ChannelId::Output(left), 0, pair_volume)?;
+                self.set_volume(ChannelId::Output(right), 0, pair_volume)?;
+                self.set_pan(ChannelId::Output(left), 0, balance)?;
+            }
+        } else if !self.is_uc() {
+            // UCX split: turn the linked level/balance into the two channel
+            // volumes, then clear the now-unused balance register.
+            let (l, r) = output_balance_to_volumes(pair_volume, balance);
+            self.set_volume(ChannelId::Output(left), 0, l)?;
+            self.set_volume(ChannelId::Output(right), 0, r)?;
             self.set_pan(ChannelId::Output(left), 0, 0)?;
         }
         Ok(())
@@ -5137,6 +5152,47 @@ mod tests {
         dev.set_input_pair_linked(0, true).unwrap();
         assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), -30);
         assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), -30);
+    }
+
+    #[test]
+    fn ucx_output_link_round_trip_preserves_balance_and_split_volumes() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        let left = ChannelId::Output(2);
+        let right = ChannelId::Output(3);
+
+        dev.set_output_volume(1, 0, 0.8).unwrap();
+        dev.set_pan(left, 0, -40).unwrap();
+        dev.set_output_linked(1, false).unwrap();
+        assert!((dev.volume(left, 0).unwrap() - 0.8).abs() < 1e-6);
+        assert!((dev.volume(right, 0).unwrap() - 0.48).abs() < 1e-6);
+        assert_eq!(dev.outputs()[2].balance, 0);
+
+        dev.set_output_volume(1, 0, 0.3).unwrap();
+        dev.set_output_volume(1, 1, 0.6).unwrap();
+        dev.set_output_linked(1, true).unwrap();
+        assert!((dev.volume(left, 0).unwrap() - 0.6).abs() < 1e-6);
+        assert!((dev.volume(right, 0).unwrap() - 0.6).abs() < 1e-6);
+        assert_eq!(dev.pan(left, 0).unwrap(), 50);
+
+        dev.set_output_linked(1, false).unwrap();
+        assert!((dev.volume(left, 0).unwrap() - 0.3).abs() < 1e-6);
+        assert!((dev.volume(right, 0).unwrap() - 0.6).abs() < 1e-6);
+        assert_eq!(dev.outputs()[2].balance, 0);
+    }
+
+    #[test]
+    fn uc_output_link_round_trip_keeps_the_derived_balance() {
+        let (mut dev, _writes) = open(Model::Uc);
+        dev.set_output_linked(0, false).unwrap();
+        dev.set_output_volume(0, 0, 0.2).unwrap();
+        dev.set_output_volume(0, 1, 0.8).unwrap();
+        dev.set_output_linked(0, true).unwrap();
+        assert_eq!(dev.pan(ChannelId::Output(0), 0).unwrap(), 75);
+        assert!((dev.volume(ChannelId::Output(0), 0).unwrap() - 0.2).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Output(1), 0).unwrap() - 0.8).abs() < 1e-6);
+        dev.set_output_linked(0, false).unwrap();
+        assert!((dev.volume(ChannelId::Output(0), 0).unwrap() - 0.2).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Output(1), 0).unwrap() - 0.8).abs() < 1e-6);
     }
 
     #[test]

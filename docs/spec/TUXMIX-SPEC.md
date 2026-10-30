@@ -469,10 +469,12 @@ Each hardware output has an **FX Return** knob in its Settings panel,
 
 ## 7. Output balance
 
-Hardware output strips include a balance knob, −100..+100. The knob writes the
-output balance register and is independent of the pair volume. The fader is the
-pair level and does not change balance. A split pair keeps two independent
-volumes.
+Hardware output strips include a balance knob, −100..+100. The linked fader
+is the louder channel (the pair level). On the UCX the knob writes the output
+balance register, independent of the pair volume. Splitting converts the pair
+level and balance into the two channel volumes; linking recomputes both from
+those volumes. A split/re-link round trip therefore preserves the pair level
+and balance. A split pair keeps two independent volumes.
 
 ## 8. Pan and balance
 
@@ -506,7 +508,8 @@ current pans are averaged.
 Phase L and Phase R keep independent states across the transition.
 
 Software-playback pairs use the same reference-and-centre rule. Output pairs
-link at centre balance.
+link at the balance derived from their two channel volumes; splitting writes
+the two volumes that encode the pair level and balance.
 
 ## 11. Control Room
 

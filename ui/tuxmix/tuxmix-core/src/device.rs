@@ -12,6 +12,30 @@ pub(crate) fn average_pan(left: i8, right: i8) -> i8 {
     ((left as i16 + right as i16) as f32 / 2.0).round() as i8
 }
 
+/// Balance of a linked output pair, from its two channel volumes. The
+/// louder side is the pair level, so this matches the linked fader.
+pub(crate) fn output_balance_from_volumes(left: f32, right: f32) -> i8 {
+    let peak = left.max(right);
+    if peak <= 0.0 {
+        0
+    } else {
+        (((right - left) / peak) * 100.0)
+            .round()
+            .clamp(-100.0, 100.0) as i8
+    }
+}
+
+/// Split a linked pair level into its two channel volumes. This is the
+/// inverse of [`output_balance_from_volumes`] and keeps a split/re-link
+/// round trip stable.
+pub(crate) fn output_balance_to_volumes(volume: f32, balance: i8) -> (f32, f32) {
+    let volume = volume.clamp(0.0, 2.0);
+    let balance = balance.clamp(-100, 100) as f32 / 100.0;
+    let left = volume * if balance > 0.0 { 1.0 - balance } else { 1.0 };
+    let right = volume * if balance < 0.0 { 1.0 + balance } else { 1.0 };
+    (left, right)
+}
+
 /// Global device-level settings.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceSettings {
@@ -708,10 +732,14 @@ pub trait RmeDevice {
         self.settings().output_link.get(pair).copied().unwrap_or(true)
     }
 
-    /// Sets whether output pair `pair` is linked.  Linking centers the
-    /// pair's balance and uses the left channel's mute state; splitting
-    /// leaves the two output levels as independent mono channels.
+    /// Sets whether output pair `pair` is linked. Linking uses the left
+    /// channel's mute state; on a backend without a balance register the two
+    /// output volumes already encode the balance, so they stay independent.
+    /// Splitting leaves them independent as well.
     fn set_output_linked(&mut self, pair: usize, linked: bool) -> Result<(), Error> {
+        if self.output_linked(pair) == linked {
+            return Ok(());
+        }
         let (left, right) = (pair * 2, pair * 2 + 1);
         let saved_mute = self.outputs().get(left).map(|o| o.mute);
         {
@@ -725,7 +753,6 @@ pub trait RmeDevice {
             if let Some(mute) = saved_mute {
                 self.set_mute(ChannelId::Output(right), mute)?;
             }
-            self.set_pan(ChannelId::Output(left), 0, 0)?;
         }
         Ok(())
     }
