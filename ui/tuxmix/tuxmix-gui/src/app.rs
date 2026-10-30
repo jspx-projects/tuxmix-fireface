@@ -8346,8 +8346,7 @@ fn strip_params<'a>(
                 type_tag: None,
                 vol: hw.unwrap_or(pair_level),
                 pan,
-                output_balance_supported: state.device.output_balance_supported()
-                    && (linked || balance_register),
+                output_balance_supported: state.device.output_balance_supported() && linked,
                 meter: state
                     .output_meters
                     .get(i)

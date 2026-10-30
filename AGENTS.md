@@ -116,7 +116,7 @@ Authoritative files:
   split itself sets the two channels hard left and hard right.
 - Splitting an output pair converts its pair level and balance into two
   channel volumes; linking recomputes both from those volumes. The round
-  trip must preserve the original values.
+  trip must preserve the original values. The balance knob is linked-only.
 - Slideouts have no close button; the strip tab that opened the panel closes
   it.
 - A knob label may overlap the unused bottom margin of its knob when space

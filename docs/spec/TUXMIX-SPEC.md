@@ -474,7 +474,8 @@ is the louder channel (the pair level). On the UCX the knob writes the output
 balance register, independent of the pair volume. Splitting converts the pair
 level and balance into the two channel volumes; linking recomputes both from
 those volumes. A split/re-link round trip therefore preserves the pair level
-and balance. A split pair keeps two independent volumes.
+and balance. A split pair keeps two independent volumes and hides the balance
+knob.
 
 ## 8. Pan and balance
 
