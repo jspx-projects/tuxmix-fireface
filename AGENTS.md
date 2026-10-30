@@ -94,8 +94,10 @@ Authoritative files:
   left edge may overlap the channel row but never moves it.
 - The FX column is a slideout: it pushes the rows until the widest row reaches
   its natural width, then overlays the rightmost part of the rows. The overlap
-  grows continuously and must not jump between push and overlay; widening the
-  window or closing FX clears it.
+  grows continuously; the Control Room and any open channel slideout keep
+  their position and are covered from the right. Never switch the main width
+  between push and overlay in one step. Widening the window or closing FX
+  clears it.
 - Slideout panels never show a scrollbar at normal size. Keep the scrollable
   wrapper in the code as a safety net while tuning, so missing content is
   reachable instead of silently clipped.
