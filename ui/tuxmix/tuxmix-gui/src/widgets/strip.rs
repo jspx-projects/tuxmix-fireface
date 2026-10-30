@@ -853,12 +853,12 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
     };
     let pan_hint = if is_output {
         if p.output_balance_supported {
-            "Output balance — drag, scroll, or double-click to reset"
+            "Output balance — drag, scroll, Shift: fine, double-click to reset"
         } else {
             "Output balance — not implemented for this output/backend"
         }
     } else {
-        "Pan — drag, scroll, or double-click to reset"
+        "Pan — drag, scroll, Shift: fine, double-click to reset"
     };
     rows = rows.push(
         container(hint(knob(pan_knob), pan_hint, scale))

@@ -158,6 +158,19 @@ There are two sizing families, one per surface:
   no unit suffix; the numeric scale stays in the lane beside the track. The
   collapse button sits at the right edge of the readout row.
 
+### 2.6 Pointer gestures
+
+Dragging a fader or knob changes it; the scroll wheel nudges it. Holding Shift
+reduces the movement for fine adjustment; this applies to faders, knobs,
+matrix cells and EQ handles.
+
+A double click on a fader, knob, FX fader or EQ handle resets that control to
+its default. A double click on the dB readout opens a numeric entry field. A
+double click on a channel name starts a rename, on the strip background
+collapses the strip, and on a Matrix cell toggles the cell between off and
+unity. Ordinary push buttons act once per click and have no separate double
+click.
+
 ## 3. Settings panel
 
 The panel follows the channel type.
