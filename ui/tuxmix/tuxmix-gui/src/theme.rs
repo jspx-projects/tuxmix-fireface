@@ -481,18 +481,9 @@ pub fn panel_tab(active: bool, lit: bool) -> impl Fn(&iced::Theme, button::Statu
             } else {
                 TEXT_SEC
             },
-            // A lit tab uses the same accent outline as the Stereo button.
-            // The open tab's dark surface stays borderless so it merges
-            // with the attached panel.
-            border: if lit {
-                Border {
-                    color: ACCENT,
-                    width: 1.0,
-                    radius: RADIUS_SM.into(),
-                }
-            } else {
-                Border::default()
-            },
+            // No border: the active tab's surface must merge with the
+            // borderless attached panel it opens.
+            border: Border::default(),
             shadow: Shadow::default(),
             snap: false,
         }

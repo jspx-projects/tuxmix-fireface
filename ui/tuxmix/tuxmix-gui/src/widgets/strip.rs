@@ -421,16 +421,44 @@ fn tab_button<'a>(
     tip: impl Into<std::borrow::Cow<'a, str>>,
     scale: f32,
 ) -> Element<'a, Message> {
-    tab_button_sized(
-        label,
-        active,
-        lit,
-        message,
+    if active {
+        // Open: the underlay joins the tab to its panel.  No accent here:
+        // the panel itself shows the on/off state.
+        return tab_button_sized(
+            label,
+            true,
+            false,
+            message,
+            tip,
+            scale,
+            TAB_BTN_W,
+            TAB_BTN_H,
+            theme::TEXT_MD + 2.0,
+        );
+    }
+    // Closed: an active setting gets the Stereo button's accent outline,
+    // sized to the text and centred in the tab's fixed column slot.  An
+    // inactive setting stays a bare glyph.
+    let glyph = || centered_label(label, (theme::TEXT_MD + 2.0) * scale);
+    let face = if lit {
+        button(glyph())
+            .padding([1.0 * scale, 3.0 * scale])
+            .style(theme::stereo_button(true))
+            .on_press(message)
+    } else {
+        button(glyph())
+            .padding([1.0 * scale, 3.0 * scale])
+            .style(theme::panel_tab(false, false))
+            .on_press(message)
+    };
+    hint(
+        container(face)
+            .width(Length::Fixed(TAB_BTN_W * scale))
+            .height(Length::Fixed(TAB_BTN_H * scale))
+            .align_x(iced::Alignment::Center)
+            .align_y(iced::Alignment::Center),
         tip,
         scale,
-        TAB_BTN_W,
-        TAB_BTN_H,
-        theme::TEXT_MD + 2.0,
     )
 }
 

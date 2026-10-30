@@ -103,9 +103,10 @@ Authoritative files:
   reachable instead of silently clipped.
 - Slideout speed is constant in pixels per millisecond; a wider panel takes
   longer instead of moving faster.
-- T, EQ and D use the Stereo button's accent outline when their setting is
-  active, not when their slideout is merely open. The gear only marks the
-  open panel.
+- T, EQ and D use the Stereo button's accent outline and colour, sized to
+  the label, while their setting is active and the slideout is closed. While
+  the slideout is open they carry no accent; the panel's own on/off control
+  is the single indication. The gear only marks the open panel.
 - A fader, knob, matrix cell or EQ handle captures the pointer for the drag;
   the drag continues outside the control and ends on release.
 - Linking an input pair averages the two channels' pans; splitting sets them
