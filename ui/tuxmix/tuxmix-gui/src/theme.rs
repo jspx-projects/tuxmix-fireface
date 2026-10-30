@@ -463,8 +463,8 @@ pub fn stereo_button(active: bool) -> impl Fn(&iced::Theme, button::Status) -> b
 /// An icon-only tab (Settings / Trim / EQ).  When its slideout is open the
 /// glyph sits on the same dark surface as the panel, so the tab reads as
 /// attached to the panel on its right.  `lit` keeps a non-open state (EQ
-/// enabled, Trim non-zero) visible as an accent glyph without the box.
-/// Hover brightens the glyph; it never borrows the accent colour.
+/// enabled, Trim non-zero) visible as an orange glyph without the box.
+/// Hover brightens the glyph; it never borrows the orange.
 pub fn panel_tab(active: bool, lit: bool) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
     move |_theme, status| {
         let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
@@ -477,9 +477,9 @@ pub fn panel_tab(active: bool, lit: bool) -> impl Fn(&iced::Theme, button::Statu
         };
         button::Style {
             background,
-            // The accent means "active setting", not "hovered" or "open".
+            // Orange means "active setting", not "hovered" or "open".
             text_color: if lit {
-                ACCENT
+                PHANTOM
             } else if hovered || active {
                 TEXT_PRIMARY
             } else {
