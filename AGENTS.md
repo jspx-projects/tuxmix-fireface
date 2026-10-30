@@ -112,8 +112,8 @@ Authoritative files:
   the slideout is open or closed; only the panel grows beside it.
 - A fader, knob, matrix cell or EQ handle captures the pointer for the drag;
   the drag continues outside the control and ends on release.
-- Linking an input pair averages the two channels' pans; splitting sets them
-  hard left and hard right.
+- Linking an input pair restores the pan captured when it was split; the
+  split itself sets the two channels hard left and hard right.
 - Slideouts have no close button; the strip tab that opened the panel closes
   it.
 - A knob label may overlap the unused bottom margin of its knob when space

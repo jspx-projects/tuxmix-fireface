@@ -13033,18 +13033,20 @@ mod tests {
     }
 
     #[test]
-    fn relinking_an_input_pair_averages_the_two_pans() {
+    fn relinking_an_input_pair_restores_the_pre_split_pan() {
         let mut state = new(true, None, None);
         let cid = ChannelId::Input(0);
         let out = state.sel_out;
 
+        let _ = update(&mut state, Message::PanChanged(ChannelId::Input(0), out, -30));
+        let _ = update(&mut state, Message::PanChanged(ChannelId::Input(1), out, -30));
         let _ = update(&mut state, Message::StereoLinkChanged(cid, false));
         let _ = update(&mut state, Message::PanChanged(ChannelId::Input(0), out, -35));
         let _ = update(&mut state, Message::PanChanged(ChannelId::Input(1), out, 40));
         let _ = update(&mut state, Message::StereoLinkChanged(cid, true));
 
-        assert_eq!(state.device.pan(ChannelId::Input(0), out).unwrap(), 3);
-        assert_eq!(state.device.pan(ChannelId::Input(1), out).unwrap(), 3);
+        assert_eq!(state.device.pan(ChannelId::Input(0), out).unwrap(), -30);
+        assert_eq!(state.device.pan(ChannelId::Input(1), out).unwrap(), -30);
     }
 
     #[test]

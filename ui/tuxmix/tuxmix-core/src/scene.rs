@@ -181,6 +181,7 @@ impl Scene {
                 input_link: true,
                 output_link: Vec::new(),
                 input_pair_link: Vec::new(),
+                input_pair_pan: Vec::new(),
             },
         }
     }

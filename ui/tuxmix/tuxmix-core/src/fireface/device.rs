@@ -3038,12 +3038,25 @@ impl RmeDevice for Fireface {
             .as_ref()
             .map(|channel| channel.pans.clone())
             .unwrap_or_default();
+        let restored_pans = self
+            .settings
+            .input_pair_pan
+            .get(pair)
+            .cloned()
+            .unwrap_or_default();
         {
             let v = &mut self.settings.input_pair_link;
             if v.len() <= pair {
                 v.resize(pair + 1, true);
             }
             v[pair] = linked;
+        }
+        if !linked {
+            let pans = &mut self.settings.input_pair_pan;
+            if pans.len() <= pair {
+                pans.resize(pair + 1, Vec::new());
+            }
+            pans[pair] = left_pans.clone();
         }
         if let Some(saved) = saved {
             if linked {
@@ -3081,7 +3094,10 @@ impl RmeDevice for Fireface {
             if linked {
                 let left_pan = left_pans.get(output).copied().unwrap_or(0);
                 let right_pan = right_pans.get(output).copied().unwrap_or(left_pan);
-                let pan = average_pan(left_pan, right_pan);
+                let pan = restored_pans
+                    .get(output)
+                    .copied()
+                    .unwrap_or_else(|| average_pan(left_pan, right_pan));
                 self.set_pan(ChannelId::Input(left), output, pan)?;
                 self.set_pan(ChannelId::Input(right), output, pan)?;
             } else {
@@ -5111,14 +5127,16 @@ mod tests {
     }
 
     #[test]
-    fn ucx_relinking_an_input_pair_averages_the_pans() {
+    fn ucx_relinking_an_input_pair_restores_the_pre_split_pan() {
         let (mut dev, _writes) = open(Model::Ucx);
+        dev.set_pan(ChannelId::Input(0), 0, -30).unwrap();
+        dev.set_pan(ChannelId::Input(1), 0, -30).unwrap();
         dev.set_input_pair_linked(0, false).unwrap();
         dev.set_pan(ChannelId::Input(0), 0, -35).unwrap();
         dev.set_pan(ChannelId::Input(1), 0, 40).unwrap();
         dev.set_input_pair_linked(0, true).unwrap();
-        assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), 3);
-        assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), 3);
+        assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), -30);
+        assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), -30);
     }
 
     #[test]

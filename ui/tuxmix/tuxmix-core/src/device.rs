@@ -162,6 +162,11 @@ pub struct DeviceSettings {
     /// strip, not only the mic pair.
     #[serde(default)]
     pub input_pair_link: Vec<bool>,
+    /// Pan per output pair captured when an input pair is split. Linking
+    /// again restores this value, so a split/re-link round trip does not
+    /// lose the pair's original position.
+    #[serde(default)]
+    pub input_pair_pan: Vec<Vec<i8>>,
 }
 
 /// Serde default for [`DeviceSettings::sample_rate`].
@@ -787,9 +792,10 @@ pub trait RmeDevice {
     }
 
     /// Sets whether input pair `pair` is linked. Linking uses the left
-    /// channel as the volume/preamp reference; the linked pan is the
-    /// rounded average of the two channels' pans. Splitting gives the two
-    /// mono channels hard-left and hard-right pans.
+    /// channel as the volume/preamp reference. Splitting captures the
+    /// linked pan and sets the two mono channels hard-left and hard-right;
+    /// linking again restores that captured pan. If no pan was captured,
+    /// the two current pans are averaged.
     fn set_input_pair_linked(&mut self, pair: usize, linked: bool) -> Result<(), Error> {
         let (left, right) = (pair * 2, pair * 2 + 1);
         let saved = self.inputs().get(left).cloned();
@@ -802,12 +808,25 @@ pub trait RmeDevice {
             .as_ref()
             .map(|channel| channel.pans.clone())
             .unwrap_or_default();
+        let restored_pans = self
+            .settings()
+            .input_pair_pan
+            .get(pair)
+            .cloned()
+            .unwrap_or_default();
         {
             let v = &mut self.settings_mut().input_pair_link;
             if v.len() <= pair {
                 v.resize(pair + 1, true);
             }
             v[pair] = linked;
+        }
+        if !linked {
+            let pans = &mut self.settings_mut().input_pair_pan;
+            if pans.len() <= pair {
+                pans.resize(pair + 1, Vec::new());
+            }
+            pans[pair] = left_pans.clone();
         }
 
         if let Some(saved) = saved {
@@ -837,7 +856,10 @@ pub trait RmeDevice {
             if linked {
                 let left_pan = left_pans.get(output).copied().unwrap_or(0);
                 let right_pan = right_pans.get(output).copied().unwrap_or(left_pan);
-                let pan = average_pan(left_pan, right_pan);
+                let pan = restored_pans
+                    .get(output)
+                    .copied()
+                    .unwrap_or_else(|| average_pan(left_pan, right_pan));
                 self.set_pan(ChannelId::Input(left), output, pan)?;
                 self.set_pan(ChannelId::Input(right), output, pan)?;
             } else {

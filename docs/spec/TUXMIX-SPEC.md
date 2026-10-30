@@ -498,10 +498,10 @@ at the same speed. Channels to the right reflow with the tween.
 ## 10. Stereo link
 
 Linking an input pair uses the left channel as the reference for volume,
-mute, solo, phantom, Inst, Level, AutoSet and gain. The linked pan is the
-rounded average of the two channels' pans before linking; an untouched split
-(hard left and hard right) therefore re-links to centre. Splitting sets the
-left and right pans hard left and hard right.
+mute, solo, phantom, Inst, Level, AutoSet and gain. Splitting captures the
+pair's linked pan and sets the left and right pans hard left and hard right;
+linking again restores the captured pan. If no pan was captured, the two
+current pans are averaged.
 
 Phase L and Phase R keep independent states across the transition.
 

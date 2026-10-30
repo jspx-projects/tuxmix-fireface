@@ -239,6 +239,7 @@ impl MockBabyfacePro {
                 input_link: true,
                 output_link: Vec::new(),
                 input_pair_link: Vec::new(),
+                input_pair_pan: Vec::new(),
             },
             input_meters: vec![0.0; profile.input_count()],
             playback_meters: vec![0.0; profile.output_pair_count() * 2],
@@ -1297,8 +1298,11 @@ mod tests {
     }
 
     #[test]
-    fn test_input_link_averages_pan_and_split_uses_hard_sides() {
+    fn test_input_link_restores_the_pre_split_pan_and_split_uses_hard_sides() {
         let mut dev = MockBabyfacePro::open().unwrap();
+        dev.set_pan(ChannelId::Input(0), 0, -30).unwrap();
+        dev.set_pan(ChannelId::Input(1), 0, -30).unwrap();
+
         dev.set_input_pair_linked(0, false).unwrap();
         assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), -100);
         assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), 100);
@@ -1311,8 +1315,8 @@ mod tests {
         dev.set_mute(ChannelId::Input(1), false).unwrap();
 
         dev.set_input_pair_linked(0, true).unwrap();
-        assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), 3);
-        assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), 3);
+        assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), -30);
+        assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), -30);
         assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.3).abs() < 1e-6);
         assert!(dev.mute(ChannelId::Input(1)).unwrap());
     }
