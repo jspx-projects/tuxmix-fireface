@@ -16,7 +16,9 @@
 //! and collected in `docs/PROTOCOL-COMPLETE.md`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::channel::{
@@ -531,6 +533,9 @@ pub struct Fireface {
     /// sending one USB transfer per register.  `vendor_out`/`vendor_in`
     /// flush it first, so control transfers keep their original order.
     write_batch: Arc<Mutex<Option<Vec<(u16, u16)>>>>,
+    /// IF1 writer for a real unit.  Live writes are queued here so the UI
+    /// thread never sleeps through the device's burst pacing.
+    async_writer: Option<Arc<AsyncWriter>>,
 }
 
 /// Flushes the open UCX scene batch when `apply_scene` returns early.
@@ -539,6 +544,9 @@ pub struct Fireface {
 struct WriteBatchGuard {
     transport: Arc<Mutex<Box<dyn ControlTransport>>>,
     batch: Arc<Mutex<Option<Vec<(u16, u16)>>>>,
+    /// Real-unit writer.  `None` in tests and on the UC, where writes are
+    /// synchronous.
+    writer: Option<Arc<AsyncWriter>>,
     /// Only the guard that opened the batch flushes and clears it.  Nested
     /// guards (a live control change inside `apply_scene`, or one setter
     /// calling another) leave the outer batch open.
@@ -558,15 +566,40 @@ impl WriteBatchGuard {
         if words.is_empty() {
             return Ok(());
         }
-        Fireface::send_words_paced(&self.transport, &words)
+        match &self.writer {
+            Some(writer) => writer.send_words(words),
+            None => Fireface::send_words_paced(&self.transport, &words),
+        }
     }
 
+    /// Wait until the writer has sent everything queued so far.
+    fn wait(&self) -> Result<(), Error> {
+        match &self.writer {
+            Some(writer) => writer.flush(),
+            None => Ok(()),
+        }
+    }
+
+    /// Queue the batch.  Live controls return here; the writer paces the
+    /// transfer off the UI thread.
     fn finish(mut self) -> Result<(), Error> {
         self.active = false;
         if !self.owns {
             return Ok(());
         }
         let result = self.flush();
+        *self.batch.lock().unwrap() = None;
+        result
+    }
+
+    /// Queue the batch and wait for the device writes to finish.  Scene
+    /// apply uses this so its completion and errors stay synchronous.
+    fn finish_wait(mut self) -> Result<(), Error> {
+        self.active = false;
+        if !self.owns {
+            return Ok(());
+        }
+        let result = self.flush().and_then(|()| self.wait());
         *self.batch.lock().unwrap() = None;
         result
     }
@@ -610,6 +643,137 @@ fn finish_live_batch<T>(
     }
 }
 
+enum WriterCommand {
+    Words(Vec<(u16, u16)>),
+    Flush(Sender<Result<(), String>>),
+    Shutdown,
+}
+
+/// Pacer for real-unit IF1 writes.  The UI thread queues words and returns;
+/// this thread owns the burst cadence, so a fader or gain drag never sleeps
+/// inside `update`.
+struct AsyncWriter {
+    tx: Sender<WriterCommand>,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl AsyncWriter {
+    fn new(transport: Arc<Mutex<Box<dyn ControlTransport>>>) -> Option<Self> {
+        let (tx, rx) = mpsc::channel();
+        match thread::Builder::new()
+            .name("tuxmix-if1-writer".into())
+            .spawn(move || writer_loop(rx, transport))
+        {
+            Ok(join) => Some(Self {
+                tx,
+                join: Mutex::new(Some(join)),
+            }),
+            Err(e) => {
+                log::warn!("Starting the IF1 writer failed: {e:?}");
+                None
+            }
+        }
+    }
+
+    fn send_words(&self, words: Vec<(u16, u16)>) -> Result<(), Error> {
+        self.tx
+            .send(WriterCommand::Words(words))
+            .map_err(|_| writer_stopped())
+    }
+
+    fn flush(&self) -> Result<(), Error> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(WriterCommand::Flush(tx))
+            .map_err(|_| writer_stopped())?;
+        match rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(Error::Io(std::io::Error::other(e))),
+            Err(_) => Err(writer_stopped()),
+        }
+    }
+}
+
+impl Drop for AsyncWriter {
+    fn drop(&mut self) {
+        let _ = self.tx.send(WriterCommand::Shutdown);
+        if let Some(join) = self.join.lock().unwrap().take() {
+            let _ = join.join();
+        }
+    }
+}
+
+fn writer_stopped() -> Error {
+    Error::Io(std::io::Error::other("IF1 writer stopped"))
+}
+
+fn writer_loop(rx: Receiver<WriterCommand>, transport: Arc<Mutex<Box<dyn ControlTransport>>>) {
+    let mut pending: Vec<(u16, u16)> = Vec::new();
+    loop {
+        match rx.recv() {
+            Ok(WriterCommand::Words(words)) => {
+                pending.extend(words);
+                // Coalesce everything already queued before spending the
+                // burst gap, then send it as one paced batch.
+                loop {
+                    match rx.try_recv() {
+                        Ok(WriterCommand::Words(more)) => {
+                            pending.extend(more);
+                            if pending.len() >= UCX_WRITE_CHUNK {
+                                break;
+                            }
+                        }
+                        Ok(WriterCommand::Flush(reply)) => {
+                            let result = flush_pending(&transport, &mut pending);
+                            let _ = reply.send(result);
+                        }
+                        Ok(WriterCommand::Shutdown) => {
+                            let _ = flush_pending(&transport, &mut pending);
+                            return;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            let _ = flush_pending(&transport, &mut pending);
+                            return;
+                        }
+                    }
+                }
+                let _ = flush_pending(&transport, &mut pending);
+            }
+            Ok(WriterCommand::Flush(reply)) => {
+                let result = flush_pending(&transport, &mut pending);
+                let _ = reply.send(result);
+            }
+            Ok(WriterCommand::Shutdown) => {
+                let _ = flush_pending(&transport, &mut pending);
+                return;
+            }
+            Err(_) => {
+                let _ = flush_pending(&transport, &mut pending);
+                return;
+            }
+        }
+    }
+}
+
+fn flush_pending(
+    transport: &Arc<Mutex<Box<dyn ControlTransport>>>,
+    pending: &mut Vec<(u16, u16)>,
+) -> Result<(), String> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let words = std::mem::take(pending);
+    match Fireface::send_words_paced(transport, &words) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let message = format!("{e:?}");
+            log::warn!("IF1 writer failed: {message}");
+            Err(message)
+        }
+    }
+}
+
 impl Fireface {
     /// Open the first Fireface found through the hwdep ABI.
     pub fn open() -> Result<Self, Error> {
@@ -634,7 +798,7 @@ impl Fireface {
             }
             let hw = Hwdep::open(found.card)?;
             let transport = HwdepTransport::new(hw, info.clone());
-            return Self::from_transport(Box::new(transport), info);
+            return Self::from_transport_async(Box::new(transport), info);
         }
         Err(Error::DeviceNotFound {
             model: model
@@ -648,7 +812,7 @@ impl Fireface {
         let info = DeviceInfo::from_abi(card, hw.info()?)
             .ok_or_else(|| Error::DeviceNotFound { model: format!("card {card}") })?;
         let transport = HwdepTransport::new(hw, info.clone());
-        Self::from_transport(Box::new(transport), info)
+        Self::from_transport_async(Box::new(transport), info)
     }
 
     /// Open the unit with this stable identity, not just the first unit of
@@ -667,7 +831,7 @@ impl Fireface {
             }
             let hw = Hwdep::open(found.card)?;
             let transport = HwdepTransport::new(hw, info.clone());
-            return Self::from_transport(Box::new(transport), info);
+            return Self::from_transport_async(Box::new(transport), info);
         }
         Err(Error::DeviceNotFound {
             model: identity.model.name().to_string(),
@@ -686,9 +850,25 @@ impl Fireface {
             .collect()
     }
 
+    #[cfg(test)]
     fn from_transport(
         transport: Box<dyn ControlTransport>,
         info: DeviceInfo,
+    ) -> Result<Self, Error> {
+        Self::from_transport_with_writer(transport, info, false)
+    }
+
+    fn from_transport_async(
+        transport: Box<dyn ControlTransport>,
+        info: DeviceInfo,
+    ) -> Result<Self, Error> {
+        Self::from_transport_with_writer(transport, info, true)
+    }
+
+    fn from_transport_with_writer(
+        transport: Box<dyn ControlTransport>,
+        info: DeviceInfo,
+        async_writer: bool,
     ) -> Result<Self, Error> {
         let model = info.model;
         let spec = super::models::for_model(model);
@@ -813,7 +993,11 @@ impl Fireface {
             matrix_overrides: HashMap::new(),
             input_tap,
             write_batch: Arc::new(Mutex::new(None)),
+            async_writer: None,
         };
+        if async_writer {
+            dev.async_writer = AsyncWriter::new(Arc::clone(&dev.transport)).map(Arc::new);
+        }
         if model == Model::Uc {
             dev.read_uc_levels();
             dev.read_uc_settings();
@@ -884,7 +1068,7 @@ impl Fireface {
             if self.queue_words(&[(addr, value)]) {
                 return Ok(());
             }
-            return self.write_words_paced(&[(addr, value)]);
+            return self.send_or_queue(&[(addr, value)]);
         }
         let result = self.transport().write_words(&[(addr, value)]);
         if let Err(e) = &result {
@@ -898,7 +1082,7 @@ impl Fireface {
             if self.queue_words(words) {
                 return Ok(());
             }
-            return self.write_words_paced(words);
+            return self.send_or_queue(words);
         }
         let result = self.transport().write_words(words);
         if let Err(e) = &result {
@@ -909,6 +1093,24 @@ impl Fireface {
             );
         }
         result
+    }
+
+    /// Hand a live UCX write to the writer, or send it inline when no
+    /// writer is running (tests, and the synchronous fallback).
+    fn send_or_queue(&self, words: &[(u16, u16)]) -> Result<(), Error> {
+        match &self.async_writer {
+            Some(writer) => writer.send_words(words.to_vec()),
+            None => self.write_words_paced(words),
+        }
+    }
+
+    /// Wait until the background writer has sent everything queued.
+    #[cfg(test)]
+    fn flush_writer(&self) -> Result<(), Error> {
+        match &self.async_writer {
+            Some(writer) => writer.flush(),
+            None => Ok(()),
+        }
     }
 
     /// Append words to the open scene batch.  `false` means no batch is
@@ -975,6 +1177,7 @@ impl Fireface {
         Some(WriteBatchGuard {
             transport: Arc::clone(&self.transport),
             batch: Arc::clone(&self.write_batch),
+            writer: self.async_writer.as_ref().map(Arc::clone),
             owns,
             active: true,
         })
@@ -986,9 +1189,17 @@ impl Fireface {
             let mut slot = self.write_batch.lock().unwrap();
             match slot.as_mut() {
                 Some(batch) => std::mem::take(batch),
-                None => return Ok(()),
+                None => Vec::new(),
             }
         };
+        if let Some(writer) = &self.async_writer {
+            // A vendor request must not overtake words already queued by
+            // a live control change.
+            if !words.is_empty() {
+                writer.send_words(words)?;
+            }
+            return writer.flush();
+        }
         if words.is_empty() {
             return Ok(());
         }
@@ -4252,7 +4463,7 @@ impl RmeDevice for Fireface {
             }
         }
         let result = match batch {
-            Some(batch) => batch.finish(),
+            Some(batch) => batch.finish_wait(),
             None => Ok(()),
         };
         if result.is_ok() {
@@ -4414,6 +4625,15 @@ mod tests {
         let (t, writes) = MockTransport::new(model);
         let info = t.info.clone();
         (Fireface::from_transport(Box::new(t), info).unwrap(), writes)
+    }
+
+    fn open_async(model: Model) -> (Fireface, Arc<Mutex<Vec<Write>>>) {
+        let (t, writes) = MockTransport::new(model);
+        let info = t.info.clone();
+        (
+            Fireface::from_transport_with_writer(Box::new(t), info, true).unwrap(),
+            writes,
+        )
     }
 
     #[test]
@@ -4683,6 +4903,35 @@ mod tests {
             Write::Words(words) => assert!(words.len() > 8),
             other => panic!("expected IF1 words, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn async_writer_flushes_live_words() {
+        let (mut dev, writes) = open_async(Model::Ucx);
+        writes.lock().unwrap().clear();
+        dev.set_channel_width(ChannelId::Input(0), 0.0).unwrap();
+        dev.flush_writer().unwrap();
+        let w = written_words(&writes);
+        let mixed = ucx::matrix_gain(std::f32::consts::FRAC_1_SQRT_2 as f64);
+        assert!(w.contains(&(0x4000, mixed)));
+    }
+
+    #[test]
+    fn async_writer_orders_words_before_vendor_requests() {
+        let (mut dev, writes) = open_async(Model::Ucx);
+        writes.lock().unwrap().clear();
+        dev.set_gain(0, 10).unwrap();
+        dev.set_sample_rate(48_000).unwrap();
+        let w = writes.lock().unwrap();
+        let words = w
+            .iter()
+            .position(|x| matches!(x, Write::Words(_)))
+            .expect("gain word");
+        let vendor = w
+            .iter()
+            .position(|x| matches!(x, Write::Vendor(..)))
+            .expect("rate vendor");
+        assert!(words < vendor, "queued words must precede the vendor request");
     }
 
     #[test]
