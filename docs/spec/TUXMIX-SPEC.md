@@ -788,6 +788,42 @@ the control is released, another control is used, or the edit pauses. Undo
 restores the previous scene; Redo reapplies the undone scene. Device settings
 and layout preferences are not captured by undo.
 
+### 13.3 Snapshots, layouts and workspaces
+
+TuxMix persists state in three separate layers:
+
+| Layer | Storage | Contents |
+|---|---|---|
+| Snapshot | `Mix <n>.json` in the scene directory | A full `Scene` |
+| Layout | `Layout <n>.json` in the layout directory | The collapsed-strip set |
+| GUI state | `gui.json` in the config directory | Window, sidebar, row mode, zoom, labels, open panels, selected output and link groupings |
+
+The current mix is `auto.json` in the scene directory.
+
+A snapshot is a host-side file. The device stores only its current mixer
+state; recalling a snapshot applies the saved scene to the device. TuxMix has
+eight snapshot slots. A snapshot is a full `Scene`: mixer and routing state,
+channel names, trim, link state and the saved device group. It is broader than
+RME's mixer-only snapshot.
+
+A layout has six slots and stores only which strips are collapsed. It does not
+store channel visibility, remote exclusions or names.
+
+Groups exist only at runtime. They are not written to the scene, a layout, the
+GUI preferences or any other file, so restarting TuxMix clears them.
+
+TuxMix has no Workspace file. A Workspace is the RME container for the current
+mix, all eight snapshots, all layout presets, group definitions and GUI state.
+TuxMix keeps those in separate files, with group state missing.
+
+RME's corresponding scopes are:
+
+| RME concept | Scope |
+|---|---|
+| Snapshot | Mixer and routing state only; no names, visibility, layout or GUI state |
+| Layout Preset | Channel visibility and MIDI/OSC remote exclusions; stored in a Workspace |
+| Workspace | Complete session: current mix, snapshots, Layout Presets, groups, names and GUI state |
+
 ## 14. Control invariants
 
 - Every channel control has a defined effect in the mixer model and its device
