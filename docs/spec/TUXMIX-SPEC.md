@@ -141,11 +141,13 @@ applies to Dynamics, Auto Level, Reverb and Echo.
 - The settings gear is a 28×26 tab with a 19 px glyph.
 - Trim, EQ and Dynamics use the 24×22 tab.
 - The active tab carries the panel's dark surface behind its glyph.
-- The T, EQ and D tabs carry the Stereo button's accent outline, sized to
-  the label, while their setting is active and the slideout is closed: trim
-  below 0 dB, EQ enabled, or dynamics on. While the slideout is open the tab
-  carries no accent; the panel's own on/off control is the single
-  indication. The gear tab only marks the open panel.
+- The T, EQ and D tabs keep their glyph only, in the accent colour, while
+  their setting is active and the slideout is closed: trim below 0 dB, EQ
+  enabled, or dynamics on. While the slideout is open the tab carries no
+  accent; the panel's own on/off control is the single indication. The gear
+  tab only marks the open panel.
+- Outlines belong to buttons, not slideout tabs. A slideout tab never draws
+  a button outline or a copy of the panel-open marker.
 - The glyph is centred in the tab before and after opening.
 
 ### 2.5 Control sizing

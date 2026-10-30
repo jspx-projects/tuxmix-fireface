@@ -436,21 +436,14 @@ fn tab_button<'a>(
             theme::TEXT_MD + 2.0,
         );
     }
-    // Closed: an active setting gets the Stereo button's accent outline,
-    // sized to the text and centred in the tab's fixed column slot.  An
-    // inactive setting stays a bare glyph.
+    // Closed: an active setting keeps its glyph only, in the accent colour.
+    // Slideout tabs are not outlined; the accent text is the whole state
+    // indication while the panel is closed.
     let glyph = || centered_label(label, (theme::TEXT_MD + 2.0) * scale);
-    let face = if lit {
-        button(glyph())
-            .padding([1.0 * scale, 3.0 * scale])
-            .style(theme::stereo_button(true))
-            .on_press(message)
-    } else {
-        button(glyph())
-            .padding([1.0 * scale, 3.0 * scale])
-            .style(theme::panel_tab(false, false))
-            .on_press(message)
-    };
+    let face = button(glyph())
+        .padding([1.0 * scale, 3.0 * scale])
+        .style(theme::panel_tab(false, lit))
+        .on_press(message);
     hint(
         container(face)
             .width(Length::Fixed(TAB_BTN_W * scale))
