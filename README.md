@@ -5,8 +5,8 @@ mode: a kernel transport module (`snd-fireface-uc`) and the TuxMix mixer.
 
 This tree is based on [TuxMix](https://github.com/ismail-bahloul/TuxMix) by
 Ismaïl Bahloul — his Babyface Pro FS mixer — and extends it into a full
-control surface for the Fireface UC family.  His commit history is preserved
-in this repository.
+control surface for the Fireface UC family. His commit history is preserved on
+the `archive/tuxmix-upstream` branch.
 
 ![The TuxMix mixer and Control Room driving a Fireface UCX, with the EQ and dynamics panels, sends, and the reverb and echo panels open](ui/tuxmix/docs/screenshots/mixer-ucx.png)
 
@@ -174,8 +174,8 @@ This project is built on prior work, and we are grateful to its authors.
 
 - [TuxMix](https://github.com/ismail-bahloul/TuxMix) by Ismaïl Bahloul (MIT)
   is the base of the mixer application: its device model, the Babyface Pro FS
-  support, the TUI and the scene system.  His commit history is preserved in
-  this repository, and the license and copyright notice stay in
+  support, the TUI and the scene system. His commit history is archived on the
+  `archive/tuxmix-upstream` branch, and the license and copyright notice stay in
   [`ui/tuxmix/LICENSE`](ui/tuxmix/LICENSE).
 - [snd-fireface-uc](https://github.com/berndie/snd-fireface-uc) by Bernd Accou
   (MIT) is the earlier Fireface UC kernel driver; our UC transport follows its

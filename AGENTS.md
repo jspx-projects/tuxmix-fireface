@@ -117,11 +117,9 @@ Authoritative files:
   for Windows/oracle questions and acknowledgements. Linux owns
   `LINUX-STATUS.md`, `LINUX-REQUESTS.md`, `DECISIONS.md`, `analysis/*` and
   `coordination/inbox/windows/*`.
-- Push only to our own repository,
-  `jspx-projects/tuxmix-fireface`. Never push to `ismail-bahloul/TuxMix`;
-  that is the upstream TuxMix application.
-- Do not commit, reset, clean or publish the nested `ui/tuxmix` worktree
-  unless the user asks for a commit or push.
+- Push only to our own repository, `jspx-projects/tuxmix-fireface`.
+- The UI is part of this repository. Do not add an external TuxMix development
+  remote; the imported upstream history is on `archive/tuxmix-upstream`.
 - Preserve the user scene and `~/.config/tuxmix/gui.json`. Leave the device on
   the user's scene after hardware tests.
 - One Fireface at a time.
