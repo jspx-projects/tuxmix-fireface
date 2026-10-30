@@ -26,8 +26,7 @@ use crate::channel::{
     OutputChannel, PlaybackChannel, Reverb, Sensitivity,
 };
 use crate::device::{
-    DeviceSettings, RmeDevice, average_pan, output_balance_from_volumes,
-    output_balance_to_volumes,
+    DeviceSettings, RmeDevice, output_balance_from_volumes, output_balance_to_volumes,
 };
 use crate::error::Error;
 use crate::scene::{MatrixOverride, Scene};
@@ -3012,34 +3011,12 @@ impl RmeDevice for Fireface {
             self.ucx_write_input_stereo(right, linked)?;
         }
         let saved = self.inputs.get(left).cloned();
-        let saved_right = self.inputs.get(right).cloned();
-        let left_pans = saved
-            .as_ref()
-            .map(|channel| channel.pans.clone())
-            .unwrap_or_default();
-        let right_pans = saved_right
-            .as_ref()
-            .map(|channel| channel.pans.clone())
-            .unwrap_or_default();
-        let restored_pans = self
-            .settings
-            .input_pair_pan
-            .get(pair)
-            .cloned()
-            .unwrap_or_default();
         {
             let v = &mut self.settings.input_pair_link;
             if v.len() <= pair {
                 v.resize(pair + 1, true);
             }
             v[pair] = linked;
-        }
-        if !linked {
-            let pans = &mut self.settings.input_pair_pan;
-            if pans.len() <= pair {
-                pans.resize(pair + 1, Vec::new());
-            }
-            pans[pair] = left_pans.clone();
         }
         if let Some(saved) = saved {
             if linked {
@@ -3069,17 +3046,11 @@ impl RmeDevice for Fireface {
                 }
             }
         }
-        for output in 0..self.output_pair_count() {
-            if linked {
-                let left_pan = left_pans.get(output).copied().unwrap_or(0);
-                let right_pan = right_pans.get(output).copied().unwrap_or(left_pan);
-                let pan = restored_pans
-                    .get(output)
-                    .copied()
-                    .unwrap_or_else(|| average_pan(left_pan, right_pan));
-                self.set_pan(ChannelId::Input(left), output, pan)?;
-                self.set_pan(ChannelId::Input(right), output, pan)?;
-            } else {
+        // The linked balance is derived from the two channel volumes, as
+        // on an output pair.  The mono pans stay as they are when linking;
+        // splitting puts them hard left/right.
+        if !linked {
+            for output in 0..self.output_pair_count() {
                 self.set_pan(ChannelId::Input(left), output, -100)?;
                 self.set_pan(ChannelId::Input(right), output, 100)?;
             }
@@ -5153,16 +5124,18 @@ mod tests {
     }
 
     #[test]
-    fn ucx_relinking_an_input_pair_restores_the_pre_split_pan() {
+    fn ucx_input_link_derives_balance_from_the_split_levels() {
         let (mut dev, _writes) = open(Model::Ucx);
-        dev.set_pan(ChannelId::Input(0), 0, -30).unwrap();
-        dev.set_pan(ChannelId::Input(1), 0, -30).unwrap();
         dev.set_input_pair_linked(0, false).unwrap();
-        dev.set_pan(ChannelId::Input(0), 0, -35).unwrap();
-        dev.set_pan(ChannelId::Input(1), 0, 40).unwrap();
+        dev.set_input_volume(0, 0, 0, 0.1).unwrap();
+        dev.set_input_volume(0, 1, 0, 0.5).unwrap();
         dev.set_input_pair_linked(0, true).unwrap();
-        assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), -30);
-        assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), -30);
+        assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.1).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.5).abs() < 1e-6);
+
+        dev.set_input_balance(0, 0, -32).unwrap();
+        assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.5).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.34).abs() < 1e-6);
     }
 
     #[test]

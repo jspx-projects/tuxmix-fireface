@@ -479,8 +479,65 @@ knob.
 
 ## 8. Pan and balance
 
-Input and software-playback strips expose pan into the selected submix. The
-knob writes the source's matrix cells for that submix.
+A split input or software-playback strip exposes pan into the selected
+submix; the knob writes the source's matrix cells for that submix. On a
+linked pair the same knob is a balance derived from the two channel volumes,
+and writing it changes the quieter channel's volume instead of a pan.
+
+### 8.1 Signal model and submixes
+
+Each hardware output is a bus. The selected output is the current submix;
+every input and software-playback strip carries an independent send gain and
+pan to that bus. The input/playback fader is the send level to the current
+submix, not a single channel fader. The output strip's fader is the bus
+master.
+
+| Term | Normal mixing desk | TotalMix FX | TuxMix |
+|---|---|---|---|
+| Input gain / trim | Preamp trim before the channel fader and meter | Hardware preamp gain; the T button is Trim Gain mode, not a separate gain stage | Trim pre-gain, common to every send of the channel |
+| Channel fader | One per channel, feeding the bus assignment | None | None |
+| Send fader | Aux send, usually pre- or post-channel fader | Per-routing send gain; the fader edits the selected output | Per-submix send gain; the fader edits the selected output |
+| Bus summing | Group, aux or matrix bus | Submix for one hardware output | Submix for one hardware output |
+| Bus master | Group or aux master fader | Output strip fader | Output strip fader |
+| Bus to output | Patch or assignment; one bus can feed several outputs | One bus per hardware output | One bus per hardware output |
+| Input VU tap | After input gain/trim, before the channel fader | After preamp gain and optional Post FX, before the send fader; T does not change it | After trim, before the send fader |
+| Output VU tap | Post-fader bus or output | Post-fader output bus | Post-fader output bus |
+
+In TotalMix, T is the **Trim Gain** mode: it gangs the sends of one channel.
+It is not a pre-gain and does not move the input VU. TotalMix therefore has
+an input VU after the preamp and optional FX, not “before trim”.
+
+In TuxMix, T is a true pre-fader trim. The send fader displays the post-trim
+level, so its maximum is the trim value at 0 dB send. An analog desk changes
+the meter and signal with trim but leaves the channel fader in place; TuxMix
+moves the send fader so the post-trim level is visible.
+
+For an analog input, the signal paths are:
+
+```text
+Normal desk:
+input -> input stage / sensitivity -> preamp / trim -> channel VU
+      -> channel fader -> pan -> bus assignment -> bus sum
+      -> bus master -> output VU -> output
+
+TotalMix FX:
+input -> input stage / reference -> preamp gain (where present) -> ADC
+      -> input VU (post-preamp; Post FX optional)
+      -> send fader for the selected output -> bus sum
+      -> output fader -> output VU -> DAC
+
+TuxMix:
+input -> input stage / reference -> preamp gain (where present) -> ADC
+      -> trim -> input VU -> send fader for the selected submix
+      -> bus sum -> output fader -> output VU -> DAC
+```
+
+The preamp gain is present on the UCX analog inputs 1–4. Digital inputs enter
+after the preamp stage. In TotalMix, T is a send-fader mode, not a gain stage.
+In TuxMix, trim is a host-side pre-fader gain after the ADC.
+
+Control Room destinations (Main, Speaker B, Phones, Cue) are ordinary output
+buses with their assignment controls.
 
 ## 9. Motion
 
@@ -504,16 +561,20 @@ Linking an input pair uses the left channel as the reference for mute, solo,
 phantom, Inst, Level, AutoSet and gain. It does not copy or flatten the two
 channel volumes: the linked fader displays the louder channel, and moving it
 shifts both channels by the same dB offset so their difference is preserved.
-The linked pan is a stored pair value; splitting sets the left and right pans
-hard left and hard right, and linking again restores that value. Split pan
-changes do not affect it. If no pan was captured, the two current pans are
-averaged.
+
+The linked balance is derived from the two channel volumes:
+
+```text
+balance = round((right - left) / max(left, right) * 100)
+```
+
+The knob sets the quieter side's volume and leaves the louder side at the
+pair level. Splitting sets the two pans hard left and hard right; split pan
+changes do not alter the balance because the balance lives in the channel
+volumes. The same rule applies to software-playback and hardware-output
+pairs.
 
 Phase L and Phase R keep independent states across the transition.
-
-Software-playback pairs use the same reference-and-centre rule. Output pairs
-link at the balance derived from their two channel volumes; splitting writes
-the two volumes that encode the pair level and balance.
 
 ## 11. Control Room
 
@@ -741,10 +802,17 @@ and layout preferences are not captured by undo.
 - The three channel rows scroll together under one horizontal slider.
 - Phase, pan, output balance, dynamics, FX and loopback survive scene recall.
 - Output balance survives output-fader movement.
-- Trim attenuates a channel's sends in the mixer: the value is applied when
-  each send is written, so it adds no device register.  `T` is the first
-  icon in the strip's column on hardware inputs and software playbacks; it
-  lights while trim is below 0 dB, and its tooltip states the applied value.
+- Trim is a pre-fader gain that attenuates every send of a channel. It adds
+  no device register; the value is applied when each send is written. `T` is
+  the first icon in the strip's column on hardware inputs and software
+  playbacks; it lights while trim is below 0 dB, and its tooltip states the
+  applied value.
+- The fader displays the post-trim level: `displayed = send × trim`. With
+  the send limited to 0 dB, the fader's maximum is the trim value, and
+  moving trim moves the fader cap with it. The send written to the device is
+  `displayed / trim`, so the audible level remains the fader value.
+- Input and playback meters are post-trim: a constant input tone falls and
+  rises with the trim value. Output meters remain post-fader.
 - Width is host-side and has no width register: it rewrites the pair's
   matrix cells. Playback stereo/mono, Mono, No Trim and Talkback receive are
   host-side and do not produce device writes.

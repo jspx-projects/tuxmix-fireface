@@ -239,7 +239,6 @@ impl MockBabyfacePro {
                 input_link: true,
                 output_link: Vec::new(),
                 input_pair_link: Vec::new(),
-                input_pair_pan: Vec::new(),
             },
             input_meters: vec![0.0; profile.input_count()],
             playback_meters: vec![0.0; profile.output_pair_count() * 2],
@@ -1298,28 +1297,27 @@ mod tests {
     }
 
     #[test]
-    fn test_input_link_restores_the_pre_split_pan_and_split_uses_hard_sides() {
+    fn test_input_link_keeps_split_levels_and_derives_balance_from_them() {
         let mut dev = MockBabyfacePro::open().unwrap();
-        dev.set_pan(ChannelId::Input(0), 0, -30).unwrap();
-        dev.set_pan(ChannelId::Input(1), 0, -30).unwrap();
-
         dev.set_input_pair_linked(0, false).unwrap();
         assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), -100);
         assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), 100);
 
-        dev.set_pan(ChannelId::Input(0), 0, -35).unwrap();
-        dev.set_pan(ChannelId::Input(1), 0, 40).unwrap();
-        dev.set_input_volume(0, 0, 0, 0.3).unwrap();
-        dev.set_input_volume(0, 1, 0, 0.7).unwrap();
+        dev.set_input_volume(0, 0, 0, 0.1).unwrap();
+        dev.set_input_volume(0, 1, 0, 0.5).unwrap();
         dev.set_mute(ChannelId::Input(0), true).unwrap();
         dev.set_mute(ChannelId::Input(1), false).unwrap();
 
         dev.set_input_pair_linked(0, true).unwrap();
-        assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), -30);
-        assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), -30);
-        assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.3).abs() < 1e-6);
-        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.7).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.1).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.5).abs() < 1e-6);
         assert!(dev.mute(ChannelId::Input(1)).unwrap());
+
+        // The linked balance sets the quieter side, with the louder side
+        // staying at the pair level.
+        dev.set_input_balance(0, 0, -32).unwrap();
+        assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.5).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.34).abs() < 1e-6);
     }
 
     #[test]
@@ -1348,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn test_playback_link_centers_pan_and_uses_the_left_channel_as_reference() {
+    fn test_playback_link_preserves_split_volumes() {
         let mut dev = MockBabyfacePro::open().unwrap();
         dev.set_playback_linked(0, false).unwrap();
         dev.set_pan(ChannelId::Playback(0), 0, -40).unwrap();
@@ -1356,9 +1354,28 @@ mod tests {
         dev.set_playback_volume(0, 0, 0, 0.3).unwrap();
         dev.set_playback_volume(0, 1, 0, 0.7).unwrap();
         dev.set_playback_linked(0, true).unwrap();
-        assert_eq!(dev.pan(ChannelId::Playback(0), 0).unwrap(), 0);
-        assert_eq!(dev.pan(ChannelId::Playback(1), 0).unwrap(), 0);
-        assert!((dev.volume(ChannelId::Playback(1), 0).unwrap() - 0.3).abs() < 1e-6);
+        // Linking does not copy the left volume over the right one.  The
+        // linked fader is a relative dB trim and displays the louder side.
+        assert!((dev.volume(ChannelId::Playback(0), 0).unwrap() - 0.3).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Playback(1), 0).unwrap() - 0.7).abs() < 1e-6);
+
+        dev.set_playback_balance(0, 0, -32).unwrap();
+        assert!((dev.volume(ChannelId::Playback(0), 0).unwrap() - 0.7).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Playback(1), 0).unwrap() - 0.476).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_linked_playback_fader_applies_the_same_db_delta() {
+        let mut dev = MockBabyfacePro::open().unwrap();
+        dev.set_playback_linked(0, false).unwrap();
+        dev.set_playback_volume(0, 0, 0, 0.1).unwrap();
+        dev.set_playback_volume(0, 1, 0, 0.5).unwrap();
+        dev.set_playback_linked(0, true).unwrap();
+
+        // Peak is 0.5; moving the linked fader to 0.25 scales both by 0.5.
+        dev.set_playback_volume(0, 0, 0, 0.25).unwrap();
+        assert!((dev.volume(ChannelId::Playback(0), 0).unwrap() - 0.05).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Playback(1), 0).unwrap() - 0.25).abs() < 1e-6);
     }
 
     #[test]

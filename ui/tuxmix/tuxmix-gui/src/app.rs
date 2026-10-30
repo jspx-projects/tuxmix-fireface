@@ -3293,6 +3293,16 @@ fn trim_factor(db: f32) -> f32 {
     10f32.powf(db.clamp(-65.0, 0.0) / 20.0)
 }
 
+/// Apply each channel's pre-fader trim to its meter reading. The meters
+/// show the signal after trim, so a constant tone moves with the trim.
+fn trim_meter_levels(levels: &[f32], trims: &[f32]) -> Vec<f32> {
+    levels
+        .iter()
+        .enumerate()
+        .map(|(i, level)| level * trim_factor(trims.get(i).copied().unwrap_or(0.0)))
+        .collect()
+}
+
 /// The trim value of a channel in dB.
 fn channel_trim(state: &TuxMix, cid: ChannelId) -> f32 {
     match cid {
@@ -3366,6 +3376,66 @@ fn set_channel_mute(state: &mut TuxMix, cid: ChannelId, m: bool) {
         ChannelId::Playback(ch) => state.device.set_playback_mute(ch / 2, ch % 2, m),
         ChannelId::Output(ch) => state.device.set_output_mute(ch / 2, ch % 2, m),
     };
+}
+
+/// The balance shown for a linked pair, derived from its two channel
+/// volumes. Split channels use their own pan.
+fn channel_pan(state: &TuxMix, cid: ChannelId, out: usize) -> i8 {
+    match cid {
+        ChannelId::Input(i) if state.device.input_pair_linked(i / 2) => {
+            let left = state
+                .device
+                .inputs()
+                .get(i & !1)
+                .and_then(|c| c.volumes.get(out))
+                .copied()
+                .unwrap_or(0.0);
+            let right = state
+                .device
+                .inputs()
+                .get(i | 1)
+                .and_then(|c| c.volumes.get(out))
+                .copied()
+                .unwrap_or(0.0);
+            output_balance_from_volumes(left, right)
+        }
+        ChannelId::Playback(i) if state.device.playback_linked(i / 2) => {
+            let left = state
+                .device
+                .playbacks()
+                .get(i & !1)
+                .and_then(|c| c.volumes.get(out))
+                .copied()
+                .unwrap_or(0.0);
+            let right = state
+                .device
+                .playbacks()
+                .get(i | 1)
+                .and_then(|c| c.volumes.get(out))
+                .copied()
+                .unwrap_or(0.0);
+            output_balance_from_volumes(left, right)
+        }
+        _ => state.device.pan(cid, out).unwrap_or(0),
+    }
+}
+
+/// Apply a pan/balance move. A linked pair has no separate balance
+/// parameter: its balance is the difference between the two channel
+/// volumes, so the knob sets the quieter side's level.
+fn set_channel_pan(state: &mut TuxMix, cid: ChannelId, out: usize, pan: i8) {
+    let result = match cid {
+        ChannelId::Input(i) if state.device.input_pair_linked(i / 2) => {
+            state.device.set_input_balance(i / 2, out, pan)
+        }
+        ChannelId::Playback(i) if state.device.playback_linked(i / 2) => {
+            state.device.set_playback_balance(i / 2, out, pan)
+        }
+        _ => state.device.set_pan(cid, out, pan),
+    };
+    if let Err(e) = result {
+        fail(state, "set_pan", &e);
+    }
 }
 
 /// Same idea as `set_channel_volume`, for solo.
@@ -3491,24 +3561,18 @@ fn apply_grouped_volume(state: &mut TuxMix, cid: ChannelId, out: usize, v: f32) 
 fn apply_grouped_pan(state: &mut TuxMix, cid: ChannelId, out: usize, pan: i8) {
     let others = propagation_set(state, cid, sidebar::GroupLink::Fader);
     if others.is_empty() {
-        if let Err(e) = state.device.set_pan(cid, out, pan) {
-            fail(state, "set_pan", &e);
-        }
+        set_channel_pan(state, cid, out, pan);
         notify_osc(state, OscOutbound::Pan(cid, out, pan));
         return;
     }
-    let old = i16::from(state.device.pan(cid, out).unwrap_or(pan));
+    let old = i16::from(channel_pan(state, cid, out));
     let delta = i16::from(pan) - old;
-    if let Err(e) = state.device.set_pan(cid, out, pan) {
-        fail(state, "set_pan", &e);
-    }
+    set_channel_pan(state, cid, out, pan);
     notify_osc(state, OscOutbound::Pan(cid, out, pan));
     for sel in others {
-        let cur = i16::from(state.device.pan(sel, out).unwrap_or(0));
+        let cur = i16::from(channel_pan(state, sel, out));
         let new = (cur + delta).clamp(-100, 100) as i8;
-        if let Err(e) = state.device.set_pan(sel, out, new) {
-            fail(state, "set_pan", &e);
-        }
+        set_channel_pan(state, sel, out, new);
         notify_osc(state, OscOutbound::Pan(sel, out, new));
     }
 }
@@ -4704,7 +4768,9 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                     state.sel_out = state.device.display_pair_index(out);
                 }
             }
-            let in_levels = state.device.input_meters();
+            let input_trims: Vec<f32> =
+                state.device.inputs().iter().map(|c| c.trim).collect();
+            let in_levels = trim_meter_levels(&state.device.input_meters(), &input_trims);
             for (i, m) in state.input_meters.iter_mut().enumerate() {
                 m.step_elapsed(in_levels.get(i).copied().unwrap_or(0.0));
             }
@@ -4726,6 +4792,9 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
                     };
                     (pb, state.device.device_output_meters())
                 };
+            let playback_trims: Vec<f32> =
+                state.device.playbacks().iter().map(|c| c.trim).collect();
+            let pb_levels = trim_meter_levels(&pb_levels, &playback_trims);
             let mut out_levels = device_output
                 .unwrap_or_else(|| state.device.output_meters_from(&in_levels, &pb_levels));
             // A muted output must read zero even if a backend's post-fader
@@ -5628,15 +5697,11 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         }
         Message::PanReset(cid, out) => {            if state.selected.len() > 1 && state.selected.contains(&cid) {
                 for sel in state.selected.clone() {
-                    if let Err(e) = state.device.set_pan(sel, out, 0) {
-                        fail(state, "set_pan", &e);
-                    }
+                    set_channel_pan(state, sel, out, 0);
                     notify_osc(state, OscOutbound::Pan(sel, out, 0));
                 }
             } else {
-                if let Err(e) = state.device.set_pan(cid, out, 0) {
-                    fail(state, "set_pan", &e);
-                }
+                set_channel_pan(state, cid, out, 0);
                 notify_osc(state, OscOutbound::Pan(cid, out, 0));
             }
         }
@@ -8221,7 +8286,7 @@ fn strip_params<'a>(
             let ch = &state.device.inputs()[i];
             let has_48v = caps.input_phantom && ch.channel_type == ChannelType::Mic;
             let linked = state.device.input_pair_linked(i / 2);
-            let volume = if linked {
+            let (volume, pan) = if linked {
                 let left = i & !1;
                 let right = left + 1;
                 let left_volume = state
@@ -8238,9 +8303,12 @@ fn strip_params<'a>(
                     .and_then(|c| c.volumes.get(output_idx))
                     .copied()
                     .unwrap_or(0.0);
-                left_volume.max(right_volume)
+                (
+                    left_volume.max(right_volume),
+                    output_balance_from_volumes(left_volume, right_volume),
+                )
             } else {
-                ch.volumes[output_idx]
+                (ch.volumes[output_idx], ch.pans[output_idx])
             };
             strip::StripParams {
                 name: ch.name.clone(),
@@ -8253,7 +8321,7 @@ fn strip_params<'a>(
                 // surface; the current output strip uses the same tone.
                 active_surface: true,
                 vol: volume * trim_factor(ch.trim),
-                pan: ch.pans[output_idx],
+                pan,
                 meter: state
                     .input_meters
                     .get(i)
@@ -8298,14 +8366,39 @@ fn strip_params<'a>(
         }
         ChannelId::Playback(i) => {
             let ch = &state.device.playbacks()[i];
+            let linked = state.device.playback_linked(i / 2);
+            let (volume, pan) = if linked {
+                let left = i & !1;
+                let right = left + 1;
+                let left_volume = state
+                    .device
+                    .playbacks()
+                    .get(left)
+                    .and_then(|c| c.volumes.get(output_idx))
+                    .copied()
+                    .unwrap_or(0.0);
+                let right_volume = state
+                    .device
+                    .playbacks()
+                    .get(right)
+                    .and_then(|c| c.volumes.get(output_idx))
+                    .copied()
+                    .unwrap_or(0.0);
+                (
+                    left_volume.max(right_volume),
+                    output_balance_from_volumes(left_volume, right_volume),
+                )
+            } else {
+                (ch.volumes[output_idx], ch.pans[output_idx])
+            };
             strip::StripParams {
                 name: ch.name.clone(),
                 // The software-playback row already says what these are;
                 // no redundant "PB" tag next to every name (TotalMix).
                 type_tag: None,
                 active_surface: true,
-                vol: ch.volumes[output_idx] * trim_factor(ch.trim),
-                pan: ch.pans[output_idx],
+                vol: volume * trim_factor(ch.trim),
+                pan,
                 has_trim: true,
                 trim: ch.trim,
                 trim_tip: trim_tip(ch.trim),
@@ -12187,7 +12280,7 @@ fn quick_view(state: &TuxMix) -> Element<'_, Message> {
 mod tests {
     use super::{
         any_channel_muted, any_channel_soloed, apply_pending_resize,
-        channel_trim, trim_factor,
+        channel_trim, trim_factor, trim_meter_levels,
         apply_prefs, channel_is_muted, channel_is_soloed, choose_startup_kind,
         choose_startup_target,
         frames_ms, converter_frames, is_undoable, new, new_with_device,
@@ -13054,20 +13147,19 @@ mod tests {
     }
 
     #[test]
-    fn relinking_an_input_pair_restores_the_pre_split_pan() {
+    fn linked_input_strip_balance_is_derived_from_the_split_levels() {
         let mut state = new(true, None, None);
         let cid = ChannelId::Input(0);
         let out = state.sel_out;
 
-        let _ = update(&mut state, Message::PanChanged(ChannelId::Input(0), out, -30));
-        let _ = update(&mut state, Message::PanChanged(ChannelId::Input(1), out, -30));
         let _ = update(&mut state, Message::StereoLinkChanged(cid, false));
-        let _ = update(&mut state, Message::PanChanged(ChannelId::Input(0), out, -35));
-        let _ = update(&mut state, Message::PanChanged(ChannelId::Input(1), out, 40));
+        state.device.set_input_volume(0, 0, out, 0.1).unwrap();
+        state.device.set_input_volume(0, 1, out, 0.5).unwrap();
         let _ = update(&mut state, Message::StereoLinkChanged(cid, true));
 
-        assert_eq!(state.device.pan(ChannelId::Input(0), out).unwrap(), -30);
-        assert_eq!(state.device.pan(ChannelId::Input(1), out).unwrap(), -30);
+        let params = super::strip_params(&state, ChannelId::Input(0), out);
+        assert!((params.vol - 0.5).abs() < 1e-6);
+        assert_eq!(params.pan, 80);
     }
 
     #[test]
@@ -13087,6 +13179,26 @@ mod tests {
 
         let params = super::strip_params(&state, ChannelId::Input(0), out);
         assert!((params.vol - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn linked_playback_strip_shows_the_louder_channel() {
+        let mut state = new(true, None, None);
+        let out = state.sel_out;
+        state.device.set_playback_linked(0, false).unwrap();
+        state
+            .device
+            .set_playback_volume(0, 0, out, 0.1)
+            .unwrap();
+        state
+            .device
+            .set_playback_volume(0, 1, out, 0.5)
+            .unwrap();
+        state.device.set_playback_linked(0, true).unwrap();
+
+        let params = super::strip_params(&state, ChannelId::Playback(0), out);
+        assert!((params.vol - 0.5).abs() < 1e-6);
+        assert_eq!(params.pan, 80);
     }
 
     #[test]
@@ -14040,6 +14152,13 @@ mod tests {
         // … while the level shown next to the fader is 6 dB lower.
         let shown = raw * trim_factor(channel_trim(&state, cid));
         assert!((shown - 0.5 * 0.501_187).abs() < 1e-3, "shown {shown}");
+    }
+
+    #[test]
+    fn trim_scales_the_meter_reading() {
+        let levels = trim_meter_levels(&[1.0, 0.5], &[-6.0, 0.0]);
+        assert!((levels[0] - 0.501_187).abs() < 1e-5);
+        assert!((levels[1] - 0.5).abs() < 1e-6);
     }
 
     #[test]

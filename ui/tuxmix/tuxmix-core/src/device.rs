@@ -6,14 +6,9 @@ use crate::channel::{
 use crate::error::Error;
 use crate::scene::Scene;
 
-/// The pan a linked pair takes from its two mono channels. Splitting puts
-/// them hard left/right, so this returns centre for an untouched split.
-pub(crate) fn average_pan(left: i8, right: i8) -> i8 {
-    ((left as i16 + right as i16) as f32 / 2.0).round() as i8
-}
-
-/// Balance of a linked output pair, from its two channel volumes. The
-/// louder side is the pair level, so this matches the linked fader.
+/// Balance of a linked pair, from its two channel volumes. The louder
+/// side is the pair level, so this matches the linked fader. The same
+/// formula applies to input, playback and output pairs.
 pub(crate) fn output_balance_from_volumes(left: f32, right: f32) -> i8 {
     let peak = left.max(right);
     if peak <= 0.0 {
@@ -186,11 +181,6 @@ pub struct DeviceSettings {
     /// strip, not only the mic pair.
     #[serde(default)]
     pub input_pair_link: Vec<bool>,
-    /// Pan per output pair captured when an input pair is split. Linking
-    /// again restores this value, so a split/re-link round trip does not
-    /// lose the pair's original position.
-    #[serde(default)]
-    pub input_pair_pan: Vec<Vec<i8>>,
 }
 
 /// Serde default for [`DeviceSettings::sample_rate`].
@@ -819,41 +809,18 @@ pub trait RmeDevice {
     }
 
     /// Sets whether input pair `pair` is linked. Linking uses the left
-    /// channel as the volume/preamp reference. Splitting captures the
-    /// linked pan and sets the two mono channels hard-left and hard-right;
-    /// linking again restores that captured pan. If no pan was captured,
-    /// the two current pans are averaged.
+    /// channel as the preamp reference and keeps both channel volumes; the
+    /// linked balance is derived from those volumes. Splitting sets the two
+    /// mono pans hard-left and hard-right.
     fn set_input_pair_linked(&mut self, pair: usize, linked: bool) -> Result<(), Error> {
         let (left, right) = (pair * 2, pair * 2 + 1);
         let saved = self.inputs().get(left).cloned();
-        let saved_right = self.inputs().get(right).cloned();
-        let left_pans = saved
-            .as_ref()
-            .map(|channel| channel.pans.clone())
-            .unwrap_or_default();
-        let right_pans = saved_right
-            .as_ref()
-            .map(|channel| channel.pans.clone())
-            .unwrap_or_default();
-        let restored_pans = self
-            .settings()
-            .input_pair_pan
-            .get(pair)
-            .cloned()
-            .unwrap_or_default();
         {
             let v = &mut self.settings_mut().input_pair_link;
             if v.len() <= pair {
                 v.resize(pair + 1, true);
             }
             v[pair] = linked;
-        }
-        if !linked {
-            let pans = &mut self.settings_mut().input_pair_pan;
-            if pans.len() <= pair {
-                pans.resize(pair + 1, Vec::new());
-            }
-            pans[pair] = left_pans.clone();
         }
 
         if let Some(saved) = saved {
@@ -875,17 +842,11 @@ pub trait RmeDevice {
             }
         }
 
-        for output in 0..self.output_pair_count() {
-            if linked {
-                let left_pan = left_pans.get(output).copied().unwrap_or(0);
-                let right_pan = right_pans.get(output).copied().unwrap_or(left_pan);
-                let pan = restored_pans
-                    .get(output)
-                    .copied()
-                    .unwrap_or_else(|| average_pan(left_pan, right_pan));
-                self.set_pan(ChannelId::Input(left), output, pan)?;
-                self.set_pan(ChannelId::Input(right), output, pan)?;
-            } else {
+        // The linked balance is derived from the two channel volumes, as
+        // on an output pair.  The mono pans stay as they are when linking;
+        // splitting puts them hard left/right.
+        if !linked {
+            for output in 0..self.output_pair_count() {
                 self.set_pan(ChannelId::Input(left), output, -100)?;
                 self.set_pan(ChannelId::Input(right), output, 100)?;
             }
@@ -923,6 +884,25 @@ pub trait RmeDevice {
         } else {
             self.set_volume(ChannelId::Input(if which == 0 { l } else { r }), output, volume)?;
         }
+        Ok(())
+    }
+
+    /// Sets the linked balance of input pair `pair` into submix `output`.
+    /// The pair level is the louder channel; the quieter side is
+    /// attenuated, exactly as [`output_balance_to_volumes`] does for an
+    /// output pair.
+    fn set_input_balance(
+        &mut self,
+        pair: usize,
+        output: usize,
+        balance: i8,
+    ) -> Result<(), Error> {
+        let (l, r) = (pair * 2, pair * 2 + 1);
+        let left = self.volume(ChannelId::Input(l), output)?;
+        let right = self.volume(ChannelId::Input(r), output)?;
+        let (left, right) = output_balance_to_volumes(left.max(right), balance);
+        self.set_volume(ChannelId::Input(l), output, left)?;
+        self.set_volume(ChannelId::Input(r), output, right)?;
         Ok(())
     }
 
@@ -977,20 +957,20 @@ pub trait RmeDevice {
 
         if linked {
             if let Some(saved) = saved {
-                for output in 0..self.output_pair_count() {
-                    let volume = saved.volumes.get(output).copied().unwrap_or(1.0);
-                    self.set_volume(ChannelId::Playback(right), output, volume)?;
-                }
+                // Linking keeps the two channel volumes.  The linked fader
+                // shows the louder one and moves both by the same dB
+                // offset, so copying the left volume here would destroy the
+                // split levels.
                 self.set_mute(ChannelId::Playback(right), saved.mute)?;
                 self.set_solo(ChannelId::Playback(right), saved.solo)?;
             }
         }
 
-        for output in 0..self.output_pair_count() {
-            if linked {
-                self.set_pan(ChannelId::Playback(left), output, 0)?;
-                self.set_pan(ChannelId::Playback(right), output, 0)?;
-            } else {
+        // The linked balance is derived from the two channel volumes.  The
+        // mono pans stay as they are when linking; splitting puts them hard
+        // left/right.
+        if !linked {
+            for output in 0..self.output_pair_count() {
                 self.set_pan(ChannelId::Playback(left), output, -100)?;
                 self.set_pan(ChannelId::Playback(right), output, 100)?;
             }
@@ -1010,11 +990,40 @@ pub trait RmeDevice {
     ) -> Result<(), Error> {
         let (l, r) = (pair * 2, pair * 2 + 1);
         if self.playback_linked(pair) {
-            self.set_volume(ChannelId::Playback(l), output, volume)?;
-            self.set_volume(ChannelId::Playback(r), output, volume)?;
+            let target = volume.clamp(0.0, 1.0);
+            let left = self.volume(ChannelId::Playback(l), output)?;
+            let right = self.volume(ChannelId::Playback(r), output)?;
+            let peak = left.max(right);
+            let (left, right) = if peak > 0.0 {
+                // The linked fader is a relative dB trim: scale both
+                // channels by the same factor so their difference stays.
+                let gain = target / peak;
+                (left * gain, right * gain)
+            } else {
+                (target, target)
+            };
+            self.set_volume(ChannelId::Playback(l), output, left)?;
+            self.set_volume(ChannelId::Playback(r), output, right)?;
         } else {
             self.set_volume(ChannelId::Playback(if which == 0 { l } else { r }), output, volume)?;
         }
+        Ok(())
+    }
+
+    /// Sets the linked balance of playback pair `pair` into submix
+    /// `output`; the pair level is the louder channel.
+    fn set_playback_balance(
+        &mut self,
+        pair: usize,
+        output: usize,
+        balance: i8,
+    ) -> Result<(), Error> {
+        let (l, r) = (pair * 2, pair * 2 + 1);
+        let left = self.volume(ChannelId::Playback(l), output)?;
+        let right = self.volume(ChannelId::Playback(r), output)?;
+        let (left, right) = output_balance_to_volumes(left.max(right), balance);
+        self.set_volume(ChannelId::Playback(l), output, left)?;
+        self.set_volume(ChannelId::Playback(r), output, right)?;
         Ok(())
     }
 
