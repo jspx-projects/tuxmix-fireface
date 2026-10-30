@@ -13033,6 +13033,21 @@ mod tests {
     }
 
     #[test]
+    fn relinking_an_input_pair_averages_the_two_pans() {
+        let mut state = new(true, None, None);
+        let cid = ChannelId::Input(0);
+        let out = state.sel_out;
+
+        let _ = update(&mut state, Message::StereoLinkChanged(cid, false));
+        let _ = update(&mut state, Message::PanChanged(ChannelId::Input(0), out, -35));
+        let _ = update(&mut state, Message::PanChanged(ChannelId::Input(1), out, 40));
+        let _ = update(&mut state, Message::StereoLinkChanged(cid, true));
+
+        assert_eq!(state.device.pan(ChannelId::Input(0), out).unwrap(), 3);
+        assert_eq!(state.device.pan(ChannelId::Input(1), out).unwrap(), 3);
+    }
+
+    #[test]
     fn unlinking_a_playback_pair_splits_both_channels() {
         // A playback pair's link is its hardware stereo split: the STEREO
         // switch is the one control for it (the strip's "SP" button was the
@@ -13359,7 +13374,7 @@ mod tests {
         });
         assert!(fx_slot(&state, now).is_some(), "still visible while closing");
         assert!(
-            fx_slot(&state, now + Duration::from_millis(100)).is_none(),
+            fx_slot(&state, now + Duration::from_millis(200)).is_none(),
             "gone once the tween settles"
         );
     }

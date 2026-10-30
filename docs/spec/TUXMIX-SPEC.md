@@ -141,6 +141,9 @@ applies to Dynamics, Auto Level, Reverb and Echo.
 - The settings gear is a 28×26 tab with a 19 px glyph.
 - Trim, EQ and Dynamics use the 24×22 tab.
 - The active tab carries the panel's dark surface behind its glyph.
+- The T, EQ and D tabs carry the accent outline while their setting is
+  active: trim below 0 dB, EQ enabled, or dynamics on. Opening the slideout
+  alone does not light them. The gear tab only marks the open panel.
 - The glyph is centred in the tab before and after opening.
 
 ### 2.5 Control sizing
@@ -162,7 +165,8 @@ There are two sizing families, one per surface:
 
 Dragging a fader or knob changes it; the scroll wheel nudges it. Holding Shift
 reduces the movement for fine adjustment; this applies to faders, knobs,
-matrix cells and EQ handles.
+matrix cells and EQ handles. A press captures the pointer until release, so a
+drag continues when the pointer leaves the control or the window.
 
 A double click on a fader, knob, FX fader or EQ handle resets that control to
 its default. A double click on the dB readout opens a numeric entry field. A
@@ -390,8 +394,8 @@ The FX panel is a column between the mixer rows and the sidebar, toggled by
 the `FX` button in the top bar and shown only on a backend with the FX bus.
 Reverb sits above Echo in one 180 px column.
 
-The column opens and closes with the same 90 ms width tween as the strip
-panels. It first reduces the mixer area until the widest row reaches its
+The column opens and closes with the same constant-speed width tween as the
+strip panels. It first reduces the mixer area until the widest row reaches its
 natural width. If that still leaves no room for the column, it slides over
 the rightmost part of the rows instead of forcing them to scroll further.
 The overlap grows continuously as the window narrows; an open slideout keeps
@@ -469,7 +473,8 @@ knob writes the source's matrix cells for that submix.
 
 ## 9. Motion
 
-All strip panels open and close with a 90 ms width tween:
+All strip panels open and close with a width tween at a constant 1 px/ms;
+a wider panel takes longer instead of sliding faster:
 
 - Settings, EQ, Dynamics and Trim grow and shrink beside their strip;
 - the FX column grows and shrinks beside the mixer, or over its right edge
@@ -480,13 +485,15 @@ All strip panels open and close with a 90 ms width tween:
   the current width to the new width.
 
 Toggling Stereo tweens the second half of the pair between zero and full width
-over the same 90 ms. Channels to the right reflow with the tween.
+at the same speed. Channels to the right reflow with the tween.
 
 ## 10. Stereo link
 
-Linking an input pair uses the left channel as the reference. Volume, mute,
-solo, phantom, Inst, Level, AutoSet and gain copy to the right channel; pans
-centre. Splitting sets the left and right pans hard left and hard right.
+Linking an input pair uses the left channel as the reference for volume,
+mute, solo, phantom, Inst, Level, AutoSet and gain. The linked pan is the
+rounded average of the two channels' pans before linking; an untouched split
+(hard left and hard right) therefore re-links to centre. Splitting sets the
+left and right pans hard left and hard right.
 
 Phase L and Phase R keep independent states across the transition.
 
@@ -714,7 +721,7 @@ and layout preferences are not captured by undo.
   gain, pan and output balance; solo colour for Dynamics.
 - Settings, EQ, Dynamics, Trim and Route panels use the same height as their
   strip.
-- Panel and row transitions use the 90 ms width tween.
+- Panel and row transitions use the constant-speed width tween.
 - The right sidebar remains visible while expanded, at every window width.
 - The three channel rows scroll together under one horizontal slider.
 - Phase, pan, output balance, dynamics, FX and loopback survive scene recall.

@@ -6,6 +6,12 @@ use crate::channel::{
 use crate::error::Error;
 use crate::scene::Scene;
 
+/// The pan a linked pair takes from its two mono channels. Splitting puts
+/// them hard left/right, so this returns centre for an untouched split.
+pub(crate) fn average_pan(left: i8, right: i8) -> i8 {
+    ((left as i16 + right as i16) as f32 / 2.0).round() as i8
+}
+
 /// Global device-level settings.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DeviceSettings {
@@ -780,12 +786,22 @@ pub trait RmeDevice {
             .unwrap_or(true)
     }
 
-    /// Sets whether input pair `pair` is linked.  Linking uses the left
-    /// channel as the pair's representative; splitting gives the two mono
-    /// channels hard-left and hard-right pans.
+    /// Sets whether input pair `pair` is linked. Linking uses the left
+    /// channel as the volume/preamp reference; the linked pan is the
+    /// rounded average of the two channels' pans. Splitting gives the two
+    /// mono channels hard-left and hard-right pans.
     fn set_input_pair_linked(&mut self, pair: usize, linked: bool) -> Result<(), Error> {
         let (left, right) = (pair * 2, pair * 2 + 1);
         let saved = self.inputs().get(left).cloned();
+        let saved_right = self.inputs().get(right).cloned();
+        let left_pans = saved
+            .as_ref()
+            .map(|channel| channel.pans.clone())
+            .unwrap_or_default();
+        let right_pans = saved_right
+            .as_ref()
+            .map(|channel| channel.pans.clone())
+            .unwrap_or_default();
         {
             let v = &mut self.settings_mut().input_pair_link;
             if v.len() <= pair {
@@ -819,8 +835,11 @@ pub trait RmeDevice {
 
         for output in 0..self.output_pair_count() {
             if linked {
-                self.set_pan(ChannelId::Input(left), output, 0)?;
-                self.set_pan(ChannelId::Input(right), output, 0)?;
+                let left_pan = left_pans.get(output).copied().unwrap_or(0);
+                let right_pan = right_pans.get(output).copied().unwrap_or(left_pan);
+                let pan = average_pan(left_pan, right_pan);
+                self.set_pan(ChannelId::Input(left), output, pan)?;
+                self.set_pan(ChannelId::Input(right), output, pan)?;
             } else {
                 self.set_pan(ChannelId::Input(left), output, -100)?;
                 self.set_pan(ChannelId::Input(right), output, 100)?;

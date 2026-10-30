@@ -25,7 +25,7 @@ use crate::channel::{
     ChannelId, ChannelType, Dynamics, Echo, EqBandType, InputChannel, InputEq, InputLevel,
     OutputChannel, PlaybackChannel, Reverb, Sensitivity,
 };
-use crate::device::{DeviceSettings, RmeDevice};
+use crate::device::{DeviceSettings, RmeDevice, average_pan};
 use crate::error::Error;
 use crate::scene::{MatrixOverride, Scene};
 
@@ -3029,6 +3029,15 @@ impl RmeDevice for Fireface {
             self.ucx_write_input_stereo(right, linked)?;
         }
         let saved = self.inputs.get(left).cloned();
+        let saved_right = self.inputs.get(right).cloned();
+        let left_pans = saved
+            .as_ref()
+            .map(|channel| channel.pans.clone())
+            .unwrap_or_default();
+        let right_pans = saved_right
+            .as_ref()
+            .map(|channel| channel.pans.clone())
+            .unwrap_or_default();
         {
             let v = &mut self.settings.input_pair_link;
             if v.len() <= pair {
@@ -3070,8 +3079,11 @@ impl RmeDevice for Fireface {
         }
         for output in 0..self.output_pair_count() {
             if linked {
-                self.set_pan(ChannelId::Input(left), output, 0)?;
-                self.set_pan(ChannelId::Input(right), output, 0)?;
+                let left_pan = left_pans.get(output).copied().unwrap_or(0);
+                let right_pan = right_pans.get(output).copied().unwrap_or(left_pan);
+                let pan = average_pan(left_pan, right_pan);
+                self.set_pan(ChannelId::Input(left), output, pan)?;
+                self.set_pan(ChannelId::Input(right), output, pan)?;
             } else {
                 self.set_pan(ChannelId::Input(left), output, -100)?;
                 self.set_pan(ChannelId::Input(right), output, 100)?;
@@ -5096,6 +5108,17 @@ mod tests {
         assert!(w.contains(&Write::Words(vec![(0x0302, 0)])));
         assert!(w.contains(&Write::Words(vec![(0x1204, 0)])));
         assert!(w.contains(&Write::Words(vec![(0x1304, 0)])));
+    }
+
+    #[test]
+    fn ucx_relinking_an_input_pair_averages_the_pans() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        dev.set_input_pair_linked(0, false).unwrap();
+        dev.set_pan(ChannelId::Input(0), 0, -35).unwrap();
+        dev.set_pan(ChannelId::Input(1), 0, 40).unwrap();
+        dev.set_input_pair_linked(0, true).unwrap();
+        assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), 3);
+        assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), 3);
     }
 
     #[test]

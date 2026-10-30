@@ -148,16 +148,14 @@ pub(crate) fn full_width(_cid: ChannelId) -> f32 {
     STRIP_W
 }
 
-/// How long a strip's collapse/expand width transition takes — longer than
-/// the meter's 50ms interp window since this is a much bigger, structural
-/// change (the whole card growing or shrinking), not a small value nudge.
-/// Same linear ease-style interpolation as `fader::MeterFrame`, just a
-/// dedicated type since the duration and the thing being interpolated
-/// (a pixel width, not a volume/pan value) are both different.
+/// Slideout speed, independent of the panel width: a 90 px Settings panel
+/// still takes 90 ms, while a 248 px EQ panel takes 248 ms instead of
+/// racing through the same 90 ms. One pixel per millisecond.
 ///
-/// Kept brisk: the slide-in/out is a navigation aid, not an effect.  The
-/// earlier 160ms felt sluggish when opening EQ/Settings repeatedly.
-const COLLAPSE_INTERP_MS: f32 = 90.0;
+/// A width tween is a navigation aid, not an effect. A fixed duration made
+/// wide panels slide visibly faster than narrow ones; a fixed speed keeps
+/// the motion even.
+const COLLAPSE_SPEED_PX_PER_MS: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CollapseAnim {
@@ -167,15 +165,24 @@ pub struct CollapseAnim {
 }
 
 impl CollapseAnim {
+    fn duration_ms(&self) -> f32 {
+        (self.value - self.prev).abs() / COLLAPSE_SPEED_PX_PER_MS
+    }
+
     pub fn at(&self, now: Instant) -> f32 {
-        let t = (now.duration_since(self.since).as_secs_f32() * 1000.0 / COLLAPSE_INTERP_MS)
+        let duration = self.duration_ms();
+        if duration <= f32::EPSILON {
+            return self.value;
+        }
+        let t = (now.duration_since(self.since).as_secs_f32() * 1000.0 / duration)
             .clamp(0.0, 1.0);
         self.prev + (self.value - self.prev) * t
     }
 
     pub fn is_settling(&self, now: Instant) -> bool {
-        (self.value - self.prev).abs() > f32::EPSILON
-            && now.duration_since(self.since).as_secs_f32() * 1000.0 < COLLAPSE_INTERP_MS
+        let duration = self.duration_ms();
+        duration > f32::EPSILON
+            && now.duration_since(self.since).as_secs_f32() * 1000.0 < duration
     }
 }
 
@@ -951,7 +958,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         icon_col = icon_col.push(tab_button(
             "T",
             trim_open,
-            trim_open || p.trim < 0.0,
+            p.trim < 0.0,
             Message::ToggleFlyout(cid, FlyoutKind::Trim),
             if trim_open {
                 std::borrow::Cow::Borrowed("Hide trim")
@@ -974,7 +981,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         icon_col = icon_col.push(tab_button_sized(
             "⚙",
             settings_open,
-            settings_open,
+            false,
             Message::ToggleFlyout(cid, FlyoutKind::Settings),
             if settings_open { "Hide settings" } else { "Show settings (48V/PAD/Sensitivity)" },
             scale,
@@ -988,7 +995,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         icon_col = icon_col.push(tab_button(
             "EQ",
             eq_open,
-            eq_open || p.eq_enabled,
+            p.eq_enabled,
             Message::ToggleFlyout(cid, FlyoutKind::Eq),
             if eq_open { "Hide EQ" } else { "Show EQ (3-band + low cut)" },
             scale,
@@ -1001,7 +1008,7 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         icon_col = icon_col.push(tab_button(
             "D",
             dyn_open,
-            dyn_open || p.dynamics_on,
+            p.dynamics_on,
             Message::ToggleFlyout(cid, FlyoutKind::Dynamics),
             if dyn_open { "Hide Dynamics" } else { "Show Dynamics (Compressor, Expander, Auto Level)" },
             scale,
@@ -1291,34 +1298,41 @@ mod tests {
     }
 
     #[test]
-    fn transitioning_anim_settles_after_the_interp_window() {
+    fn transitioning_anim_settles_after_its_width_based_duration() {
         let a = CollapseAnim { prev: STRIP_W, value: COLLAPSED_W, since: Instant::now() };
+        let duration = Duration::from_millis(a.duration_ms() as u64);
         assert!(a.is_settling(a.since), "just started — should still be settling");
         assert!(
-            a.is_settling(a.since + Duration::from_millis(80)),
+            a.is_settling(a.since + duration / 2),
             "mid-transition — should still be settling"
         );
         assert!(
-            !a.is_settling(a.since + Duration::from_millis(200)),
-            "past the interp window — should have stopped requesting redraws"
+            !a.is_settling(a.since + duration + Duration::from_millis(1)),
+            "past the width-based window — should have stopped requesting redraws"
         );
     }
 
     #[test]
     fn at_interpolates_linearly_from_prev_to_value() {
         let a = CollapseAnim { prev: STRIP_W, value: COLLAPSED_W, since: Instant::now() };
+        let duration = Duration::from_millis(a.duration_ms() as u64);
         assert_eq!(a.at(a.since), STRIP_W);
-        assert_eq!(
-            a.at(a.since + Duration::from_millis(COLLAPSE_INTERP_MS as u64)),
-            COLLAPSED_W
-        );
-        let mid = a.at(
-            a.since + Duration::from_millis((COLLAPSE_INTERP_MS / 2.0) as u64),
-        );
+        assert_eq!(a.at(a.since + duration), COLLAPSED_W);
+        let mid = a.at(a.since + duration / 2);
         let expected_mid = (STRIP_W + COLLAPSED_W) / 2.0;
         assert!(
             (mid - expected_mid).abs() < 0.5,
             "expected ~{expected_mid} at the midpoint, got {mid}"
+        );
+    }
+
+    #[test]
+    fn slideout_speed_does_not_depend_on_panel_width() {
+        let small = CollapseAnim { prev: 0.0, value: 90.0, since: Instant::now() };
+        let large = CollapseAnim { prev: 0.0, value: 180.0, since: Instant::now() };
+        assert!(
+            (large.duration_ms() / small.duration_ms() - 2.0).abs() < 1e-4,
+            "a panel twice as wide must take twice as long"
         );
     }
 }

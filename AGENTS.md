@@ -101,6 +101,15 @@ Authoritative files:
 - Slideout panels never show a scrollbar at normal size. Keep the scrollable
   wrapper in the code as a safety net while tuning, so missing content is
   reachable instead of silently clipped.
+- Slideout speed is constant in pixels per millisecond; a wider panel takes
+  longer instead of moving faster.
+- T, EQ and D use the Stereo button's accent outline when their setting is
+  active, not when their slideout is merely open. The gear only marks the
+  open panel.
+- A fader, knob, matrix cell or EQ handle captures the pointer for the drag;
+  the drag continues outside the control and ends on release.
+- Linking an input pair averages the two channels' pans; splitting sets them
+  hard left and hard right.
 - Slideouts have no close button; the strip tab that opened the panel closes
   it.
 - A knob label may overlap the unused bottom margin of its knob when space
