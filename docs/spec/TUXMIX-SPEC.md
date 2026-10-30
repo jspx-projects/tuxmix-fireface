@@ -147,7 +147,8 @@ applies to Dynamics, Auto Level, Reverb and Echo.
   accent; the panel's own on/off control is the single indication. The gear
   tab only marks the open panel.
 - Outlines belong to buttons, not slideout tabs. A slideout tab never draws
-  a button outline or a copy of the panel-open marker.
+  a button outline or a copy of the panel-open marker. Hover brightens the
+  glyph but never uses the accent.
 - The glyph is centred in the tab before and after opening.
 
 ### 2.5 Control sizing

@@ -105,8 +105,9 @@ Authoritative files:
   longer instead of moving faster.
 - Outline only for buttons, never for slideout tabs. T, EQ and D use accent
   text only while their setting is active and the slideout is closed; while
-  the slideout is open they carry no accent. The panel's own on/off control
-  is the single indication. The gear only marks the open panel.
+  the slideout is open they carry no accent. Hover brightens the glyph but
+  never uses the accent. The panel's own on/off control is the single
+  indication. The gear only marks the open panel.
 - A fader, knob, matrix cell or EQ handle captures the pointer for the drag;
   the drag continues outside the control and ends on release.
 - Linking an input pair averages the two channels' pans; splitting sets them
