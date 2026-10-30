@@ -390,6 +390,12 @@ The FX panel is a column between the mixer rows and the sidebar, toggled by
 the `FX` button in the top bar and shown only on a backend with the FX bus.
 Reverb sits above Echo in one 180 px column.
 
+The column opens and closes with the same 90 ms width tween as the strip
+panels. It first reduces the mixer area until the widest row reaches its
+natural width. If that still leaves no room for the column, it slides over
+the rightmost part of the rows instead of forcing them to scroll further.
+Widening the window moves it back into the layout; closing FX removes it.
+
 | Band | Height |
 |---|---:|
 | Header (on switch + effect name) | 36 |
@@ -464,6 +470,8 @@ knob writes the source's matrix cells for that submix.
 All strip panels open and close with a 90 ms width tween:
 
 - Settings, EQ, Dynamics and Trim grow and shrink beside their strip;
+- the FX column grows and shrinks beside the mixer, or over its right edge
+  when the window is too narrow for both;
 - Route grows and shrinks as a raised picker;
 - Quick view uses the same tween;
 - switching Settings, EQ, Dynamics or Trim on one strip tweens directly from

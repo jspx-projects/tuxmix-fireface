@@ -2096,6 +2096,9 @@ pub struct TuxMix {
     /// The FX column beside the mixer: Reverb and Echo, in TotalMix's own
     /// place for them. Only meaningful when the backend reports `fx`.
     pub show_fx_panel: bool,
+    /// Width tween for the FX column. `None` once settled; closing keeps
+    /// the column in the layout until this reaches zero.
+    pub fx_anim: Option<strip::CollapseAnim>,
     /// Control Room Assign: the output pair chosen for each destination,
     /// in `ASSIGN_DESTS` order. An assigned pair leaves the hardware-output
     /// row and shows up in the Control Room section instead.
@@ -2590,6 +2593,7 @@ pub fn new_with_device(
         show_device_panel: false,
         talkback_on: false,
         show_fx_panel: true,
+        fx_anim: None,
         assign: [None; 7],
         assign_menu: AssignMenu::Closed,
         show_about: false,
@@ -5669,6 +5673,9 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             state.collapse_anim.retain(|_, a| a.is_settling(now));
             state.flyout_anim.retain(|_, a| a.is_settling(now));
             state.stereo_anim.retain(|_, a| a.is_settling(now));
+            if state.fx_anim.is_some_and(|a| !a.is_settling(now)) {
+                state.fx_anim = None;
+            }
             if let Some((cid, kind)) = state.pending_flyout {
                 let still_closing = state.flyout_anim.iter().any(|(&(c, k), a)| {
                     c == cid && k != strip::FlyoutKind::Route && a.is_settling(now)
@@ -5772,7 +5779,18 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             state.show_settings = false;
         }
         Message::ToggleFxPanel => {
+            let now = Instant::now();
+            let full = FX_W * state.ui_scale;
+            let current = state
+                .fx_anim
+                .map(|a| a.at(now))
+                .unwrap_or(if state.show_fx_panel { full } else { 0.0 });
             state.show_fx_panel = !state.show_fx_panel;
+            state.fx_anim = Some(strip::CollapseAnim {
+                prev: current,
+                value: if state.show_fx_panel { full } else { 0.0 },
+                since: now,
+            });
         }
         Message::ToggleAssign => {
             state.assign_menu = match state.assign_menu {
@@ -6477,6 +6495,7 @@ fn is_active(state: &TuxMix) -> bool {
         || !state.collapse_anim.is_empty()
         || !state.flyout_anim.is_empty()
         || !state.stereo_anim.is_empty()
+        || state.fx_anim.is_some()
         || state.drag_range.is_some()
         || state.notice.is_some()
 }
@@ -6507,6 +6526,7 @@ pub fn subscription(state: &TuxMix) -> Subscription<Message> {
     if !state.collapse_anim.is_empty()
         || !state.flyout_anim.is_empty()
         || !state.stereo_anim.is_empty()
+        || state.fx_anim.is_some()
     {
         subs.push(iced::time::every(Duration::from_millis(8)).map(|_| Message::CollapseTick));
     }
@@ -6605,10 +6625,12 @@ fn handle_global_event(
 
 pub fn view(state: &TuxMix, _window: window::Id) -> Element<'_, Message> {
     let top = top_bar(state);
-    let content = match state.view {
-        View::Quick => quick_view(state),
-        View::Mixer => mixer_view(state),
-        View::Matrix => matrix_view(state),
+    let now = Instant::now();
+    let fx_width = fx_slot(state, now);
+    let (content, fx_overlay) = match state.view {
+        View::Quick => (quick_view(state), false),
+        View::Mixer => mixer_view(state, fx_width),
+        View::Matrix => (matrix_view(state), false),
     };
 
     // Explicit Fill — a Shrink parent doesn't actually grant a Fill-sized
@@ -6626,17 +6648,38 @@ pub fn view(state: &TuxMix, _window: window::Id) -> Element<'_, Message> {
     if !state.connected {
         main = main.push(disconnected_banner(state));
     }
-    main = main.push(content);
+    if fx_overlay {
+        let width = fx_width.unwrap_or(0.0);
+        let panel = container(
+            container(fx_column(state, width))
+                .width(Length::Fixed(width))
+                .height(Length::Fill)
+                .style(theme::root),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::Alignment::End)
+        .align_y(iced::Alignment::Start);
+        main = main.push(
+            stack(vec![content, panel.into()])
+                .width(Length::Fill)
+                .height(Length::Fill),
+        );
+    } else {
+        main = main.push(content);
+    }
     if state.show_osc_log {
         main = main.push(osc_log_panel(state));
     }
     let main = main.width(Length::Fill).height(Length::Fill);
     // TotalMix's own order across the window: mixer, FX column, control
-    // strip. The FX column is the two Reverb/Echo panels (see `fx_column`),
-    // shown only on a backend that has the FX bus.
+    // strip. When the mixer cannot shrink far enough, the FX column is
+    // drawn over the rightmost part of the mixer instead of squeezing it.
     let mut parts = row![main];
-    if state.show_fx_panel && state.device.capabilities().fx {
-        parts = parts.push(fx_column(state));
+    if let Some(width) = fx_width {
+        if !fx_overlay {
+            parts = parts.push(fx_column(state, width));
+        }
     }
     let mut base: Element<'_, Message> = parts
         .push(sidebar::sidebar(state))
@@ -8531,6 +8574,30 @@ fn flyout_slot(
     }
 }
 
+/// Current animated FX-column width, or `None` when it is fully closed and
+/// should not occupy the layout.
+fn fx_slot(state: &TuxMix, now: Instant) -> Option<f32> {
+    if !state.device.capabilities().fx {
+        return None;
+    }
+    match state.fx_anim {
+        Some(anim) => {
+            let width = anim.at(now);
+            if !state.show_fx_panel && !anim.is_settling(now) {
+                None
+            } else {
+                Some(width.max(0.0))
+            }
+        }
+        None => state.show_fx_panel.then_some(FX_W * state.ui_scale),
+    }
+}
+
+/// Whether the FX column has to overlay the mixer instead of pushing it.
+fn fx_should_overlay(natural_width: f32, main_space: f32, fx_full: f32) -> bool {
+    main_space < natural_width + fx_full
+}
+
 /// Route is rendered as a Stack overlay, so its row needs the strip's
 /// right edge while it is open *or* still sliding out.
 fn route_visible(state: &TuxMix, cid: ChannelId, now: Instant) -> bool {
@@ -10168,26 +10235,31 @@ const FX_KNOB: f32 = 1.0;
 const FX_KNOBS_W: f32 = 120.0;
 const FX_FADER_W: f32 = 56.0;
 
-fn fx_column(state: &TuxMix) -> Element<'_, Message> {
+fn fx_column(state: &TuxMix, width: f32) -> Element<'_, Message> {
     let scale = state.ui_scale;
+    let full = FX_W * scale;
     let body = column![reverb_panel(state, scale), echo_panel(state, scale)]
         .spacing(theme::SPACE_SM * scale);
     // The two panels together are 840 px tall, short enough for the default
     // window; the scrollable is the safety net for a squeezed one.
-    container(
+    let column = container(
         scrollable(body)
             .direction(scrollable::Direction::Vertical(theme::thin_scrollbar()))
             .style(theme::scrollable)
-            .width(Length::Fixed(FX_W * scale))
+            .width(Length::Fixed(full))
             .height(Length::Fill),
     )
-    .width(Length::Fixed(FX_W * scale))
+    .width(Length::Fixed(full))
     .height(Length::Fill)
     .padding(iced::Padding {
         top: theme::SPACE_MD * scale,
         ..iced::Padding::ZERO
-    })
-    .into()
+    });
+    container(column)
+        .width(Length::Fixed(width.max(0.0)))
+        .height(Length::Fill)
+        .clip(true)
+        .into()
 }
 
 /// One FX panel's title bar: the on switch at the left, then the effect
@@ -11263,7 +11335,7 @@ fn control_room_panel(
         .into()
 }
 
-fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
+fn mixer_view(state: &TuxMix, fx_width: Option<f32>) -> (Element<'_, Message>, bool) {
     // Snapshot once for all three inline-panel width tweens.
     let anim_now = Instant::now();
     // Grouped by pair, TotalMix-style: a linked pair (the default) shows
@@ -11608,18 +11680,30 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
     // Width of the channel strips alone, so the HARDWARE OUTPUTS rule stops
     // at the last channel instead of running into the Control Room.
     let mut strips_width = 0.0f32;
+    let cr_w = control_room_width(state, scale);
+    let natural_out = if state.device.capabilities().protocol_features {
+        out_width + theme::SPACE_MD + cr_w
+    } else {
+        out_width
+    };
+    let natural_width = input_width.max(pb_width).max(natural_out);
+    let side = sidebar_px(state);
+    let main_space = state.window_width - side - 2.0 * theme::SPACE_XL * scale;
+    let fx_open = fx_width.is_some() && state.device.capabilities().fx;
+    let fx_full = FX_W * scale + theme::SPACE_MD * scale;
+    // Let the FX column push the mixer until the mixer reaches its natural
+    // width; past that point it slides over the rightmost part instead of
+    // forcing the rows to scroll.
+    let fx_overlay = fx_open && fx_should_overlay(natural_width, main_space, fx_full);
+    let reserve = if fx_open && !fx_overlay {
+        fx_width.unwrap_or(0.0) + theme::SPACE_MD * scale
+    } else {
+        0.0
+    };
+    let available = main_space - reserve;
     let out_row: Element<'_, Message> = if state.device.capabilities().protocol_features {
-        let side = sidebar_px(state);
-        let fx = if state.show_fx_panel && state.device.capabilities().fx {
-            FX_W * scale + theme::SPACE_MD * scale
-        } else {
-            0.0
-        };
-        let cr_w = control_room_width(state, scale);
         strips_width = out_width;
-        let available = state.window_width - side - fx - 2.0 * theme::SPACE_XL * scale;
-        let natural = out_width + theme::SPACE_MD + cr_w;
-        out_width = natural.max(available);
+        out_width = natural_out.max(available);
         // The strips are the row; the Control Room rides above them, pinned
         // to the right edge, so a slideout widening the panel eats into the
         // channel row instead of pushing it.
@@ -11724,7 +11808,7 @@ fn mixer_view(state: &TuxMix) -> Element<'_, Message> {
     // strips or making the last visible strip look narrower.
     .width(Length::Fixed(input_width.max(pb_width).max(out_width)));
 
-    page(body)
+    (page(body), fx_overlay)
 }
 
 fn matrix_view(state: &TuxMix) -> Element<'_, Message> {
@@ -12082,7 +12166,7 @@ mod tests {
         choose_startup_target,
         frames_ms, converter_frames, is_undoable, new, new_with_device,
         apply_startup_sync, prefs_of, mute_armed, power_sum_output_meters,
-        reorder_pair_volumes,
+        reorder_pair_volumes, fx_should_overlay, fx_slot,
         uc_min_buffer_frames, uc_usb_frames, ucx_min_buffer_frames,
         ucx_urb_frames, ucx_usb_frames, update, zoom, ChannelId, DeviceHandle,
         DeviceKind, DeviceTarget, EditField, MeterAnim, Message, RowMode, View,
@@ -13241,6 +13325,35 @@ mod tests {
         apply_prefs(&mut state, old);
         assert_eq!(state.row_mode, RowMode::Three, "false was only the old default");
         assert!(!serde_json::to_string(&prefs_of(&state)).unwrap().contains("two_row"));
+    }
+
+    #[test]
+    fn the_fx_column_pushes_until_the_mixer_reaches_its_natural_width() {
+        let natural = 900.0;
+        let fx = FX_W + theme::SPACE_MD;
+        assert!(!fx_should_overlay(natural, natural + fx, fx));
+        assert!(fx_should_overlay(natural, natural + fx - 1.0, fx));
+    }
+
+    #[test]
+    fn the_fx_column_uses_the_same_width_tween() {
+        let mut state = new(true, None, None);
+        state.device = DeviceHandle::open_mock_ucx();
+        state.host_scene = Some(state.device.capture_scene());
+        let now = Instant::now();
+        assert_eq!(fx_slot(&state, now), Some(FX_W * state.ui_scale));
+
+        state.show_fx_panel = false;
+        state.fx_anim = Some(strip::CollapseAnim {
+            prev: FX_W,
+            value: 0.0,
+            since: now,
+        });
+        assert!(fx_slot(&state, now).is_some(), "still visible while closing");
+        assert!(
+            fx_slot(&state, now + Duration::from_millis(100)).is_none(),
+            "gone once the tween settles"
+        );
     }
 
     #[test]
