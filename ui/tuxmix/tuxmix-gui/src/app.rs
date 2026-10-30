@@ -1207,6 +1207,17 @@ impl DeviceHandle {
         Ok(())
     }
 
+    pub fn set_talkback(&mut self, on: bool) -> Result<(), tuxmix_core::Error> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.set_talkback(on);
+        }
+        if let DeviceHandle::Mock(_) = self {
+            return Ok(());
+        }
+        Ok(())
+    }
+
     /// Apply the readable/queued device values after the user chooses
     /// "Device -> TuxMix".  Unreadable state stays on the TuxMix scene.
     pub fn restore_readable(
@@ -1786,6 +1797,8 @@ pub enum Message {
     ControlRoomMono(bool),
     /// Control-room Mute FX option (host-side).
     ControlRoomMuteFx(bool),
+    /// Control-room Talkback on/off.
+    TalkbackChanged(bool),
     /// Recalls "Mix `u8`" (1-8) and marks it as the slot `SnapshotStore`
     /// will save into.
     SnapshotClicked(u8),
@@ -2078,6 +2091,8 @@ pub struct TuxMix {
     /// Docked Settings panel (device group, clock source, SPDIF
     /// flags) — same pattern as `show_osc_log`, see `device_panel`.
     pub show_device_panel: bool,
+    /// Talkback is engaged.  Performance state, not part of the scene.
+    pub talkback_on: bool,
     /// The FX column beside the mixer: Reverb and Echo, in TotalMix's own
     /// place for them. Only meaningful when the backend reports `fx`.
     pub show_fx_panel: bool,
@@ -2573,6 +2588,7 @@ pub fn new_with_device(
         osc_log: VecDeque::new(),
         show_osc_log: false,
         show_device_panel: false,
+        talkback_on: false,
         show_fx_panel: true,
         assign: [None; 7],
         assign_menu: AssignMenu::Closed,
@@ -4215,6 +4231,7 @@ fn is_undoable(message: &Message) -> bool {
             | Message::SetRowMode(_)
             | Message::DimToggle
             | Message::Dim(_)
+            | Message::TalkbackChanged(_)
             | Message::MatrixHover(..)
             | Message::PointerPressed
             | Message::FieldFocus(..)
@@ -4376,6 +4393,7 @@ fn needs_protocol_features(message: &Message) -> bool {
             | Message::DynamicsEnabled(..)
             | Message::DynamicsChanged(..)
             | Message::SpeakerB(..)
+            | Message::TalkbackChanged(_)
             | Message::ReverbChanged(..)
             | Message::EchoChanged(..)
             | Message::FxVolume(..)
@@ -4864,6 +4882,12 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
         // (see the 3 s auto-save in `Message::Tick`). The mock never
         // persists (same reasoning as the auto-save).
         Message::SaveNow => {
+            // Talkback is a performance state; never leave the unit talking
+            // back after TuxMix closes.
+            if state.talkback_on {
+                let _ = state.device.set_talkback(false);
+                state.talkback_on = false;
+            }
             // Closing writes the window size, which no resize step does.
             state.prefs_dirty = true;
             flush_prefs(state);
@@ -6174,6 +6198,13 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
             state.device.settings_mut().mute_fx = on;
             notify_osc_bool(state, "/mute_fx", on);
+        }
+        Message::TalkbackChanged(on) => {
+            if let Err(e) = state.device.set_talkback(on) {
+                fail(state, "talkback", &e);
+            }
+            state.talkback_on = on;
+            notify_osc_bool(state, "/talkback", on);
         }
         Message::SnapshotClicked(n) => {
             state.active_snapshot = Some(n as usize);
@@ -7547,12 +7578,14 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
             if state.device.is_uc_model() {
                 if let Some(queue) = state.driver_queue {
                     let (usb, endpoint) = uc_usb_frames(card.rate, queue);
-                    let total = card.buffer + usb + endpoint;
+                    let converter = converter_frames(card.rate);
+                    let total = card.buffer + usb + endpoint + converter;
                     col = col.push(line(
                         format!(
-                            "{:.1} ms USB + {:.1} ms endpoint ≈ {:.1} ms total",
+                            "{:.1} ms USB + {:.1} ms endpoint + {:.1} ms converter ≈ {:.1} ms total",
                             frames_ms(usb, card.rate),
                             frames_ms(endpoint, card.rate),
+                            frames_ms(converter, card.rate),
                             frames_ms(total, card.rate)
                         ),
                         theme::TEXT_SEC,
@@ -7561,12 +7594,14 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
             } else if state.device.is_ucx_model() {
                 if let Some(queue) = state.driver_queue {
                     let (usb, lead) = ucx_usb_frames(card.rate, queue);
-                    let total = card.buffer + usb + lead;
+                    let converter = converter_frames(card.rate);
+                    let total = card.buffer + usb + lead + converter;
                     col = col.push(line(
                         format!(
-                            "{:.1} ms USB + {:.1} ms device lead ≈ {:.1} ms total",
+                            "{:.1} ms USB + {:.1} ms device lead + {:.1} ms converter ≈ {:.1} ms total",
                             frames_ms(usb, card.rate),
                             frames_ms(lead, card.rate),
+                            frames_ms(converter, card.rate),
                             frames_ms(total, card.rate)
                         ),
                         theme::TEXT_SEC,
@@ -7606,12 +7641,14 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
                 .spacing(theme::SPACE_TIGHT * scale);
                 if let Some(queue) = state.driver_queue {
                     let (usb, endpoint) = uc_usb_frames(rate, queue);
-                    let total = buffer + usb + endpoint;
+                    let converter = converter_frames(rate);
+                    let total = buffer + usb + endpoint + converter;
                     col = col.push(line(
                         format!(
-                            "{:.1} ms USB + {:.1} ms endpoint ≈ {:.1} ms total",
+                            "{:.1} ms USB + {:.1} ms endpoint + {:.1} ms converter ≈ {:.1} ms total",
                             frames_ms(usb, rate),
                             frames_ms(endpoint, rate),
+                            frames_ms(converter, rate),
                             frames_ms(total, rate)
                         ),
                         theme::TEXT_SEC,
@@ -7638,12 +7675,14 @@ fn latency_readout(state: &TuxMix, clock: PwClock) -> Element<'_, Message> {
                 .spacing(theme::SPACE_TIGHT * scale);
                 if let Some(queue) = state.driver_queue {
                     let (usb, lead) = ucx_usb_frames(rate, queue);
-                    let total = buffer + usb + lead;
+                    let converter = converter_frames(rate);
+                    let total = buffer + usb + lead + converter;
                     col = col.push(line(
                         format!(
-                            "{:.1} ms USB + {:.1} ms device lead ≈ {:.1} ms total",
+                            "{:.1} ms USB + {:.1} ms device lead + {:.1} ms converter ≈ {:.1} ms total",
                             frames_ms(usb, rate),
                             frames_ms(lead, rate),
+                            frames_ms(converter, rate),
                             frames_ms(total, rate)
                         ),
                         theme::TEXT_SEC,
@@ -7700,10 +7739,15 @@ fn ucx_usb_frames(rate: u32, (urb_frames, urbs): (u32, u32)) -> (u32, u32) {
 
 /// Frames the UCX's ALSA ring needs: `nurbs + 2` URBs of margin.
 fn ucx_min_buffer_frames(rate: u32, (urb_frames, urbs): (u32, u32)) -> u32 {
-    let urb = ucx_urb_frames(rate, urb_frames);
-    let (usb, lead) = ucx_usb_frames(rate, (urb_frames, urbs));
-    let min = ((urbs + 2) * urb).max(usb + lead + 2 * urb);
-    min.div_ceil(urb) * urb
+    (urbs + 2) * ucx_urb_frames(rate, urb_frames)
+}
+
+/// Output converter delay in frames: half of the measured converter
+/// round-trip (25 frames at 1x and 2x, 23 at 4x).  The value is measured on
+/// the UCX and assumed to be the same on the UC.
+fn converter_frames(rate: u32) -> u32 {
+    let round_trip: u32 = if rate > 128_000 { 23 } else { 25 };
+    round_trip.div_ceil(2)
 }
 
 fn frames_ms(frames: u32, rate: u32) -> f32 {
@@ -11196,7 +11240,14 @@ fn control_room_panel(
                     .then_some(Message::ControlRoomMuteFx(!settings.mute_fx)),
             ),
         ]),
-        group(vec![cell("talkback", false, None)]),
+        group(vec![cell(
+            "talkback",
+            state.talkback_on,
+            state
+                .device
+                .is_ucx_model()
+                .then_some(Message::TalkbackChanged(!state.talkback_on)),
+        )]),
     ]
     .spacing(theme::SPACE_MD * scale)
     .padding(theme::SPACE_SM * scale)
@@ -12029,7 +12080,7 @@ mod tests {
         channel_trim, trim_factor,
         apply_prefs, channel_is_muted, channel_is_soloed, choose_startup_kind,
         choose_startup_target,
-        frames_ms, is_undoable, new, new_with_device,
+        frames_ms, converter_frames, is_undoable, new, new_with_device,
         apply_startup_sync, prefs_of, mute_armed, power_sum_output_meters,
         reorder_pair_volumes,
         uc_min_buffer_frames, uc_usb_frames, ucx_min_buffer_frames,
@@ -12086,12 +12137,16 @@ mod tests {
         assert_eq!(ucx_urb_frames(96_000, 48), 96);
         assert_eq!(ucx_usb_frames(48_000, (48, 2)), (144, 60));
         assert_eq!(ucx_usb_frames(96_000, (48, 2)), (288, 60));
-        // The ring must cover the queue, the 60-frame lead and two URBs
-        // of margin, rounded to a whole URB.
-        assert_eq!(ucx_min_buffer_frames(48_000, (48, 2)), 336);
-        assert_eq!(ucx_min_buffer_frames(96_000, (48, 2)), 576);
+        // nurbs + 2 URBs of ring margin.
+        assert_eq!(ucx_min_buffer_frames(48_000, (48, 2)), 192);
+        assert_eq!(ucx_min_buffer_frames(96_000, (48, 2)), 384);
         assert!((frames_ms(144, 48_000) - 3.0).abs() < 0.01);
         assert!((frames_ms(60, 48_000) - 1.25).abs() < 0.01);
+        // Half of the measured 25-frame converter round trip, 23 at 4x.
+        assert_eq!(converter_frames(44_100), 13);
+        assert_eq!(converter_frames(48_000), 13);
+        assert_eq!(converter_frames(96_000), 13);
+        assert_eq!(converter_frames(192_000), 12);
     }
 
     #[test]

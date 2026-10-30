@@ -2215,6 +2215,60 @@ impl Fireface {
         self.ucx_write_options()
     }
 
+    /// Toggle Talkback.  The measured activation set is one 19-word burst;
+    /// the source and dim are host-side settings on the reference app and
+    /// are not part of this write.
+    pub fn set_talkback(&mut self, on: bool) -> Result<(), Error> {
+        if self.is_uc() {
+            return Err(Error::InvalidChannel(
+                "Talkback is not mapped on the UC".into(),
+            ));
+        }
+        const ON: [(u16, u16); 19] = [
+            (0x18E8, 0xEA60),
+            (0x18E8, 0xF9C8),
+            (0x19E9, 0xEA60),
+            (0x19E9, 0x0648),
+            (0x4188, 0x0263),
+            (0x41C9, 0x0263),
+            (0x18EA, 0xEFC0),
+            (0x18EA, 0xF9C8),
+            (0x19EB, 0xEFC0),
+            (0x19EB, 0x0648),
+            (0x418A, 0x066A),
+            (0x41CB, 0x066A),
+            (0x41A0, 0x0F95),
+            (0x41E1, 0x0F95),
+            (0x41A4, 0x0ADB),
+            (0x41E5, 0x0ADB),
+            (0x1803, 0xFD76),
+            (0x1903, 0xFD76),
+            (0x3F9E, 0x0001),
+        ];
+        const OFF: [(u16, u16); 19] = [
+            (0x18E8, 0xF6E0),
+            (0x18E8, 0xF9C8),
+            (0x19E9, 0xF6E0),
+            (0x19E9, 0x0648),
+            (0x4188, 0x17E3),
+            (0x41C9, 0x17E3),
+            (0x18EA, 0xFC40),
+            (0x18EA, 0xF9C8),
+            (0x19EB, 0xFC40),
+            (0x19EB, 0x0648),
+            (0x418A, 0x8804),
+            (0x41CB, 0x8804),
+            (0x41A0, 0x937B),
+            (0x41E1, 0x937B),
+            (0x41A4, 0x8D92),
+            (0x41E5, 0x8D92),
+            (0x1803, 0xFD76),
+            (0x1903, 0xFD76),
+            (0x3F9E, 0x0000),
+        ];
+        self.write_words(if on { &ON } else { &OFF })
+    }
+
     /// Toggle M/S processing on an input pair: `NN05` on both channels and
     /// the M/S send rewrite.  Mono inputs reject it.
     pub fn set_input_ms_proc(&mut self, idx: usize, on: bool) -> Result<(), Error> {
@@ -5516,6 +5570,60 @@ mod tests {
         assert!(w.contains(&Write::Words(vec![(0x41E1, neg)])));
         // Playback coefficients keep their +0x180 mirror.
         assert!(w.contains(&Write::Words(vec![(0x4320, ms)])));
+    }
+
+    #[test]
+    fn ucx_talkback_writes_the_measured_set() {
+        let (mut dev, writes) = open(Model::Ucx);
+        writes.lock().unwrap().clear();
+        dev.set_talkback(true).unwrap();
+        let w = writes.lock().unwrap();
+        assert!(w.contains(&Write::Words(vec![
+            (0x18E8, 0xEA60),
+            (0x18E8, 0xF9C8),
+            (0x19E9, 0xEA60),
+            (0x19E9, 0x0648),
+            (0x4188, 0x0263),
+            (0x41C9, 0x0263),
+            (0x18EA, 0xEFC0),
+            (0x18EA, 0xF9C8),
+            (0x19EB, 0xEFC0),
+            (0x19EB, 0x0648),
+            (0x418A, 0x066A),
+            (0x41CB, 0x066A),
+            (0x41A0, 0x0F95),
+            (0x41E1, 0x0F95),
+            (0x41A4, 0x0ADB),
+            (0x41E5, 0x0ADB),
+            (0x1803, 0xFD76),
+            (0x1903, 0xFD76),
+            (0x3F9E, 0x0001),
+        ])));
+        drop(w);
+        writes.lock().unwrap().clear();
+        dev.set_talkback(false).unwrap();
+        let w = writes.lock().unwrap();
+        assert!(w.contains(&Write::Words(vec![
+            (0x18E8, 0xF6E0),
+            (0x18E8, 0xF9C8),
+            (0x19E9, 0xF6E0),
+            (0x19E9, 0x0648),
+            (0x4188, 0x17E3),
+            (0x41C9, 0x17E3),
+            (0x18EA, 0xFC40),
+            (0x18EA, 0xF9C8),
+            (0x19EB, 0xFC40),
+            (0x19EB, 0x0648),
+            (0x418A, 0x8804),
+            (0x41CB, 0x8804),
+            (0x41A0, 0x937B),
+            (0x41E1, 0x937B),
+            (0x41A4, 0x8D92),
+            (0x41E5, 0x8D92),
+            (0x1803, 0xFD76),
+            (0x1903, 0xFD76),
+            (0x3F9E, 0x0000),
+        ])));
     }
 
     #[test]
