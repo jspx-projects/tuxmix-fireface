@@ -421,37 +421,19 @@ fn tab_button<'a>(
     tip: impl Into<std::borrow::Cow<'a, str>>,
     scale: f32,
 ) -> Element<'a, Message> {
-    if active {
-        // Open: the underlay joins the tab to its panel.  No accent here:
-        // the panel itself shows the on/off state.
-        return tab_button_sized(
-            label,
-            true,
-            false,
-            message,
-            tip,
-            scale,
-            TAB_BTN_W,
-            TAB_BTN_H,
-            theme::TEXT_MD + 2.0,
-        );
-    }
-    // Closed: an active setting keeps its glyph only, in the accent colour.
-    // Slideout tabs are not outlined; the accent text is the whole state
-    // indication while the panel is closed.
-    let glyph = || centered_label(label, (theme::TEXT_MD + 2.0) * scale);
-    let face = button(glyph())
-        .padding([1.0 * scale, 3.0 * scale])
-        .style(theme::panel_tab(false, lit))
-        .on_press(message);
-    hint(
-        container(face)
-            .width(Length::Fixed(TAB_BTN_W * scale))
-            .height(Length::Fixed(TAB_BTN_H * scale))
-            .align_x(iced::Alignment::Center)
-            .align_y(iced::Alignment::Center),
+    // One fixed slot whether the slideout is open or closed.  The panel
+    // grows to the right; the glyph itself never moves.  While open the
+    // panel owns the on/off state, so the tab drops its orange.
+    tab_button_sized(
+        label,
+        active,
+        lit && !active,
+        message,
         tip,
         scale,
+        TAB_BTN_W,
+        TAB_BTN_H,
+        theme::TEXT_MD + 2.0,
     )
 }
 

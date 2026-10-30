@@ -149,6 +149,9 @@ applies to Dynamics, Auto Level, Reverb and Echo.
 - Outlines belong to buttons, not slideout tabs. A slideout tab never draws
   a button outline or a copy of the panel-open marker. Hover brightens the
   glyph but never uses orange.
+- The T, gear, EQ and D tabs keep the same fixed slot with the slideout open
+  or closed. Only the panel grows beside them; the tabs themselves never
+  move.
 - The glyph is centred in the tab before and after opening.
 
 ### 2.5 Control sizing

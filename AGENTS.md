@@ -108,6 +108,8 @@ Authoritative files:
   the slideout is open they carry no orange. Hover brightens the glyph but
   never uses orange. The panel's own on/off control is the single
   indication. The gear only marks the open panel.
+- A channel button that opens a slideout keeps the same fixed slot whether
+  the slideout is open or closed; only the panel grows beside it.
 - A fader, knob, matrix cell or EQ handle captures the pointer for the drag;
   the drag continues outside the control and ends on release.
 - Linking an input pair averages the two channels' pans; splitting sets them
