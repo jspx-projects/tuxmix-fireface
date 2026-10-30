@@ -539,6 +539,10 @@ pub struct Fireface {
 struct WriteBatchGuard {
     transport: Arc<Mutex<Box<dyn ControlTransport>>>,
     batch: Arc<Mutex<Option<Vec<(u16, u16)>>>>,
+    /// Only the guard that opened the batch flushes and clears it.  Nested
+    /// guards (a live control change inside `apply_scene`, or one setter
+    /// calling another) leave the outer batch open.
+    owns: bool,
     active: bool,
 }
 
@@ -559,6 +563,9 @@ impl WriteBatchGuard {
 
     fn finish(mut self) -> Result<(), Error> {
         self.active = false;
+        if !self.owns {
+            return Ok(());
+        }
         let result = self.flush();
         *self.batch.lock().unwrap() = None;
         result
@@ -567,13 +574,39 @@ impl WriteBatchGuard {
 
 impl Drop for WriteBatchGuard {
     fn drop(&mut self) {
-        if !self.active {
+        if !self.active || !self.owns {
             return;
         }
         if let Err(e) = self.flush() {
             log::warn!("Flushing the coalesced IF1 scene failed: {e:?}");
         }
         *self.batch.lock().unwrap() = None;
+    }
+}
+
+/// Close a live-write batch, preferring the caller's own error when the
+/// setter failed part-way through.
+fn finish_live_batch<T>(
+    batch: Option<WriteBatchGuard>,
+    result: Result<T, Error>,
+) -> Result<T, Error> {
+    match batch {
+        Some(batch) => {
+            let flushed = batch.finish();
+            match result {
+                Ok(value) => {
+                    flushed?;
+                    Ok(value)
+                }
+                Err(e) => {
+                    if let Err(flush_err) = flushed {
+                        log::warn!("Flushing a live IF1 change failed: {flush_err:?}");
+                    }
+                    Err(e)
+                }
+            }
+        }
+        None => result,
     }
 }
 
@@ -933,10 +966,16 @@ impl Fireface {
         if self.model != Model::Ucx {
             return None;
         }
-        *self.write_batch.lock().unwrap() = Some(Vec::with_capacity(UCX_WRITE_CHUNK));
+        let mut slot = self.write_batch.lock().unwrap();
+        let owns = slot.is_none();
+        if owns {
+            *slot = Some(Vec::with_capacity(UCX_WRITE_CHUNK));
+        }
+        drop(slot);
         Some(WriteBatchGuard {
             transport: Arc::clone(&self.transport),
             batch: Arc::clone(&self.write_batch),
+            owns,
             active: true,
         })
     }
@@ -2450,6 +2489,7 @@ impl RmeDevice for Fireface {
         output: usize,
         volume: f32,
     ) -> Result<(), Error> {
+        let batch = self.begin_write_batch();
         // Hardware outputs run to +6 dB, like TotalMix's output faders.
         // Crosspoints and software playback stay at or below 0 dB.
         let v = match channel {
@@ -2477,7 +2517,7 @@ impl RmeDevice for Fireface {
             ChannelId::Input(idx) => self.apply_input_volume(idx, output, v)?,
             ChannelId::Playback(idx) => self.apply_playback_volume(idx, output, v)?,
         }
-        Ok(())
+        finish_live_batch(batch, Ok(()))
     }
 
     fn volume(&self, channel: ChannelId, output: usize) -> Result<f32, Error> {
@@ -2578,6 +2618,7 @@ impl RmeDevice for Fireface {
     }
 
     fn set_pan(&mut self, channel: ChannelId, output: usize, pan: i8) -> Result<(), Error> {
+        let batch = self.begin_write_batch();
         let pan = pan.clamp(-100, 100);
         match channel {
             ChannelId::Input(idx) => {
@@ -2681,7 +2722,7 @@ impl RmeDevice for Fireface {
                 }
             }
         }
-        Ok(())
+        finish_live_batch(batch, Ok(()))
     }
 
     fn pan(&self, channel: ChannelId, output: usize) -> Result<i8, Error> {
@@ -3479,6 +3520,7 @@ impl RmeDevice for Fireface {
     }
 
     fn set_channel_width(&mut self, channel: ChannelId, width: f32) -> Result<(), Error> {
+        let batch = self.begin_write_batch();
         if self.is_uc() {
             return Err(Error::InvalidChannel(
                 "Channel width is not mapped on the UC".into(),
@@ -3516,7 +3558,7 @@ impl RmeDevice for Fireface {
                 ))
             }
         }
-        Ok(())
+        finish_live_batch(batch, Ok(()))
     }
 
     fn set_ref_level(&mut self, idx: usize, raw: u16) -> Result<(), Error> {
@@ -4354,6 +4396,20 @@ mod tests {
         }
     }
 
+    /// All IF1 words written so far, flattened across batch boundaries.
+    fn written_words(writes: &Arc<Mutex<Vec<Write>>>) -> Vec<(u16, u16)> {
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|w| match w {
+                Write::Words(v) => Some(v.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     fn open(model: Model) -> (Fireface, Arc<Mutex<Vec<Write>>>) {
         let (t, writes) = MockTransport::new(model);
         let info = t.info.clone();
@@ -4564,9 +4620,9 @@ mod tests {
         let (mut dev, writes) = open(Model::Ucx);
         writes.lock().unwrap().clear();
         dev.set_pan(ChannelId::Output(2), 0, -50).unwrap();
-        let w = writes.lock().unwrap();
-        assert!(w.contains(&Write::Words(vec![(0x1201, (-50i16) as u16)])));
-        assert!(w.contains(&Write::Words(vec![(0x1301, (-50i16) as u16)])));
+        let w = written_words(&writes);
+        assert!(w.contains(&(0x1201, (-50i16) as u16)));
+        assert!(w.contains(&(0x1301, (-50i16) as u16)));
         drop(w);
         assert_eq!(dev.outputs()[2].balance, -50);
         assert_eq!(dev.outputs()[3].balance, -50);
@@ -4585,12 +4641,12 @@ mod tests {
         // At width 0 the pair is an equal-power sum: cos = sin = 0.7071.
         let mixed = ucx::matrix_gain(std::f32::consts::FRAC_1_SQRT_2 as f64);
         {
-            let w = writes.lock().unwrap();
+            let w = written_words(&writes);
             // AN1/2 is pair 1: DSP outputs 0/1, sources 0/1.
-            assert!(w.contains(&Write::Words(vec![(0x4000, mixed)])));
-            assert!(w.contains(&Write::Words(vec![(0x4001, mixed)])));
-            assert!(w.contains(&Write::Words(vec![(0x4040, mixed)])));
-            assert!(w.contains(&Write::Words(vec![(0x4041, mixed)])));
+            assert!(w.contains(&(0x4000, mixed)));
+            assert!(w.contains(&(0x4001, mixed)));
+            assert!(w.contains(&(0x4040, mixed)));
+            assert!(w.contains(&(0x4041, mixed)));
         }
         assert_eq!(dev.inputs()[0].width, 0.0);
         assert_eq!(dev.inputs()[1].width, 0.0);
@@ -4599,10 +4655,10 @@ mod tests {
         writes.lock().unwrap().clear();
         dev.set_channel_width(ChannelId::Input(0), 1.0).unwrap();
         {
-            let w = writes.lock().unwrap();
-            assert!(w.contains(&Write::Words(vec![(0x4000, ucx::matrix_gain(1.0))])));
-            assert!(w.contains(&Write::Words(vec![(0x4001, 0)])));
-            assert!(w.contains(&Write::Words(vec![(0x4040, 0)])));
+            let w = written_words(&writes);
+            assert!(w.contains(&(0x4000, ucx::matrix_gain(1.0))));
+            assert!(w.contains(&(0x4001, 0)));
+            assert!(w.contains(&(0x4040, 0)));
         }
 
         // A routing with no live send is left alone.
@@ -4610,11 +4666,23 @@ mod tests {
         dev.set_volume(ChannelId::Input(1), 1, 0.0).unwrap();
         writes.lock().unwrap().clear();
         dev.set_channel_width(ChannelId::Input(0), 0.5).unwrap();
+        let w = written_words(&writes);
+        assert!(!w
+            .iter()
+            .any(|(reg, _)| (0x4000..=0x4041).contains(reg)));
+    }
+
+    #[test]
+    fn ucx_live_width_change_is_one_burst() {
+        let (mut dev, writes) = open(Model::Ucx);
+        writes.lock().unwrap().clear();
+        dev.set_channel_width(ChannelId::Input(0), 0.0).unwrap();
         let w = writes.lock().unwrap();
-        assert!(!w.iter().any(|x| matches!(
-            x,
-            Write::Words(v) if v.iter().any(|(reg, _)| (0x4000..=0x4041).contains(reg))
-        )));
+        assert_eq!(w.len(), 1, "one USB burst for the whole width update");
+        match &w[0] {
+            Write::Words(words) => assert!(words.len() > 8),
+            other => panic!("expected IF1 words, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4644,23 +4712,23 @@ mod tests {
         dev.set_volume(ChannelId::Input(0), 1, 1.0).unwrap();
         let trimmed = ucx::matrix_gain(10f64.powf(-6.0 / 20.0));
         {
-            let w = writes.lock().unwrap();
-            assert!(w.contains(&Write::Words(vec![(0x4000, trimmed)])));
+            let w = written_words(&writes);
+            assert!(w.contains(&(0x4000, trimmed)));
         }
 
         writes.lock().unwrap().clear();
         dev.set_no_trim(2, true).unwrap();
         {
-            let w = writes.lock().unwrap();
-            assert!(w.contains(&Write::Words(vec![(0x4000, ucx::matrix_gain(1.0))])));
+            let w = written_words(&writes);
+            assert!(w.contains(&(0x4000, ucx::matrix_gain(1.0))));
         }
         assert!(dev.outputs()[2].no_trim);
 
         writes.lock().unwrap().clear();
         dev.set_no_trim(2, false).unwrap();
         {
-            let w = writes.lock().unwrap();
-            assert!(w.contains(&Write::Words(vec![(0x4000, trimmed)])));
+            let w = written_words(&writes);
+            assert!(w.contains(&(0x4000, trimmed)));
         }
         assert!(!dev.outputs()[2].no_trim);
     }

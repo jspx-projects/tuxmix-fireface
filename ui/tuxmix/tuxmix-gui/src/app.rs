@@ -1833,8 +1833,9 @@ pub enum Message {
     EngineQuantum(u32),
     /// Periodic re-read of the PipeWire clock (another app may change it).
     EnginePoll,
-    /// The graph clock, and the card's own open stream (`None` = idle).
-    EngineRead(Option<PwClock>, Option<CardStream>),
+    /// The graph clock, the card's own open stream (`None` = idle), and
+    /// whether a Fireface playback sink is running.
+    EngineRead(Option<PwClock>, Option<CardStream>, bool),
 }
 
 /// The two inline text fields a strip can open.
@@ -2284,6 +2285,7 @@ pub enum UndoGesture {
     Echo,
     Pitch,
     Width,
+    ChannelWidth(ChannelId),
 }
 
 /// See `UndoGesture`. Long enough to bridge the gaps inside one wheel spin
@@ -2313,6 +2315,7 @@ fn undo_gesture(message: &Message) -> Option<UndoGesture> {
         Message::FxVolume(FxBus::Echo, _) => UndoGesture::Echo,
         Message::PitchChanged(_) => UndoGesture::Pitch,
         Message::WidthChanged(_) => UndoGesture::Width,
+        Message::ChannelWidthChanged(cid, _) => UndoGesture::ChannelWidth(*cid),
         _ => return None,
     })
 }
@@ -6021,19 +6024,30 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             }
         }
         Message::EnginePoll => {
-            // Off the UI thread: a process spawn is ~10 ms.  Capture the
-            // card id before the async block; the device handle itself
-            // cannot cross the task boundary.
+            // Off the UI thread: both the graph read and the `pactl`
+            // probe spawn processes (~10 ms).  Capture what the async
+            // block needs before it; the device handle itself cannot
+            // cross the task boundary.
             let card_id = state.device.card_id();
+            let follows = state.device.rate_follows_sound_server();
+            let is_mock = state.device.is_mock();
             return Task::perform(
-                async move { (pw_clock::read(), pw_clock::card_stream(card_id)) },
-                |(clock, stream)| Message::EngineRead(clock, stream),
+                async move {
+                    let sink_running =
+                        follows && !is_mock && pw_clock::fireface_sink_running();
+                    (
+                        pw_clock::read(),
+                        pw_clock::card_stream(card_id),
+                        sink_running,
+                    )
+                },
+                |(clock, stream, sink_running)| {
+                    Message::EngineRead(clock, stream, sink_running)
+                },
             );
         }
-        Message::EngineRead(clock, stream) => {
+        Message::EngineRead(clock, stream, sink_running) => {
             if state.device.rate_follows_sound_server() {
-                let sink_running =
-                    !state.device.is_mock() && pw_clock::fireface_sink_running();
                 let sink_started = sink_running && !state.last_sink_running;
                 let new_rate = stream.map(|s| s.rate);
                 let model_rate = state.device.settings().sample_rate;
@@ -13316,6 +13330,19 @@ mod tests {
     }
 
     #[test]
+    fn a_channel_width_turn_is_one_undo_step() {
+        let mut state = new(true, None, None);
+        let cid = ChannelId::Input(4);
+        let before = state.device.inputs()[4].width;
+        for width in [0.9, 0.8, 0.7, 0.6] {
+            let _ = update(&mut state, Message::ChannelWidthChanged(cid, width));
+        }
+        assert_eq!(state.undo_stack.len(), 1, "one step for the whole gesture");
+        let _ = update(&mut state, Message::Undo);
+        assert!((state.device.inputs()[4].width - before).abs() < 1e-6);
+    }
+
+    #[test]
     fn letting_go_ends_the_gesture() {
         let mut state = new(true, None, None);
         let cid = ChannelId::Input(4);
@@ -13490,7 +13517,7 @@ mod tests {
         // Background polls do not count as activity.
         state.last_activity = Instant::now() - Duration::from_secs(10);
         let _ = update(&mut state, Message::EnginePoll);
-        let _ = update(&mut state, Message::EngineRead(None, None));
+        let _ = update(&mut state, Message::EngineRead(None, None, false));
         assert_eq!(tick_interval(&state), TICK_IDLE);
 
         // A pending window resize and a running collapse animation keep it fast.
