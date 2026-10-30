@@ -394,7 +394,9 @@ The column opens and closes with the same 90 ms width tween as the strip
 panels. It first reduces the mixer area until the widest row reaches its
 natural width. If that still leaves no room for the column, it slides over
 the rightmost part of the rows instead of forcing them to scroll further.
-Widening the window moves it back into the layout; closing FX removes it.
+The overlap grows continuously as the window narrows; an open slideout keeps
+its position and is covered from the right. Widening the window moves the
+column back into the layout; closing FX removes it.
 
 | Band | Height |
 |---|---:|

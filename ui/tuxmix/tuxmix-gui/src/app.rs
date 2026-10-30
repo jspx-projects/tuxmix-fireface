@@ -8593,9 +8593,12 @@ fn fx_slot(state: &TuxMix, now: Instant) -> Option<f32> {
     }
 }
 
-/// Whether the FX column has to overlay the mixer instead of pushing it.
-fn fx_should_overlay(natural_width: f32, main_space: f32, fx_full: f32) -> bool {
-    main_space < natural_width + fx_full
+/// How much of the main area the FX column reserves. It grows to the
+/// column's full extent while the mixer has slack, stays pinned at the
+/// mixer's natural width while the column slides over it, and reaches zero
+/// once the mixer itself has to scroll.
+fn fx_reserve(main_space: f32, natural_width: f32, fx_extent: f32) -> f32 {
+    (main_space - natural_width).clamp(0.0, fx_extent)
 }
 
 /// Route is rendered as a Stack overlay, so its row needs the strip's
@@ -11689,18 +11692,20 @@ fn mixer_view(state: &TuxMix, fx_width: Option<f32>) -> (Element<'_, Message>, b
     let natural_width = input_width.max(pb_width).max(natural_out);
     let side = sidebar_px(state);
     let main_space = state.window_width - side - 2.0 * theme::SPACE_XL * scale;
-    let fx_open = fx_width.is_some() && state.device.capabilities().fx;
-    let fx_full = FX_W * scale + theme::SPACE_MD * scale;
-    // Let the FX column push the mixer until the mixer reaches its natural
-    // width; past that point it slides over the rightmost part instead of
-    // forcing the rows to scroll.
-    let fx_overlay = fx_open && fx_should_overlay(natural_width, main_space, fx_full);
-    let reserve = if fx_open && !fx_overlay {
-        fx_width.unwrap_or(0.0) + theme::SPACE_MD * scale
+    let fx_panel = fx_width.unwrap_or(0.0);
+    let fx_open = fx_width.is_some() && state.device.capabilities().fx && fx_panel > 0.5;
+    let fx_extent = fx_panel + theme::SPACE_MD * scale;
+    // The reserve shrinks continuously once the mixer reaches its natural
+    // width. The Control Room therefore keeps its position while the FX
+    // column starts covering it, instead of jumping to the right when the
+    // layout switches from a sibling column to an overlay.
+    let reserve = if fx_open {
+        fx_reserve(main_space, natural_width, fx_extent)
     } else {
         0.0
     };
     let available = main_space - reserve;
+    let fx_overlay = fx_open && reserve < fx_extent;
     let out_row: Element<'_, Message> = if state.device.capabilities().protocol_features {
         strips_width = out_width;
         out_width = natural_out.max(available);
@@ -12166,7 +12171,7 @@ mod tests {
         choose_startup_target,
         frames_ms, converter_frames, is_undoable, new, new_with_device,
         apply_startup_sync, prefs_of, mute_armed, power_sum_output_meters,
-        reorder_pair_volumes, fx_should_overlay, fx_slot,
+        reorder_pair_volumes, fx_reserve, fx_slot,
         uc_min_buffer_frames, uc_usb_frames, ucx_min_buffer_frames,
         ucx_urb_frames, ucx_usb_frames, update, zoom, ChannelId, DeviceHandle,
         DeviceKind, DeviceTarget, EditField, MeterAnim, Message, RowMode, View,
@@ -13331,8 +13336,11 @@ mod tests {
     fn the_fx_column_pushes_until_the_mixer_reaches_its_natural_width() {
         let natural = 900.0;
         let fx = FX_W + theme::SPACE_MD;
-        assert!(!fx_should_overlay(natural, natural + fx, fx));
-        assert!(fx_should_overlay(natural, natural + fx - 1.0, fx));
+        assert_eq!(fx_reserve(natural + fx + 100.0, natural, fx), fx);
+        assert_eq!(fx_reserve(natural + fx, natural, fx), fx);
+        assert_eq!(fx_reserve(natural + fx - 50.0, natural, fx), fx - 50.0);
+        assert_eq!(fx_reserve(natural, natural, fx), 0.0);
+        assert_eq!(fx_reserve(natural - 50.0, natural, fx), 0.0);
     }
 
     #[test]
