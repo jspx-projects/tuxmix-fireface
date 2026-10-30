@@ -673,6 +673,14 @@ The UCX options word, reference levels and 48 V/Inst/Level switches are
 unit-owned: not written at connect, not read back. Only the last value written
 from TuxMix is kept in the scene for display.
 
+### 13.2 Undo and Redo
+
+Undo stores the scene before a mix-changing command. A continuous gesture on
+one control is one step: a fader, pan, width or EQ-band drag coalesces until
+the control is released, another control is used, or the edit pauses. Undo
+restores the previous scene; Redo reapplies the undone scene. Device settings
+and layout preferences are not captured by undo.
+
 ## 14. Control invariants
 
 - Every channel control has a defined effect in the mixer model and its device

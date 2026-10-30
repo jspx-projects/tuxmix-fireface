@@ -84,6 +84,10 @@ backend waits 5 ms after a burst of up to 8 words and 16 ms after a larger
 burst. A full scene is sent as 63-word bursts; closer spacing overflows the
 device receive FIFO and the bulk transfer times out.
 
+Live width, pan and volume changes use the same queue: one control event is
+sent as one or more bursts rather than one transfer per register. A live
+change made while a scene is being applied joins the scene batch.
+
 ### 2.5 MIDI
 
 The unit exposes a class-compliant USB-MIDI 1.0 streaming interface on IF2 with
