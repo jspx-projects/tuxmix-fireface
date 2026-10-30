@@ -858,10 +858,6 @@ pub trait RmeDevice {
 
         if let Some(saved) = saved {
             if linked {
-                for output in 0..self.output_pair_count() {
-                    let volume = saved.volumes.get(output).copied().unwrap_or(1.0);
-                    self.set_volume(ChannelId::Input(right), output, volume)?;
-                }
                 self.set_mute(ChannelId::Input(right), saved.mute)?;
                 self.set_solo(ChannelId::Input(right), saved.solo)?;
                 if saved.channel_type == ChannelType::Mic {
@@ -910,8 +906,20 @@ pub trait RmeDevice {
     ) -> Result<(), Error> {
         let (l, r) = (pair * 2, pair * 2 + 1);
         if self.input_pair_linked(pair) {
-            self.set_volume(ChannelId::Input(l), output, volume)?;
-            self.set_volume(ChannelId::Input(r), output, volume)?;
+            let target = volume.clamp(0.0, 1.0);
+            let left = self.volume(ChannelId::Input(l), output)?;
+            let right = self.volume(ChannelId::Input(r), output)?;
+            let peak = left.max(right);
+            let (left, right) = if peak > 0.0 {
+                // The linked fader is a relative dB trim: scale both
+                // channels by the same factor so their difference stays.
+                let gain = target / peak;
+                (left * gain, right * gain)
+            } else {
+                (target, target)
+            };
+            self.set_volume(ChannelId::Input(l), output, left)?;
+            self.set_volume(ChannelId::Input(r), output, right)?;
         } else {
             self.set_volume(ChannelId::Input(if which == 0 { l } else { r }), output, volume)?;
         }

@@ -114,6 +114,8 @@ Authoritative files:
   the drag continues outside the control and ends on release.
 - Linking an input pair restores the pan captured when it was split; the
   split itself sets the two channels hard left and hard right.
+- The linked input fader displays the louder channel and shifts both channels
+  by the same dB offset; linking never flattens or copies the two volumes.
 - Splitting an output pair converts its pair level and balance into two
   channel volumes; linking recomputes both from those volumes. The round
   trip must preserve the original values. The balance knob is linked-only.

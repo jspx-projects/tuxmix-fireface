@@ -8220,6 +8220,28 @@ fn strip_params<'a>(
         ChannelId::Input(i) => {
             let ch = &state.device.inputs()[i];
             let has_48v = caps.input_phantom && ch.channel_type == ChannelType::Mic;
+            let linked = state.device.input_pair_linked(i / 2);
+            let volume = if linked {
+                let left = i & !1;
+                let right = left + 1;
+                let left_volume = state
+                    .device
+                    .inputs()
+                    .get(left)
+                    .and_then(|c| c.volumes.get(output_idx))
+                    .copied()
+                    .unwrap_or(0.0);
+                let right_volume = state
+                    .device
+                    .inputs()
+                    .get(right)
+                    .and_then(|c| c.volumes.get(output_idx))
+                    .copied()
+                    .unwrap_or(0.0);
+                left_volume.max(right_volume)
+            } else {
+                ch.volumes[output_idx]
+            };
             strip::StripParams {
                 name: ch.name.clone(),
                 // RME TotalMix identifies the row and the channel name; a
@@ -8230,7 +8252,7 @@ fn strip_params<'a>(
                 // Input strips always use the lighter active-source
                 // surface; the current output strip uses the same tone.
                 active_surface: true,
-                vol: ch.volumes[output_idx] * trim_factor(ch.trim),
+                vol: volume * trim_factor(ch.trim),
                 pan: ch.pans[output_idx],
                 meter: state
                     .input_meters
@@ -13046,6 +13068,25 @@ mod tests {
 
         assert_eq!(state.device.pan(ChannelId::Input(0), out).unwrap(), -30);
         assert_eq!(state.device.pan(ChannelId::Input(1), out).unwrap(), -30);
+    }
+
+    #[test]
+    fn linked_input_strip_shows_the_louder_channel() {
+        let mut state = new(true, None, None);
+        let out = state.sel_out;
+        state.device.set_input_pair_linked(0, false).unwrap();
+        state
+            .device
+            .set_input_volume(0, 0, out, 0.1)
+            .unwrap();
+        state
+            .device
+            .set_input_volume(0, 1, out, 0.5)
+            .unwrap();
+        state.device.set_input_pair_linked(0, true).unwrap();
+
+        let params = super::strip_params(&state, ChannelId::Input(0), out);
+        assert!((params.vol - 0.5).abs() < 1e-6);
     }
 
     #[test]

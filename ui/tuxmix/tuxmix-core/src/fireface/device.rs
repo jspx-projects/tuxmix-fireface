@@ -3043,10 +3043,6 @@ impl RmeDevice for Fireface {
         }
         if let Some(saved) = saved {
             if linked {
-                for output in 0..self.output_pair_count() {
-                    let volume = saved.volumes.get(output).copied().unwrap_or(1.0);
-                    self.set_volume(ChannelId::Input(right), output, volume)?;
-                }
                 self.set_mute(ChannelId::Input(right), saved.mute)?;
                 self.set_solo(ChannelId::Input(right), saved.solo)?;
                 if saved.channel_type == ChannelType::Mic {
@@ -5139,6 +5135,21 @@ mod tests {
         assert!(w.contains(&Write::Words(vec![(0x0302, 0)])));
         assert!(w.contains(&Write::Words(vec![(0x1204, 0)])));
         assert!(w.contains(&Write::Words(vec![(0x1304, 0)])));
+    }
+
+    #[test]
+    fn ucx_linked_input_fader_preserves_the_channel_difference() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        dev.set_input_pair_linked(0, false).unwrap();
+        dev.set_input_volume(0, 0, 0, 0.1).unwrap();
+        dev.set_input_volume(0, 1, 0, 0.5).unwrap();
+        dev.set_input_pair_linked(0, true).unwrap();
+        assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.1).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.5).abs() < 1e-6);
+
+        dev.set_input_volume(0, 0, 0, 0.25).unwrap();
+        assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.05).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.25).abs() < 1e-6);
     }
 
     #[test]

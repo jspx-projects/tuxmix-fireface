@@ -1317,8 +1317,23 @@ mod tests {
         dev.set_input_pair_linked(0, true).unwrap();
         assert_eq!(dev.pan(ChannelId::Input(0), 0).unwrap(), -30);
         assert_eq!(dev.pan(ChannelId::Input(1), 0).unwrap(), -30);
-        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.3).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.3).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.7).abs() < 1e-6);
         assert!(dev.mute(ChannelId::Input(1)).unwrap());
+    }
+
+    #[test]
+    fn test_linked_input_fader_applies_the_same_db_delta() {
+        let mut dev = MockBabyfacePro::open().unwrap();
+        dev.set_input_pair_linked(0, false).unwrap();
+        dev.set_input_volume(0, 0, 0, 0.1).unwrap();
+        dev.set_input_volume(0, 1, 0, 0.5).unwrap();
+        dev.set_input_pair_linked(0, true).unwrap();
+
+        // Peak is 0.5; moving the linked fader to 0.25 scales both by 0.5.
+        dev.set_input_volume(0, 0, 0, 0.25).unwrap();
+        assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.05).abs() < 1e-6);
+        assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.25).abs() < 1e-6);
     }
 
     #[test]
