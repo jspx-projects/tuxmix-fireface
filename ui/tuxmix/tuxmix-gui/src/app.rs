@@ -972,6 +972,15 @@ impl DeviceHandle {
         None
     }
 
+    /// UCX FX bus overload flags: `[send, return]`.
+    pub fn fx_overload(&self) -> Option<[bool; 2]> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.fx_overload();
+        }
+        None
+    }
+
     /// Device-supplied hardware-output meters, already mapped to TuxMix's
     /// internal Phones-first output order.  `None` means the backend has
     /// no output meter stream and the GUI must compute them host-side.
@@ -1926,6 +1935,8 @@ pub struct TuxMix {
     pub output_meters: Vec<MeterAnim>,
     /// UCX FX bus meters: send and return.
     pub fx_meters: [MeterAnim; 2],
+    /// UCX FX bus overload indicators: send and return.
+    pub fx_overload: [bool; 2],
     /// Strips the user has collapsed to save horizontal space — presence in
     /// the set means collapsed. This is the *target* state; the strip may
     /// still be mid-transition, tracked separately in `collapse_anim`.
@@ -2549,6 +2560,7 @@ pub fn new_with_device(
         playback_tap_channels: 0,
         output_meters: vec![MeterAnim::new(); n_outputs],
         fx_meters: [MeterAnim::new(), MeterAnim::new()],
+        fx_overload: [false, false],
         collapsed: HashSet::new(),
         collapse_anim: HashMap::new(),
         flyout_open: HashSet::new(),
@@ -4810,6 +4822,7 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             for (i, m) in state.fx_meters.iter_mut().enumerate() {
                 m.step_elapsed(fx_levels[i]);
             }
+            state.fx_overload = state.device.fx_overload().unwrap_or([false, false]);
             // A live signal keeps the UI on the fast tick (and the fade
             // after it, `ACTIVE_FOR`); silence lets it go idle.
             const LIVE: f32 = 0.002;
@@ -6420,6 +6433,7 @@ fn switch_device(state: &mut TuxMix, target: DeviceTarget) -> Result<(), String>
     state.playback_meters = vec![MeterAnim::new(); state.device.playbacks().len()];
     state.output_meters = vec![MeterAnim::new(); state.device.outputs().len()];
     state.fx_meters = [MeterAnim::new(), MeterAnim::new()];
+    state.fx_overload = [false, false];
     state.playback_tap = if state.device.is_mock() || state.device.has_device_playback_meters() {
         pw_meter::PlaybackTap::disabled()
     } else {
@@ -10314,7 +10328,7 @@ const FX_REV_CONTROLS_H: f32 = 247.5;
 /// until those registers are known (`docs/work/UCX-OPEN-ITEMS.md`).
 const FX_REV_TAIL_H: f32 = 98.0;
 /// Echo controls: four rows plus the high-cut picker.
-const FX_ECHO_CONTROLS_H: f32 = 343.0;
+const FX_ECHO_CONTROLS_H: f32 = 360.0;
 /// Row pitch: 70 px at RME scale. Each row owns a whole pitch, so the
 /// rhythm holds whatever the label's font metrics turn out to be.
 const FX_ROW_H: f32 = 78.75;
@@ -10384,6 +10398,62 @@ fn fx_header_row(
 
 /// The `type` row: a caption at the left edge, then the algorithm pick list
 /// filling the rest of the row.
+fn fx_centered_pick(
+    options: Vec<String>,
+    selected: String,
+    on_select: impl Fn(String) -> Message + 'static,
+    height: f32,
+    scale: f32,
+) -> Element<'static, Message> {
+    let selected_label = selected.clone();
+    let pick = pick_list(options, Some(selected), on_select)
+        .style(theme::pick_list_no_text)
+        .menu_style(theme::menu)
+        .padding(iced::Padding {
+            top: 1.0 * scale,
+            right: 10.0 * scale,
+            bottom: 1.0 * scale,
+            left: 1.0 * scale,
+        })
+        .text_size(theme::TEXT_XS * scale)
+        .text_line_height(iced::widget::text::LineHeight::Absolute(
+            iced::Pixels((height - 2.0) * scale),
+        ))
+        .width(Length::Fill)
+        .handle(iced::widget::pick_list::Handle::None);
+    let label = container(
+        text(selected_label)
+            .size(theme::TEXT_XS * scale)
+            .color(theme::TEXT_PRIMARY),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(iced::Alignment::Center)
+    .align_y(iced::Alignment::Center)
+    .clip(true)
+    .padding(iced::Padding {
+        right: 10.0 * scale,
+        left: 1.0 * scale,
+        ..iced::Padding::ZERO
+    });
+    let arrow = container(
+        text("▾")
+            .size(theme::TEXT_XS * scale)
+            .color(theme::TEXT_SEC),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(iced::Alignment::End)
+    .align_y(iced::Alignment::Center)
+    .padding(iced::Padding {
+        right: theme::SPACE_SM * scale,
+        ..iced::Padding::ZERO
+    });
+    iced::widget::stack![pick, label, arrow]
+        .height(Length::Fixed(height * scale))
+        .into()
+}
+
 fn fx_type_row(picker: Element<'static, Message>, scale: f32) -> Element<'static, Message> {
     container(
         row![
@@ -10480,32 +10550,48 @@ fn fx_delay_cell(
         modifiers,
         scale,
     );
-    container(
-        row![
-            container(knob).width(Length::Fill),
-            container(
-                text(format!("{bpm:.0}"))
-                    .size(theme::TEXT_XS * scale)
-                    .color(theme::TEXT_SEC)
-            )
-            .width(Length::Fixed(26.0 * scale))
-            .align_y(iced::Alignment::Center),
-        ]
-        .height(Length::Fixed(FX_ROW_H * scale)),
-    )
+    iced::widget::stack![
+        container(knob).width(Length::Fill),
+        container(
+            text(format!("{bpm:.0}"))
+                .size(theme::TEXT_XS * scale)
+                .color(theme::TEXT_SEC)
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::Alignment::End)
+        .align_y(iced::Alignment::End)
+        .padding(iced::Padding {
+            right: theme::SPACE_TIGHT * scale,
+            bottom: 18.0 * scale,
+            ..iced::Padding::ZERO
+        }),
+    ]
+    .height(Length::Fixed(FX_ROW_H * scale))
     .width(Length::Fill)
     .into()
 }
 
 fn fx_meter_column(state: &TuxMix, scale: f32) -> Element<'static, Message> {
     let bar_h = 230.0 * scale;
-    let bar_w = 10.0 * scale;
-    let bar = |i: usize| {
-        progress_bar(0.0..=1.0, state.fx_meters[i].frame().value)
+    let bar_w = 14.0 * scale;
+    let bar = |i: usize| -> Element<'static, Message> {
+        let meter = progress_bar(0.0..=1.0, state.fx_meters[i].frame().value)
             .vertical()
             .length(Length::Fixed(bar_h))
             .girth(Length::Fixed(bar_w))
-            .style(theme::fx_meter)
+            .style(theme::fx_meter);
+        if state.fx_overload[i] {
+            iced::widget::stack![
+                meter,
+                container(iced::widget::Space::new().height(Length::Fixed(4.0 * scale)))
+                    .width(Length::Fixed(bar_w))
+                    .style(theme::overload)
+            ]
+            .into()
+        } else {
+            meter.into()
+        }
     };
     let bars = row![bar(0), bar(1)]
         .spacing(theme::SPACE_SM * scale)
@@ -10930,9 +11016,9 @@ fn echo_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
         _ => "Pong Echo",
     };
     let type_row = fx_type_row(
-        pick_list(
+        fx_centered_pick(
             ECHO_TYPES.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
-            Some(echo_type.to_string()),
+            echo_type.to_string(),
             move |name| {
                 let kind = ECHO_TYPES
                     .iter()
@@ -10940,13 +11026,9 @@ fn echo_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
                     .unwrap_or(0) as u8;
                 Message::EchoChanged(Echo { kind, ..e })
             },
-        )
-        .style(theme::pick_list)
-        .menu_style(theme::menu)
-        .padding([theme::SPACE_TIGHT * scale, theme::SPACE_MD * scale])
-        .text_size(theme::TEXT_XS * scale)
-        .width(Length::Fill)
-        .into(),
+            24.0,
+            scale,
+        ),
         scale,
     );
 
@@ -10989,33 +11071,9 @@ fn echo_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
         .get(e.high_cut as usize)
         .copied()
         .unwrap_or("Off");
-    let high_cut = container(
-        pick_list(
-            ECHO_HIGH_CUTS
-                .iter()
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>(),
-            Some(high_cut_name.to_string()),
-            move |value: String| Message::EchoChanged(Echo {
-                high_cut: ECHO_HIGH_CUTS
-                    .iter()
-                    .position(|name| *name == value)
-                    .unwrap_or(0) as u8,
-                ..e
-            }),
-        )
-        .style(theme::pick_list)
-        .menu_style(theme::menu)
-        .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
-        .text_size(theme::TEXT_XS * scale)
-        .width(Length::Fill),
-    )
-    .height(Length::Fixed(24.0 * scale))
-    .padding([0.0, theme::SPACE_SM * scale])
-    .width(Length::Fill);
-    let volume = fx_row_one(
+    let row4 = fx_row_one(
         fx_knob_cell(
-            "volume",
+            "vol.",
             e.volume_db,
             (-30.0, 6.0),
             format!("{:+.1}", e.volume_db),
@@ -11030,32 +11088,55 @@ fn echo_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
         ),
         scale,
     );
-    let volume_column = column![
-        iced::widget::Space::new().height(Length::Fill),
-        volume,
-        high_cut,
-        text("high cut")
-            .size(theme::TEXT_XS * scale)
-            .color(theme::TEXT_SEC)
-            .width(Length::Fill)
-            .center(),
-    ]
-    .spacing(0.0)
-    .height(Length::Fixed(FX_ECHO_CONTROLS_H * scale))
-    .width(Length::Fill);
+    let high_cut = container(
+        row![
+            text("HC")
+                .size(theme::TEXT_XS * scale)
+                .color(theme::TEXT_SEC),
+            container(fx_centered_pick(
+                ECHO_HIGH_CUTS
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>(),
+                high_cut_name.to_string(),
+                move |value: String| Message::EchoChanged(Echo {
+                    high_cut: ECHO_HIGH_CUTS
+                        .iter()
+                        .position(|name| *name == value)
+                        .unwrap_or(0) as u8,
+                    ..e
+                }),
+                22.0,
+                scale,
+            ))
+            .width(Length::Fixed(54.0 * scale)),
+        ]
+        .spacing(theme::SPACE_TIGHT * scale)
+        .align_y(iced::Alignment::Center),
+    )
+    .height(Length::Fixed(24.0 * scale))
+    .width(Length::Fill)
+    .align_x(iced::Alignment::Center)
+    .padding([0.0, theme::SPACE_SM * scale]);
 
-    let rows = column![row1, row2, row3]
+    let knobs = column![row1, row2, row3, row4, high_cut]
         .spacing(0.0)
-        .width(Length::Fill);
-    let controls = fx_controls(
-        rows.into(),
-        volume_column.into(),
-        Some(fx_meter_column(state, scale)),
-        80.0,
-        FX_ECHO_CONTROLS_H,
-        4.0,
-        scale,
-    );
+        .width(Length::Fixed(100.0 * scale));
+    let meters = container(fx_meter_column(state, scale))
+        .width(Length::Fixed(60.0 * scale));
+    let controls = container(
+        row![knobs, meters]
+            .spacing(theme::SPACE_SM * scale)
+            .padding(iced::Padding {
+                top: 4.0 * scale,
+                left: theme::SPACE_SM * scale,
+                right: 0.0,
+                bottom: 0.0,
+            }),
+    )
+    .height(Length::Fixed(FX_ECHO_CONTROLS_H * scale))
+    .width(Length::Fill)
+    .style(theme::fx_controls);
 
     container(column![header, type_row, controls].spacing(0.0).width(Length::Fill))
         .width(Length::Fixed(FX_W * scale))
@@ -13525,7 +13606,7 @@ mod tests {
         assert!((FX_TYPE_H - 28.0 * 1.125).abs() < 0.01);
         assert!((FX_REV_CONTROLS_H - 220.0 * 1.125).abs() < 0.01);
         assert!((FX_REV_TAIL_H - 87.0 * 1.125).abs() < 0.2);
-        assert!((FX_ECHO_CONTROLS_H - 305.0 * 1.125).abs() < 0.2);
+        assert!((FX_ECHO_CONTROLS_H - 320.0 * 1.125).abs() < 0.2);
         // 70 px knob pitch.
         assert!((FX_ROW_H - 70.0 * 1.125).abs() < 0.01);
     }

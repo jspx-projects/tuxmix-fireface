@@ -450,6 +450,12 @@ Other types leave the band empty.
 
 ### 6.2 Echo
 
+The four knobs share one vertical centre line. The delay knob shows the
+delay time inside it; the BPM readout sits at its underside/right without
+moving the knob. `HC` sits left of a compact high-cut box, and the box value
+is centred. The FX `in`/`out` meters sit to the right of the knob column and
+show an overload segment at the top when the peak reaches full scale.
+
 | Control | Range |
 |---|---|
 | On | on/off |

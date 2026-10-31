@@ -212,6 +212,8 @@ struct MeterBank {
     post_fader: [u64; 18],
     fx_in: u64,
     fx_out: u64,
+    fx_peak_in: u32,
+    fx_peak_out: u32,
 }
 
 impl MeterBank {
@@ -224,11 +226,15 @@ impl MeterBank {
                 self.pre_fader.copy_from_slice(&p.power[..18]);
                 self.fx_in = p.fx_power[0];
                 self.fx_out = p.fx_power[1];
+                self.fx_peak_in = p.fx_peak[0];
+                self.fx_peak_out = p.fx_peak[1];
             }
             MeterKind::OutputsPostFader => {
                 self.post_fader.copy_from_slice(&p.power[..18]);
                 self.fx_in = p.fx_power[0];
                 self.fx_out = p.fx_power[1];
+                self.fx_peak_in = p.fx_peak[0];
+                self.fx_peak_out = p.fx_peak[1];
             }
         }
     }
@@ -2378,6 +2384,17 @@ impl Fireface {
     pub fn fx_meters(&self) -> Option<[f32; 2]> {
         match self.model {
             Model::Ucx => Some([self.meters.fx(false), self.meters.fx(true)]),
+            Model::Uc => None,
+        }
+    }
+
+    /// FX bus overload flags: `[send, return]`.
+    pub fn fx_overload(&self) -> Option<[bool; 2]> {
+        match self.model {
+            Model::Ucx => Some([
+                self.meters.fx_peak_in >= 1 << 27,
+                self.meters.fx_peak_out >= 1 << 27,
+            ]),
             Model::Uc => None,
         }
     }

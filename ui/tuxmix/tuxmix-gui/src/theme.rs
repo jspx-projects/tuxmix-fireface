@@ -222,6 +222,13 @@ pub fn fx_controls(_theme: &iced::Theme) -> container::Style {
     }
 }
 
+pub fn overload(_theme: &iced::Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(MRED)),
+        ..container::Style::default()
+    }
+}
+
 pub fn fx_meter(_theme: &iced::Theme) -> progress_bar::Style {
     progress_bar::Style {
         background: Background::Color(BG_DEEP),

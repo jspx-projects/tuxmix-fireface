@@ -697,7 +697,9 @@ The meter endpoint is IF1 IN `0x85`. A packet is 244 bytes.
 | 240..243 | tag |
 
 The two FX values are zero on input and playback pages. On output pages they
-follow the FX send level and are meter data, not protocol status.
+follow the FX send level and are meter data, not protocol status. An FX peak
+at full scale (`2^27`) is the overload indication; there is no separate
+overload flag register.
 
 | Tag | Bank |
 |---|---|

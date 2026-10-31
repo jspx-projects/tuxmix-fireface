@@ -47,6 +47,13 @@ Authoritative files:
   `send FX` and `return FX` knobs are pinned to the same column. `send`/`FX`
   and `return`/`FX` use two lines so the label column stays narrow.
 - Button labels are centred, and so are dropdown values.
+- A column of knobs shares one vertical centre line. A secondary readout
+  such as the Echo BPM sits at the underside/right of its knob without moving
+  the knob off that line.
+- A short label such as `HC` sits left of its selection box; the box is only
+  as wide as its value, and the value text is centred.
+- VU meters sit to the right of the knob column, wider than a strip meter,
+  with an overload indicator at the top.
 - Every button and dropdown in a Settings panel shares one control height.
 - Standalone labels in the Settings grid, such as `ref.`, are centred and
   sit at the bottom of their slot, just above the control they name.
