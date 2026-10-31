@@ -420,7 +420,8 @@ column back into the layout; closing FX removes it.
 
 Knob rows are 78.75 px apart and knobs are 49.5 px across. Reverb's volume
 fader occupies the right-hand column across the first two knob rows; Echo's
-occupies the second column.
+occupies the second column. The Echo panel's right-hand column carries the
+`FX` `in`/`out` meter pair, fed by the UCX FX bus power channels.
 
 ### 6.1 Reverb
 

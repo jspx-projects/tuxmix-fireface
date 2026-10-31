@@ -1,8 +1,8 @@
 use iced::futures::channel::mpsc;
 use iced::keyboard::{self, Key};
 use iced::widget::{
-    button, column, container, mouse_area, opaque, pick_list, responsive, row, scrollable, stack,
-    text,
+    button, column, container, mouse_area, opaque, pick_list, progress_bar, responsive, row,
+    scrollable, stack, text,
 };
 use iced::{window, Color, Element, Length, Subscription, Task};
 use rosc::OscType;
@@ -961,6 +961,15 @@ impl DeviceHandle {
             DeviceHandle::Fireface(d) => d.playback_meters(),
             _ => None,
         }
+    }
+
+    /// UCX FX bus meters: `[send, return]`.
+    pub fn fx_meters(&self) -> Option<[f32; 2]> {
+        #[cfg(feature = "alsa")]
+        if let DeviceHandle::Fireface(d) = self {
+            return d.fx_meters();
+        }
+        None
     }
 
     /// Device-supplied hardware-output meters, already mapped to TuxMix's
@@ -1929,6 +1938,8 @@ pub struct TuxMix {
     /// Host-computed output levels (power sum of routed sources ×
     /// faders) — same ballistics as the input/playback meters.
     pub output_meters: Vec<MeterAnim>,
+    /// UCX FX bus meters: send and return.
+    pub fx_meters: [MeterAnim; 2],
     /// Strips the user has collapsed to save horizontal space — presence in
     /// the set means collapsed. This is the *target* state; the strip may
     /// still be mid-transition, tracked separately in `collapse_anim`.
@@ -2553,6 +2564,7 @@ pub fn new_with_device(
         playback_tap,
         playback_tap_channels: 0,
         output_meters: vec![MeterAnim::new(); n_outputs],
+        fx_meters: [MeterAnim::new(), MeterAnim::new()],
         collapsed: HashSet::new(),
         collapse_anim: HashMap::new(),
         flyout_open: HashSet::new(),
@@ -4812,6 +4824,10 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             for (i, m) in state.output_meters.iter_mut().enumerate() {
                 m.step_elapsed(out_levels.get(i).copied().unwrap_or(0.0));
             }
+            let fx_levels = state.device.fx_meters().unwrap_or([0.0, 0.0]);
+            for (i, m) in state.fx_meters.iter_mut().enumerate() {
+                m.step_elapsed(fx_levels[i]);
+            }
             // A live signal keeps the UI on the fast tick (and the fade
             // after it, `ACTIVE_FOR`); silence lets it go idle.
             const LIVE: f32 = 0.002;
@@ -6446,6 +6462,7 @@ fn switch_device(state: &mut TuxMix, target: DeviceTarget) -> Result<(), String>
     state.input_meters = vec![MeterAnim::new(); state.device.inputs().len()];
     state.playback_meters = vec![MeterAnim::new(); state.device.playbacks().len()];
     state.output_meters = vec![MeterAnim::new(); state.device.outputs().len()];
+    state.fx_meters = [MeterAnim::new(), MeterAnim::new()];
     state.playback_tap = if state.device.is_mock() || state.device.has_device_playback_meters() {
         pw_meter::PlaybackTap::disabled()
     } else {
@@ -10585,9 +10602,48 @@ fn fx_row<'a>(
 /// Reverb (two columns, fader at the right edge) and 60 px for Echo (one
 /// column, fader in the second column, the third left empty where the FX
 /// in/out meters would be).
+fn fx_meter_column(state: &TuxMix, scale: f32) -> Element<'static, Message> {
+    let bar_h = 230.0 * scale;
+    let bar_w = 10.0 * scale;
+    let bar = |i: usize| {
+        progress_bar(0.0..=1.0, state.fx_meters[i].frame().value)
+            .vertical()
+            .length(Length::Fixed(bar_h))
+            .girth(Length::Fixed(bar_w))
+    };
+    let bars = row![bar(0), bar(1)]
+        .spacing(theme::SPACE_SM * scale)
+        .align_y(iced::Alignment::End);
+    let captions = row![
+        text("in")
+            .size(theme::TEXT_XS * scale)
+            .color(theme::TEXT_SEC),
+        text("out")
+            .size(theme::TEXT_XS * scale)
+            .color(theme::TEXT_SEC),
+    ]
+    .spacing(theme::SPACE_MD * scale);
+    container(
+        column![
+            text("FX")
+                .size(theme::TEXT_XS * scale)
+                .color(theme::TEXT_SEC),
+            captions,
+            bars
+        ]
+        .spacing(theme::SPACE_SM * scale)
+        .align_x(iced::Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fixed(FX_ECHO_CONTROLS_H * scale))
+    .align_y(iced::Alignment::Start)
+    .into()
+}
+
 fn fx_controls(
     rows: Element<'static, Message>,
     fader_col: Element<'static, Message>,
+    right_col: Option<Element<'static, Message>>,
     knobs_w: f32,
     height: f32,
     top_pad: f32,
@@ -10598,7 +10654,9 @@ fn fx_controls(
         container(rows).width(Length::Fixed(knobs_w * scale)),
         container(fader_col).width(Length::Fixed(FX_FADER_W * scale)),
     ];
-    if filler > 0.0 {
+    if let Some(extra) = right_col {
+        band = band.push(container(extra).width(Length::Fixed(filler * scale)));
+    } else if filler > 0.0 {
         band = band.push(iced::widget::Space::new().width(Length::Fixed(filler * scale)));
     }
     container(
@@ -10787,6 +10845,7 @@ fn reverb_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
             scale,
             modifiers,
         ),
+        None,
         FX_KNOBS_W,
         FX_REV_CONTROLS_H,
         3.5,
@@ -11070,6 +11129,7 @@ fn echo_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
     let controls = fx_controls(
         rows.into(),
         fx_fader_column(FxBus::Echo, e.volume_db, -10.0, colour, scale, modifiers),
+        Some(fx_meter_column(state, scale)),
         FX_KNOBS_W / 2.0,
         FX_ECHO_CONTROLS_H,
         4.0,

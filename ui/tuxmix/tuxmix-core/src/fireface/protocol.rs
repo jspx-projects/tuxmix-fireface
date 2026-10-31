@@ -90,6 +90,10 @@ pub struct MeterPacket {
     pub power: [u64; 20],
     /// Peak per channel: 16 × |24-bit sample|; full scale 2^27.
     pub peak: [u32; 18],
+    /// FX bus power: in and out.
+    pub fx_power: [u64; 2],
+    /// FX bus peak: in and out.
+    pub fx_peak: [u32; 2],
 }
 
 impl MeterPacket {
@@ -110,7 +114,18 @@ impl MeterPacket {
         for (i, p) in peak.iter_mut().enumerate() {
             *p = u32::from_le_bytes(b[160 + i * 4..164 + i * 4].try_into().unwrap());
         }
-        Ok(Self { kind, power, peak })
+        let fx_power = [power[18], power[19]];
+        let fx_peak = [
+            u32::from_le_bytes(b[232..236].try_into().unwrap()),
+            u32::from_le_bytes(b[236..240].try_into().unwrap()),
+        ];
+        Ok(Self {
+            kind,
+            power,
+            peak,
+            fx_power,
+            fx_peak,
+        })
     }
 }
 
@@ -581,11 +596,17 @@ mod tests {
     fn meter_packet_parses() {
         let mut b = [0u8; 244];
         b[0..8].copy_from_slice(&(512u64 * 100 * 100).to_le_bytes());
+        b[144..152].copy_from_slice(&(512u64 * 40 * 40).to_le_bytes());
+        b[152..160].copy_from_slice(&(512u64 * 30 * 30).to_le_bytes());
         b[160..164].copy_from_slice(&(16u32 * 100).to_le_bytes());
+        b[232..236].copy_from_slice(&(16u32 * 40).to_le_bytes());
+        b[236..240].copy_from_slice(&(16u32 * 30).to_le_bytes());
         b[240..244].copy_from_slice(&0x1111_1111u32.to_le_bytes());
         let p = MeterPacket::parse(&b).unwrap();
         assert_eq!(p.kind, MeterKind::InputsA);
         assert_eq!(p.power[0], 512 * 10_000);
         assert_eq!(p.peak[0], 1600);
+        assert_eq!(p.fx_power, [512 * 1_600, 512 * 900]);
+        assert_eq!(p.fx_peak, [640, 480]);
     }
 }

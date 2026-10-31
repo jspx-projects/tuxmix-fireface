@@ -210,6 +210,8 @@ struct MeterBank {
     playback: [u64; 18],
     pre_fader: [u64; 18],
     post_fader: [u64; 18],
+    fx_in: u64,
+    fx_out: u64,
 }
 
 impl MeterBank {
@@ -219,12 +221,21 @@ impl MeterBank {
             MeterKind::InputsB => self.inputs_b.copy_from_slice(&p.power[..18]),
             MeterKind::Playback => self.playback.copy_from_slice(&p.power[..18]),
             MeterKind::OutputsPreFader => {
-                self.pre_fader.copy_from_slice(&p.power[..18])
+                self.pre_fader.copy_from_slice(&p.power[..18]);
+                self.fx_in = p.fx_power[0];
+                self.fx_out = p.fx_power[1];
             }
             MeterKind::OutputsPostFader => {
-                self.post_fader.copy_from_slice(&p.power[..18])
+                self.post_fader.copy_from_slice(&p.power[..18]);
+                self.fx_in = p.fx_power[0];
+                self.fx_out = p.fx_power[1];
             }
         }
+    }
+
+    fn fx(&self, out: bool) -> f32 {
+        let p = if out { self.fx_out } else { self.fx_in };
+        db_to_linear(protocol::power_dbfs(p))
     }
 
     fn input(&self, i: usize) -> f32 {
@@ -2359,6 +2370,14 @@ impl Fireface {
                     .map(|i| self.meters.output(i, post))
                     .collect(),
             ),
+            Model::Uc => None,
+        }
+    }
+
+    /// FX bus meters: `[send, return]`.
+    pub fn fx_meters(&self) -> Option<[f32; 2]> {
+        match self.model {
+            Model::Ucx => Some([self.meters.fx(false), self.meters.fx(true)]),
             Model::Uc => None,
         }
     }
