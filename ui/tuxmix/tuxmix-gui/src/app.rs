@@ -1480,13 +1480,6 @@ pub const RESET_MIX: [(&str, ResetMix); 10] = [
     ("Total reset", ResetMix::TotalReset),
 ];
 
-/// Which half of the global FX bus an FX-panel control belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FxBus {
-    Reverb,
-    Echo,
-}
-
 /// Which level of the Assign menu is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignMenu {
@@ -1628,13 +1621,6 @@ pub enum Message {
     /// Global FX panel.
     ReverbChanged(Reverb),
     EchoChanged(Echo),
-    /// The FX column's own volume faders. The strip fader messages are
-    /// channel-scoped and the FX buses have no channel slot, so they get
-    /// their own pair: `value` is a linear fader position (0..2, the
-    /// `Fader` widget's own units), converted to dB in the handler.
-    FxVolume(FxBus, f32),
-    /// Ends an FX fader gesture, the way `RangeCleared` ends a strip drag.
-    FxVolumeReleased(FxBus),
     /// Per-output FX Return level in dB.
     FxReturnChanged(usize, f32),
     /// Per-channel FX send level in dB.
@@ -2340,8 +2326,6 @@ fn undo_gesture(message: &Message) -> Option<UndoGesture> {
         }
         Message::ReverbChanged(_) => UndoGesture::Reverb,
         Message::EchoChanged(_) => UndoGesture::Echo,
-        Message::FxVolume(FxBus::Reverb, _) => UndoGesture::Reverb,
-        Message::FxVolume(FxBus::Echo, _) => UndoGesture::Echo,
         Message::PitchChanged(_) => UndoGesture::Pitch,
         Message::WidthChanged(_) => UndoGesture::Width,
         Message::ChannelWidthChanged(cid, _) => UndoGesture::ChannelWidth(*cid),
@@ -4270,7 +4254,6 @@ fn is_undoable(message: &Message) -> bool {
             | Message::MismatchAlwaysTuxmix
             | Message::SetAlwaysInitDevice(_)
             | Message::RangeCleared(_)
-            | Message::FxVolumeReleased(_)
             | Message::ToggleFxPanel
             | Message::ToggleAssign
             | Message::AssignDestinations(_)
@@ -4476,7 +4459,6 @@ fn needs_protocol_features(message: &Message) -> bool {
             | Message::TalkbackChanged(_)
             | Message::ReverbChanged(..)
             | Message::EchoChanged(..)
-            | Message::FxVolume(..)
             | Message::FxReturnChanged(..)
             | Message::FxSendChanged(..)
             | Message::ResetMix(_)
@@ -5901,31 +5883,6 @@ pub fn update(state: &mut TuxMix, message: Message) -> Task<Message> {
             };
             if let Err(e) = result {
                 fail(state, "assign", &e);
-            }
-        }
-        Message::FxVolume(bus, position) => {
-            // The fader speaks in linear position (0..2); the FX volumes are
-            // dB fields with their own limits.
-            let db = vol_to_db(position).clamp(-30.0, 6.0);
-            let next = match bus {
-                FxBus::Reverb => Message::ReverbChanged(Reverb {
-                    volume_db: db,
-                    ..state.device.settings().reverb.unwrap_or_default()
-                }),
-                FxBus::Echo => Message::EchoChanged(Echo {
-                    volume_db: db,
-                    ..state.device.settings().echo.unwrap_or_default()
-                }),
-            };
-            return update(state, next);
-        }
-        Message::FxVolumeReleased(bus) => {
-            let gesture = match bus {
-                FxBus::Reverb => UndoGesture::Reverb,
-                FxBus::Echo => UndoGesture::Echo,
-            };
-            if matches!(state.undo_gesture, Some((open, _)) if open == gesture) {
-                state.undo_gesture = None;
             }
         }
         Message::ToggleSettings => {
@@ -10502,107 +10459,44 @@ fn fx_knob_cell<'a, T: Copy + 'static>(
     .into()
 }
 
-/// The FX volume fader: TotalMix draws a short vertical fader here rather
-/// than a knob, with its value below it and `volume` under that.
-fn fx_fader(
-    bus: FxBus,
-    volume_db: f32,
-    reset_db: f32,
-    colour: Color,
-    height: f32,
-    modifiers: iced::keyboard::Modifiers,
+fn fx_delay_cell(
+    echo: Echo,
     scale: f32,
+    modifiers: iced::keyboard::Modifiers,
 ) -> Element<'static, Message> {
-    fader::fader(fader::Fader {
-        value: db_to_vol(volume_db),
-        // The bus volume runs -30..+6 dB; the widget speaks linear position.
-        range: (db_to_vol(-30.0), db_to_vol(6.0)),
-        default_value: db_to_vol(reset_db),
-        meter: fader::MeterFrame::still(0.0),
-        meter_available: false,
-        meter2: None,
-        meter2_available: false,
-        height,
-        show_meter: false,
-        fill: theme::FADER,
-        reserved_right: 0.0,
+    let delay_s = echo.delay_ms as f32 / 1000.0;
+    let bpm = 60_000.0 / echo.delay_ms.max(1) as f32;
+    let knob = fx_knob_cell(
+        "delay time",
+        delay_s,
+        (0.01, 2.0),
+        format!("{delay_s:.2}"),
+        theme::KNOB_GREEN,
+        true,
+        0.6,
+        echo,
+        Message::EchoChanged,
+        |e, v| e.delay_ms = (v * 1000.0).round().clamp(10.0, 2_000.0) as u16,
         modifiers,
         scale,
-        show_track: true,
-        label: None,
-        label_color: colour,
-        compact_width: 18.0,
-        on_press: Box::new(move |v, _| Message::FxVolume(bus, v)),
-        on_drag: Box::new(move |v| Message::FxVolume(bus, v)),
-        on_release: Box::new(move || Message::FxVolumeReleased(bus)),
-        on_reset: Box::new(move || Message::FxVolume(bus, db_to_vol(reset_db))),
-    })
-    .into()
-}
-
-/// A fader column: the fader, its value, then the `volume` label. Heights
-/// place the value and label at the measured line centres (126.6 and 149 px
-/// from the top of the controls band).
-fn fx_fader_column(
-    bus: FxBus,
-    volume_db: f32,
-    reset_db: f32,
-    colour: Color,
-    scale: f32,
-    modifiers: iced::keyboard::Modifiers,
-) -> Element<'static, Message> {
-    column![
-        fx_fader(
-            bus,
-            volume_db,
-            reset_db,
-            colour,
-            112.0 * scale,
-            modifiers,
-            scale
-        ),
-        iced::widget::Space::new().height(Length::Fixed(8.0 * scale)),
-        text(format!("{volume_db:+.1}"))
-            .size(theme::TEXT_XS * scale)
-            .color(theme::TEXT_SEC)
-            .width(Length::Fill)
-            .center(),
-        iced::widget::Space::new().height(Length::Fixed(11.0 * scale)),
-        text("volume")
-            .size(theme::TEXT_XS * scale)
-            .color(theme::TEXT_SEC)
-            .width(Length::Fill)
-            .center(),
-    ]
-    .spacing(0.0)
-    .align_x(iced::Alignment::Center)
-    .width(Length::Fill)
-    .into()
-}
-
-/// One fixed-pitch row of the controls band.
-fn fx_row<'a>(
-    left: Element<'a, Message>,
-    right: Element<'a, Message>,
-    scale: f32,
-) -> Element<'a, Message> {
+    );
     container(
-        row![left, right]
-            .width(Length::Fill)
-            .height(Length::Fixed(FX_ROW_H * scale)),
+        row![
+            container(knob).width(Length::Fill),
+            container(
+                text(format!("{bpm:.0}"))
+                    .size(theme::TEXT_XS * scale)
+                    .color(theme::TEXT_SEC)
+            )
+            .width(Length::Fixed(26.0 * scale))
+            .align_y(iced::Alignment::Center),
+        ]
+        .height(Length::Fixed(FX_ROW_H * scale)),
     )
-    .height(Length::Fixed(FX_ROW_H * scale))
-    .align_y(iced::Alignment::Start)
     .width(Length::Fill)
     .into()
 }
 
-/// The knob block and the fader column of one panel's controls band.
-///
-/// `knobs_w` is the width of the knob columns before the fader: 120 px for
-/// Reverb (two columns, fader at the right edge) and 60 px for Echo (one
-/// column, fader in the second column, the third left empty where the FX
-/// in/out meters would be).
 fn fx_meter_column(state: &TuxMix, scale: f32) -> Element<'static, Message> {
     let bar_h = 230.0 * scale;
     let bar_w = 10.0 * scale;
@@ -10639,6 +10533,23 @@ fn fx_meter_column(state: &TuxMix, scale: f32) -> Element<'static, Message> {
     .width(Length::Fill)
     .height(Length::Fixed(FX_ECHO_CONTROLS_H * scale))
     .align_y(iced::Alignment::Start)
+    .into()
+}
+
+/// One fixed-pitch row of the controls band.
+fn fx_row<'a>(
+    left: Element<'a, Message>,
+    right: Element<'a, Message>,
+    scale: f32,
+) -> Element<'a, Message> {
+    container(
+        row![left, right]
+            .width(Length::Fill)
+            .height(Length::Fixed(FX_ROW_H * scale)),
+    )
+    .height(Length::Fixed(FX_ROW_H * scale))
+    .align_y(iced::Alignment::Start)
+    .width(Length::Fill)
     .into()
 }
 
@@ -10836,17 +10747,34 @@ fn reverb_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
         scale,
     );
 
+    let volume = fx_row_one(
+        fx_knob_cell(
+            "volume",
+            r.volume_db,
+            (-30.0, 6.0),
+            format!("{:+.1}", r.volume_db),
+            colour,
+            false,
+            -15.8,
+            r,
+            Message::ReverbChanged,
+            |r, v| r.volume_db = v,
+            modifiers,
+            scale,
+        ),
+        scale,
+    );
+    let volume_column = column![
+        iced::widget::Space::new().height(Length::Fill),
+        volume
+    ]
+    .height(Length::Fixed(FX_REV_CONTROLS_H * scale))
+    .width(Length::Fill);
+
     let rows = column![row1, row2, row3].spacing(0.0).width(Length::Fill);
     let controls = fx_controls(
         rows.into(),
-        fx_fader_column(
-            FxBus::Reverb,
-            r.volume_db,
-            -15.8,
-            colour,
-            scale,
-            modifiers,
-        ),
+        volume_column.into(),
         None,
         FX_KNOBS_W,
         FX_REV_CONTROLS_H,
@@ -11022,49 +10950,8 @@ fn echo_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
         scale,
     );
 
-    let row1 = fx_row_one(
-        fx_knob_cell(
-            "delay time",
-            e.delay_ms as f32,
-            (10.0, 2_000.0),
-            format!("{}", e.delay_ms),
-            colour,
-            true,
-            600.0,
-            e,
-            Message::EchoChanged,
-            |e, v| e.delay_ms = v.round() as u16,
-            modifiers,
-            scale,
-        ),
-        scale,
-    );
-    // BPM has no register of its own: TotalMix recomputes the delay time
-    // and writes only `0x3C22` (capture H41). 60 / delay_s reproduces the
-    // panel's own reading (105 BPM against 0.57 s).
-    let bpm = 60_000.0 / e.delay_ms.max(1) as f32;
+    let row1 = fx_delay_cell(e, scale, modifiers);
     let row2 = fx_row_one(
-        fx_knob_cell(
-            "delay bpm",
-            bpm.clamp(30.0, 300.0),
-            (30.0, 300.0),
-            format!("{:.0}", bpm.clamp(30.0, 300.0)),
-            colour,
-            false,
-            105.0,
-            e,
-            Message::EchoChanged,
-            |e, v| {
-                e.delay_ms = (60_000.0 / v.clamp(30.0, 300.0))
-                    .round()
-                    .clamp(10.0, 2_000.0) as u16
-            },
-            modifiers,
-            scale,
-        ),
-        scale,
-    );
-    let row3 = fx_row_one(
         fx_knob_cell(
             "feedback",
             e.feedback as f32,
@@ -11081,43 +10968,7 @@ fn echo_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
         ),
         scale,
     );
-    let high_cut_name = ECHO_HIGH_CUTS
-        .get(e.high_cut as usize)
-        .copied()
-        .unwrap_or("Off");
-    let high_cut = container(
-        row![
-            pick_list(
-                ECHO_HIGH_CUTS
-                    .iter()
-                    .map(|value| value.to_string())
-                    .collect::<Vec<_>>(),
-                Some(high_cut_name.to_string()),
-                move |value: String| Message::EchoChanged(Echo {
-                    high_cut: ECHO_HIGH_CUTS
-                        .iter()
-                        .position(|name| *name == value)
-                        .unwrap_or(0) as u8,
-                    ..e
-                }),
-            )
-            .style(theme::pick_list)
-            .menu_style(theme::menu)
-            .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
-            .text_size(theme::TEXT_XS * scale)
-            .width(Length::Fixed(50.0 * scale)),
-            text("high cut")
-                .size(theme::TEXT_XS * scale)
-                .color(theme::TEXT_SEC),
-        ]
-        .spacing(theme::SPACE_SM * scale)
-        .align_y(iced::Alignment::Center),
-    )
-    .height(Length::Fixed(24.0 * scale))
-    .align_y(iced::Alignment::Center)
-    .padding([0.0, theme::SPACE_SM * scale])
-    .width(Length::Fill);
-    let row4 = fx_row_one(
+    let row3 = fx_row_one(
         fx_knob_cell(
             "width",
             e.width,
@@ -11134,15 +10985,73 @@ fn echo_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
         ),
         scale,
     );
+    let high_cut_name = ECHO_HIGH_CUTS
+        .get(e.high_cut as usize)
+        .copied()
+        .unwrap_or("Off");
+    let high_cut = container(
+        pick_list(
+            ECHO_HIGH_CUTS
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+            Some(high_cut_name.to_string()),
+            move |value: String| Message::EchoChanged(Echo {
+                high_cut: ECHO_HIGH_CUTS
+                    .iter()
+                    .position(|name| *name == value)
+                    .unwrap_or(0) as u8,
+                ..e
+            }),
+        )
+        .style(theme::pick_list)
+        .menu_style(theme::menu)
+        .padding([theme::SPACE_TIGHT * scale, theme::SPACE_SM * scale])
+        .text_size(theme::TEXT_XS * scale)
+        .width(Length::Fill),
+    )
+    .height(Length::Fixed(24.0 * scale))
+    .padding([0.0, theme::SPACE_SM * scale])
+    .width(Length::Fill);
+    let volume = fx_row_one(
+        fx_knob_cell(
+            "volume",
+            e.volume_db,
+            (-30.0, 6.0),
+            format!("{:+.1}", e.volume_db),
+            colour,
+            false,
+            -10.0,
+            e,
+            Message::EchoChanged,
+            |e, v| e.volume_db = v,
+            modifiers,
+            scale,
+        ),
+        scale,
+    );
+    let volume_column = column![
+        iced::widget::Space::new().height(Length::Fill),
+        volume,
+        high_cut,
+        text("high cut")
+            .size(theme::TEXT_XS * scale)
+            .color(theme::TEXT_SEC)
+            .width(Length::Fill)
+            .center(),
+    ]
+    .spacing(0.0)
+    .height(Length::Fixed(FX_ECHO_CONTROLS_H * scale))
+    .width(Length::Fill);
 
-    let rows = column![row1, row2, row3, high_cut, row4]
+    let rows = column![row1, row2, row3]
         .spacing(0.0)
         .width(Length::Fill);
     let controls = fx_controls(
         rows.into(),
-        fx_fader_column(FxBus::Echo, e.volume_db, -10.0, colour, scale, modifiers),
+        volume_column.into(),
         Some(fx_meter_column(state, scale)),
-        FX_KNOBS_W / 2.0,
+        80.0,
         FX_ECHO_CONTROLS_H,
         4.0,
         scale,

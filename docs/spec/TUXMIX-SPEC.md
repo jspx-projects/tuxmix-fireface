@@ -419,9 +419,10 @@ column back into the layout; closing FX removes it.
 | Echo controls | 343 |
 
 Knob rows are 78.75 px apart and knobs are 49.5 px across. Reverb's volume
-fader occupies the right-hand column across the first two knob rows; Echo's
-occupies the second column. The Echo panel's right-hand column carries the
-`FX` `in`/`out` meter pair, fed by the UCX FX bus power channels.
+fader occupies the right-hand column across the first two knob rows. Echo's
+volume is a knob in the second column; its high-cut picker sits below it. The
+Echo panel's right-hand column carries the `FX` `in`/`out` meter pair, fed by
+the UCX FX bus power channels.
 
 ### 6.1 Reverb
 
@@ -453,12 +454,11 @@ Other types leave the band empty.
 |---|---|
 | On | on/off |
 | Type | Stereo Echo, Stereo Cross, Pong Echo |
-| Delay | 10..2000 ms |
-| Delay BPM | 30..300 |
+| Delay time | 10..2000 ms; second readout 30..300 BPM |
 | Feedback | 0..100 % |
 | High cutoff | Off, 16k, 12k, 8k, 4k, 2k |
 | Width | 0..100 |
-| Volume | −30..+6 dB, vertical fader |
+| Volume | −30..+6 dB knob |
 
 BPM is derived from the delay: it reads `60000 / delay` and writes the delay
 register, `60000 / bpm`.
