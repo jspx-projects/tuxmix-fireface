@@ -130,14 +130,47 @@ stream live state changes.
 
 | Address | Meaning |
 |---|---|
+| `0x3f00` | heartbeat counter |
+| `0x3f01` | constant `0xffff` |
+| `0x3f02` | rolling status value |
+| `0x3f03` | constant `0` |
+| `0x3f10` | constant `0x7070` |
+| `0x3f50` | constant `0` |
 | `0x3d03` | DIM |
 | `0x3f9e` | monitor flags; bit 1 = MS processing |
+| `0x0002`, `0x0102` | input stereo mode |
+| `0x0202`, `0x0302` | input stereo mode, second pair |
+| `0x1204`, `0x1304` | output stereo mode |
 | `0x0007`, `0x0107`, `0x0207`, `0x0307` | input gain 1–4, 0.1 dB |
 | `0x1200..0x2300`, offset 0 | hardware-output volume, signed 0.1 dB |
+| `0x12a0`, `0x22a0` | selected-submix fader record |
 
 Input gains are reported when the physical encoder moves. Output-volume state
 is mapped to the Phones-first output order. The physical Phones encoder emits
 `0x1800` and `0x1900`.
+
+Front-panel 48 V, Inst and Level changes write `NN08`/`NN09` on both sides of
+a linked pair and emit no state word.
+
+The state stream is sparse. It is not a full scene dump and it does not echo
+every writable register. It carries no observed word for 48 V, Inst, Level,
+reference level, the options word, EQ, dynamics or FX. The full mixer scene is
+written by the host at connect; gain, output volume, DIM and MS state are the
+only live controls read back from this stream.
+
+### 3.3 State readback
+
+| State | Source |
+|---|---|
+| Input gain 1–4 | `0xNN07` state word |
+| Output volume | `0xNN00` state word |
+| DIM | `0x3d03` state word |
+| MS processing | `0x3f9e` bit 1 |
+| Stereo mode | `0xNN02` / `0xNN04` state word |
+| Fader records | `0x12a0` family |
+| 48 V, Inst, Level, reference level | host scene only |
+| Options word | unit-owned |
+| EQ, dynamics, FX | host scene only |
 
 ## 4. Register model
 
@@ -364,14 +397,18 @@ the fader.  The post-fader coupling is not expressed in `NN01`.
 | Control | Behaviour |
 |---|---|
 | Mute | `NN00 = 1`; active sends are zeroed and restored on unmute |
-| Solo | host-side monitoring state |
+| Solo | host-side monitoring state; no solo register |
 | Stereo mode | `NN02`, 0 mono / 1 stereo |
+
+Solo writes no device word of its own. With active sends, solo and unsolo
+rewrite the affected send cells; with no active send, the toggle produces no
+host-to-device traffic.
 
 ### 6.4 Mode buttons
 
-Stereo, 48 V, Inst, AutoSet and Phase are per-channel states. A linked pair
-copies the left channel's preamp state to the right and centres both pans.
-Splitting writes hard-left and hard-right pans.
+Stereo, 48 V, Inst, AutoSet and Phase are per-channel states. Link state is
+`NN02`. The linked-pair parameter rules are defined in
+[`OSC-CONTROL-SPEC.md`](OSC-CONTROL-SPEC.md) §11.
 
 ## 7. Output controls
 
@@ -383,6 +420,9 @@ Splitting writes hard-left and hard-right pans.
 | Balance | `NN01` | −100..+100 |
 | Mute | `NN02` | 0/1 |
 | Stereo mode | `NN04` | 0 mono / 1 stereo |
+
+The front-panel VOLUME encoder writes the assigned Main pair's `NN00`
+registers. Reassigning Main moves the encoder to the new pair.
 
 Balance writes the same value to both channels of a linked pair. It is
 independent of the pair volume.
@@ -504,6 +544,10 @@ The Reverb and Echo registers are listed in §4.4.
 - Echo: enable, type, delay, feedback, high cut, volume, width.
 - Each output has an FX Return level (`NN03`).
 
+The output meter pages carry two extra power channels for the FX bus and two
+extra peak words at meter offsets 232..239. The FX values follow the FX send
+level.
+
 The backend applies the whole Reverb block and the whole Echo block in one
 IF1 burst each.
 
@@ -556,7 +600,20 @@ The `0x1b` quad is:
 (0x7d00, 0x0003)
 ```
 
-### 11.4 Options word
+### 11.4 Application reconnect
+
+When TotalMix FX opens with the USB driver already attached, it does not
+reissue `SET_CONFIGURATION`, `SET_INTERFACE` or the `0x16`/`0x1b` vendor
+initialisation. It writes:
+
+1. 30 × `0x15` loopback bank, indices 0..29, value 0;
+2. a 1106-word bulk scene in 18 bursts: 17 × 252 bytes and 140 bytes;
+3. the normal heartbeat.
+
+The scene begins with the fader/matrix records and ends with the global FX and
+monitor words.
+
+### 11.5 Options word
 
 Request `0x10`, index 1487, carries the unit's options as one full word:
 
@@ -634,10 +691,13 @@ The meter endpoint is IF1 IN `0x85`. A packet is 244 bytes.
 
 | Bytes | Contents |
 |---|---|
-| 0..159 | 20 little-endian `u64` mean-square values; first 18 used |
-| 160..231 | 18 little-endian `u32` peak values |
-| 232..239 | reserved |
+| 0..159 | 20 little-endian `u64` mean-square values: 18 channel values, then two FX bus values |
+| 160..231 | 18 little-endian `u32` channel peak values |
+| 232..239 | two little-endian `u32` FX bus peak values |
 | 240..243 | tag |
+
+The two FX values are zero on input and playback pages. On output pages they
+follow the FX send level and are meter data, not protocol status.
 
 | Tag | Bank |
 |---|---|

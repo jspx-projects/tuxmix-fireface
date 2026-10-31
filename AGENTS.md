@@ -26,6 +26,8 @@ Authoritative files:
 
 - `docs/spec/UCX-CONTROL-SPEC.md` — UCX transport, registers, controls,
   metering.
+- `docs/spec/OSC-CONTROL-SPEC.md` — TotalMix FX OSC transport, pages, scales,
+  link rules and UCX register mapping.
 - `docs/spec/TUXMIX-SPEC.md` — visible UI, panels, state and persistence.
 - `docs/spec/UC-CONTROL-SPEC.md` — UC-specific protocol and controls.
 - `docs/spec/BABYFACE-PRO-CONTROL-SPEC.md` — Babyface Pro FS channel model,
@@ -112,8 +114,8 @@ Authoritative files:
   the slideout is open or closed; only the panel grows beside it.
 - A fader, knob, matrix cell or EQ handle captures the pointer for the drag;
   the drag continues outside the control and ends on release.
-- Linking an input pair restores the pan captured when it was split; the
-  split itself sets the two channels hard left and hard right.
+- Splitting an input pair sets the two channels hard left and hard right;
+  linking keeps the split volumes and derives the balance from them.
 - The linked input fader displays the louder channel and shifts both channels
   by the same dB offset; linking never flattens or copies the two volumes.
 - Splitting an output pair converts its pair level and balance into two

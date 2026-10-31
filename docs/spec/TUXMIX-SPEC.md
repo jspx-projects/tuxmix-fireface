@@ -558,9 +558,14 @@ at the same speed. Channels to the right reflow with the tween.
 ## 10. Stereo link
 
 Linking an input pair uses the left channel as the reference for mute, solo,
-phantom, Inst, Level, AutoSet and gain. It does not copy or flatten the two
-channel volumes: the linked fader displays the louder channel, and moving it
-shifts both channels by the same dB offset so their difference is preserved.
+phantom, Inst, Level, reference level and AutoSet. It also copies the left
+channel's FX send, low cut, EQ, dynamics and AutoLevel settings to the
+right. Gain and phase remain per-channel: the linked gain control uses the
+left value while the right value is retained.
+
+Linking does not copy or flatten the two channel volumes: the linked fader
+displays the louder channel, and moving it shifts both channels by the same
+dB offset so their difference is preserved.
 
 The linked balance is derived from the two channel volumes:
 
@@ -574,7 +579,14 @@ changes do not alter the balance because the balance lives in the channel
 volumes. The same rule applies to software-playback and hardware-output
 pairs.
 
-Phase L and Phase R keep independent states across the transition.
+Software-playback pairs link as a host grouping. Mute and solo copy from left
+to right; FX send remains per-channel and MS processing stays a pair control.
+
+Hardware-output pairs link with the output stereo words. Mute, FX return,
+low cut, EQ, dynamics and AutoLevel copy from left to right. The two channel
+volumes encode the pair level and balance. The output reference level is a
+line-output group value, not a per-pair link value. Phase L and Phase R keep
+independent states across every transition.
 
 ## 11. Control Room
 
