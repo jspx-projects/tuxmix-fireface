@@ -6944,6 +6944,7 @@ fn reverb_type_name(kind: u8) -> &'static str {
 }
 
 const ECHO_TYPES: [&str; 3] = ["Stereo Echo", "Stereo Cross", "Pong Echo"];
+const ECHO_HIGH_CUTS: [&str; 6] = ["Off", "16k", "12k", "8k", "4k", "2k"];
 
 fn device_panel(state: &TuxMix) -> Element<'_, Message> {
     let scale = state.ui_scale;
@@ -10610,15 +10611,16 @@ fn fx_meter_column(state: &TuxMix, scale: f32) -> Element<'static, Message> {
             .vertical()
             .length(Length::Fixed(bar_h))
             .girth(Length::Fixed(bar_w))
+            .style(theme::fx_meter)
     };
     let bars = row![bar(0), bar(1)]
         .spacing(theme::SPACE_SM * scale)
         .align_y(iced::Alignment::End);
     let captions = row![
-        text("in")
+        text("In")
             .size(theme::TEXT_XS * scale)
             .color(theme::TEXT_SEC),
-        text("out")
+        text("Out")
             .size(theme::TEXT_XS * scale)
             .color(theme::TEXT_SEC),
     ]
@@ -11079,13 +11081,23 @@ fn echo_panel(state: &TuxMix, scale: f32) -> Element<'_, Message> {
         ),
         scale,
     );
+    let high_cut_name = ECHO_HIGH_CUTS
+        .get(e.high_cut as usize)
+        .copied()
+        .unwrap_or("Off");
     let high_cut = container(
         row![
             pick_list(
-                (0u8..=20).map(|i| i.to_string()).collect::<Vec<_>>(),
-                Some(e.high_cut.to_string()),
+                ECHO_HIGH_CUTS
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>(),
+                Some(high_cut_name.to_string()),
                 move |value: String| Message::EchoChanged(Echo {
-                    high_cut: value.parse().unwrap_or(0),
+                    high_cut: ECHO_HIGH_CUTS
+                        .iter()
+                        .position(|name| *name == value)
+                        .unwrap_or(0) as u8,
                     ..e
                 }),
             )

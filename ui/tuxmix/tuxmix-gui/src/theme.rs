@@ -2,7 +2,7 @@
 
 use iced::gradient::Linear;
 use iced::widget::overlay::menu;
-use iced::widget::{button, container};
+use iced::widget::{button, container, progress_bar};
 use iced::{Background, Border, Color, Shadow};
 
 // Identity: the app icon is a pure-black tile with a monochrome silver
@@ -219,6 +219,18 @@ pub fn fx_controls(_theme: &iced::Theme) -> container::Style {
         background: Some(Background::Color(blend(SURFACE, BG_DEEP, 0.45))),
         text_color: Some(TEXT_PRIMARY),
         ..container::Style::default()
+    }
+}
+
+pub fn fx_meter(_theme: &iced::Theme) -> progress_bar::Style {
+    progress_bar::Style {
+        background: Background::Color(BG_DEEP),
+        bar: Background::Color(MGREEN),
+        border: Border {
+            color: BORDER,
+            width: 1.0,
+            radius: RADIUS_SM.into(),
+        },
     }
 }
 

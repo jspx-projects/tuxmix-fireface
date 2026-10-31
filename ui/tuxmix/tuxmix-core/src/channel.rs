@@ -310,7 +310,8 @@ pub struct Echo {
     pub delay_ms: u16,
     /// 0..100 %.
     pub feedback: u8,
-    /// Raw high-cut value/index (the unit is not decoded).
+    /// Echo high-cut selection: 0 Off, 1 16 kHz, 2 12 kHz, 3 8 kHz,
+    /// 4 4 kHz, 5 2 kHz (`0x3c24`).
     pub high_cut: u8,
     /// Signed dB, 0.1 dB units on the wire.
     pub volume_db: f32,

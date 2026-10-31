@@ -456,7 +456,7 @@ Other types leave the band empty.
 | Delay | 10..2000 ms |
 | Delay BPM | 30..300 |
 | Feedback | 0..100 % |
-| High cutoff | 0..20 |
+| High cutoff | Off, 16k, 12k, 8k, 4k, 2k |
 | Width | 0..100 |
 | Volume | −30..+6 dB, vertical fader |
 

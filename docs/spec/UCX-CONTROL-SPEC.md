@@ -278,7 +278,7 @@ The fader base is submix-dependent: the selected hardware output chooses the
 | `0x3c21` | Echo type | 0 Stereo Echo, 1 Stereo Cross, 2 Pong Echo |
 | `0x3c22` | Echo delay | 0.01 s |
 | `0x3c23` | Echo feedback | % |
-| `0x3c24` | Echo high cut | index |
+| `0x3c24` | Echo high cut | 0 Off, 1 16k, 2 12k, 3 8k, 4 4k, 5 2k |
 | `0x3c25` | Echo volume | 0.1 dB, signed |
 | `0x3c26` | Echo width | 0..100 |
 | `0x1802` / `0x1902` | Phones/Main mode word | bit 1 = Speaker B |
