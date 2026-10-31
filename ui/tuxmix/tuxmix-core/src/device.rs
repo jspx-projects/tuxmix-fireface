@@ -731,7 +731,7 @@ pub trait RmeDevice {
             return Ok(());
         }
         let (left, right) = (pair * 2, pair * 2 + 1);
-        let saved_mute = self.outputs().get(left).map(|o| o.mute);
+        let saved = self.outputs().get(left).cloned();
         {
             let v = &mut self.settings_mut().output_link;
             if v.len() <= pair {
@@ -740,8 +740,15 @@ pub trait RmeDevice {
             v[pair] = linked;
         }
         if linked {
-            if let Some(mute) = saved_mute {
-                self.set_mute(ChannelId::Output(right), mute)?;
+            if let Some(saved) = saved {
+                self.set_mute(ChannelId::Output(right), saved.mute)?;
+                if let Some(eq) = saved.eq {
+                    self.set_output_eq(right, &eq)?;
+                }
+                if let Some(dynamics) = saved.dynamics {
+                    self.set_dynamics(ChannelId::Output(right), &dynamics)?;
+                }
+                let _ = self.set_fx_return(right, saved.fx_return_db);
             }
         }
         Ok(())
@@ -808,6 +815,21 @@ pub trait RmeDevice {
             .unwrap_or(true)
     }
 
+    /// Apply one complete EQ and low-cut state to an input channel.
+    fn apply_input_eq(&mut self, idx: usize, eq: &InputEq) -> Result<(), Error> {
+        self.set_eq_enabled(idx, eq.enabled)?;
+        self.set_eq_low_cut_enabled(idx, eq.low_cut_enabled)?;
+        self.set_eq_low_cut_freq(idx, eq.low_cut_freq_hz)?;
+        self.set_eq_low_cut_slope(idx, eq.low_cut_slope_db_oct)?;
+        for (band, settings) in eq.bands.iter().enumerate() {
+            self.set_eq_band_type(idx, band, settings.band_type)?;
+            self.set_eq_band_freq(idx, band, settings.freq_hz)?;
+            self.set_eq_band_q(idx, band, settings.q)?;
+            self.set_eq_band_gain(idx, band, settings.gain_db)?;
+        }
+        Ok(())
+    }
+
     /// Sets whether input pair `pair` is linked. Linking uses the left
     /// channel as the preamp reference and keeps both channel volumes; the
     /// linked balance is derived from those volumes. Splitting sets the two
@@ -839,6 +861,13 @@ pub trait RmeDevice {
                 if let Some(gain) = saved.gain {
                     self.set_input_gain(left, gain)?;
                 }
+                if let Some(eq) = saved.eq {
+                    self.apply_input_eq(right, &eq)?;
+                }
+                if let Some(dynamics) = saved.dynamics {
+                    self.set_dynamics(ChannelId::Input(right), &dynamics)?;
+                }
+                let _ = self.set_channel_fx_send(ChannelId::Input(right), saved.fx_send_db);
             }
         }
 

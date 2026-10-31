@@ -3044,6 +3044,13 @@ impl RmeDevice for Fireface {
                     self.set_autoset(right, saved.autoset)?;
                     self.set_autoset(left, saved.autoset)?;
                 }
+                if let Some(eq) = saved.eq {
+                    self.apply_input_eq(right, &eq)?;
+                }
+                if let Some(dynamics) = saved.dynamics {
+                    self.set_dynamics(ChannelId::Input(right), &dynamics)?;
+                }
+                let _ = self.set_channel_fx_send(ChannelId::Input(right), saved.fx_send_db);
             }
         }
         // The linked balance is derived from the two channel volumes, as
@@ -3078,7 +3085,8 @@ impl RmeDevice for Fireface {
             self.ucx_write_output_stereo(left, linked)?;
             self.ucx_write_output_stereo(right, linked)?;
         }
-        let saved_mute = self.outputs.get(left).map(|o| o.mute);
+        let saved_output = self.outputs.get(left).cloned();
+        let saved_mute = saved_output.as_ref().map(|o| o.mute);
         {
             let v = &mut self.settings.output_link;
             if v.len() <= pair {
@@ -3089,6 +3097,15 @@ impl RmeDevice for Fireface {
         if linked {
             if let Some(mute) = saved_mute {
                 self.set_mute(ChannelId::Output(right), mute)?;
+            }
+            if let Some(saved) = saved_output {
+                if let Some(eq) = saved.eq {
+                    self.set_output_eq(right, &eq)?;
+                }
+                if let Some(dynamics) = saved.dynamics {
+                    self.set_dynamics(ChannelId::Output(right), &dynamics)?;
+                }
+                let _ = self.set_fx_return(right, saved.fx_return_db);
             }
             if self.is_uc() {
                 // No balance register: splitting comes back from the two
@@ -5121,6 +5138,87 @@ mod tests {
         dev.set_input_volume(0, 0, 0, 0.25).unwrap();
         assert!((dev.volume(ChannelId::Input(0), 0).unwrap() - 0.05).abs() < 1e-6);
         assert!((dev.volume(ChannelId::Input(1), 0).unwrap() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ucx_input_link_copies_fx_eq_and_dynamics() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        dev.set_input_pair_linked(0, false).unwrap();
+        dev.set_channel_fx_send(ChannelId::Input(0), -30.0)
+            .unwrap();
+        dev.set_channel_fx_send(ChannelId::Input(1), -10.0)
+            .unwrap();
+
+        let mut eq = InputEq::default();
+        eq.enabled = true;
+        eq.low_cut_enabled = true;
+        eq.low_cut_freq_hz = 120;
+        eq.low_cut_slope_db_oct = 18;
+        eq.bands[0].band_type = EqBandType::Bell;
+        eq.bands[0].gain_db = 4.0;
+        eq.bands[0].freq_hz = 250;
+        eq.bands[0].q = 1.4;
+        dev.apply_input_eq(0, &eq).unwrap();
+
+        let dynamics = Dynamics {
+            on: true,
+            gain_db: 3.0,
+            attack_ms: 20,
+            release_ms: 400,
+            comp_threshold_db: -24.0,
+            comp_ratio: 2.5,
+            exp_threshold_db: -40.0,
+            exp_ratio: 1.8,
+            auto_level: true,
+            auto_max_gain_db: 9.0,
+            auto_headroom_db: 6.0,
+            auto_rise_s: 2.0,
+        };
+        dev.set_dynamics(ChannelId::Input(0), &dynamics).unwrap();
+
+        dev.set_input_pair_linked(0, true).unwrap();
+        assert_eq!(dev.inputs()[1].fx_send_db, -30.0);
+        assert_eq!(dev.inputs()[1].eq, Some(eq));
+        assert_eq!(dev.inputs()[1].dynamics, Some(dynamics));
+    }
+
+    #[test]
+    fn ucx_output_link_copies_fx_eq_and_dynamics() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        dev.set_output_linked(1, false).unwrap();
+
+        let mut eq = InputEq::default();
+        eq.enabled = true;
+        eq.low_cut_enabled = true;
+        eq.low_cut_freq_hz = 80;
+        eq.low_cut_slope_db_oct = 12;
+        eq.bands[2].band_type = EqBandType::HighShelf;
+        eq.bands[2].gain_db = -3.0;
+        eq.bands[2].freq_hz = 6_000;
+        eq.bands[2].q = 0.9;
+        dev.set_output_eq(2, &eq).unwrap();
+
+        let dynamics = Dynamics {
+            on: true,
+            gain_db: -2.0,
+            attack_ms: 30,
+            release_ms: 500,
+            comp_threshold_db: -18.0,
+            comp_ratio: 3.0,
+            exp_threshold_db: -45.0,
+            exp_ratio: 2.0,
+            auto_level: false,
+            auto_max_gain_db: 6.0,
+            auto_headroom_db: 6.0,
+            auto_rise_s: 5.0,
+        };
+        dev.set_dynamics(ChannelId::Output(2), &dynamics).unwrap();
+        dev.set_fx_return(2, -12.0).unwrap();
+
+        dev.set_output_linked(1, true).unwrap();
+        assert_eq!(dev.outputs()[3].eq, Some(eq));
+        assert_eq!(dev.outputs()[3].dynamics, Some(dynamics));
+        assert_eq!(dev.outputs()[3].fx_return_db, -12.0);
     }
 
     #[test]
