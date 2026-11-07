@@ -1019,6 +1019,39 @@ impl RmeDevice for Mirror {
         Ok(())
     }
 
+    fn set_external_input(
+        &mut self,
+        on: bool,
+        source: Option<usize>,
+        gain_db: f32,
+    ) -> Result<(), Error> {
+        self.run(move |d| {
+            let _ = d.set_external_input(on, source, gain_db);
+        });
+        Ok(())
+    }
+
+    fn set_cue_target(&mut self, pair: Option<usize>) -> Result<(), Error> {
+        self.run(move |d| {
+            let _ = d.set_cue_target(pair);
+        });
+        Ok(())
+    }
+
+    fn set_pfl(&mut self, channel: ChannelId, on: bool) -> Result<(), Error> {
+        self.run(move |d| {
+            let _ = d.set_pfl(channel, on);
+        });
+        Ok(())
+    }
+
+    fn set_pfl_mode(&mut self, pfl: bool, exclusive: bool) -> Result<(), Error> {
+        self.run(move |d| {
+            let _ = d.set_pfl_mode(pfl, exclusive);
+        });
+        Ok(())
+    }
+
     fn set_speaker_b(&mut self, on: bool) -> Result<(), Error> {
         self.run(move |d| {
             let _ = d.set_speaker_b(on);

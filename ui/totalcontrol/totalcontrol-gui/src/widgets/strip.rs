@@ -308,6 +308,8 @@ pub struct StripParams<'a> {
     pub open_flyout: Option<FlyoutKind>,
     pub mute: bool,
     pub solo: bool,
+    /// PFL replaces Solo for this input strip (Control Room setting).
+    pub pfl: bool,
     /// Off, but held for the sidebar's Mute / Solo master to bring back
     /// (`theme::armed_toggle_button`). Set by `app::finish_params`.
     pub mute_armed: bool,
@@ -658,12 +660,17 @@ fn collapsed_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         scale,
     );
     let solo_btn = hint(
-        button(centered_label("S", theme::TEXT_XS * scale))
-            .width(Length::Fill)
-            .height(btn_h)
-            .style(theme::armed_toggle_button(p.solo, p.solo_armed, theme::SOLO_COLOR))
-            .on_press(Message::Solo(cid, !p.solo)),
-        if p.solo_armed {
+        button(centered_label(
+            if p.pfl { "PFL" } else { "S" },
+            theme::TEXT_XS * scale,
+        ))
+        .width(Length::Fill)
+        .height(btn_h)
+        .style(theme::armed_toggle_button(p.solo, p.solo_armed, theme::SOLO_COLOR))
+        .on_press(Message::Solo(cid, !p.solo)),
+        if p.pfl {
+            "PFL (pre-fader listen) to the Cue/PFL target"
+        } else if p.solo_armed {
             "Solo (switched off by the S master, which brings it back)"
         } else {
             "Solo"
@@ -814,12 +821,21 @@ fn full_strip<'a>(p: StripParams<'a>, w: f32) -> Element<'a, Message> {
         scale,
     );
     let solo_btn = hint(
-        button(centered_label("S", theme::TEXT_SM * scale))
-            .width(Length::Fill)
-            .height(btn_h)
-            .style(theme::armed_toggle_button(p.solo, p.solo_armed, theme::SOLO_COLOR))
-            .on_press(Message::Solo(cid, !p.solo)),
-        if p.solo_armed {
+        button(centered_label(
+            if p.pfl { "PFL" } else { "S" },
+            if p.pfl {
+                theme::TEXT_XS * scale
+            } else {
+                theme::TEXT_SM * scale
+            },
+        ))
+        .width(Length::Fill)
+        .height(btn_h)
+        .style(theme::armed_toggle_button(p.solo, p.solo_armed, theme::SOLO_COLOR))
+        .on_press(Message::Solo(cid, !p.solo)),
+        if p.pfl {
+            "PFL (pre-fader listen) to the Cue/PFL target"
+        } else if p.solo_armed {
             "Solo (switched off by the S master, which brings it back)"
         } else {
             "Solo"

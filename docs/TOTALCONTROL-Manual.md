@@ -412,8 +412,8 @@ The buttons are one channel wide, in TotalMix’s order:
 | `speaker B` | Latching | Switches monitoring between Main and Speaker B | No, runtime only |
 | `mono` | Latching | Main Out and Speaker B | Yes |
 | `talkback` | Toggle | Phones with Talkback receive, plus Main for Listenback | No, runtime only |
-| `ext. input` | Disabled | — | — |
-| `mute FX` | Latching | Reverb and Echo returns (see below) | Yes |
+| `ext. input` | Latching | Main Out and Speaker B | No, runtime only |
+| `mute FX` | Latching | Reverb and Echo returns on Main Out and Speaker B | Yes |
 | `settings` | Opens the dialog | — | No |
 | `assign` | Opens the menu | The monitoring assignments | No, preferences |
 
@@ -509,16 +509,35 @@ the Talkback button and the receive switches.
 returns on the monitored outputs without switching either effect off.
 Releasing it restores the previous return levels.
 
-In the current build Mute FX writes the FX-return levels of the AN1/2 and
-Phones output blocks. On the default assignment that covers Main Out; if
-Main Out or Speaker B is assigned to another pair, Mute FX does not follow
-that assignment. Mute FX is part of the mixer scene.
+Mute FX follows the assigned Main Out and Speaker B pairs: it saves their
+FX-return levels, writes −65 dB, and restores the exact saved levels when the
+button is released. Phones outputs are never part of this path. Mute FX is
+part of the mixer scene.
 
 ### External input
 
-**Ext. input** is shown dimmed and does nothing in this build. Its source and
-gain are stored in Control Room Settings, but the runtime signal path that
-would replace the Main mix with the selected stereo input is not implemented.
+**Ext. input** replaces the Main Out and Speaker B submixes with the stereo
+hardware-input pair selected in Control Room Settings. It applies the
+configured gain, silences the FX returns on those two monitor pairs, and
+latches the button. Releasing it restores the normal submix and the saved FX
+returns. The source list contains hardware inputs only.
+
+The button is available when a source pair is configured and a Main Out is
+assigned. Changing the source or gain while External Input is active
+re-engages the path with the new values.
+
+### PFL
+
+With `Live Mode, PFL replaces Solo` enabled, the Solo button on every input
+strip becomes **PFL**. PFL sends that input pre-fader and at unity to the
+selected `Cue/PFL to` output, silences the other sources in that output, and
+temporarily mutes that output's FX returns. Releasing the last PFL input
+restores the previous submix and FX returns.
+
+`Exclusive Solo/PFL Mode` keeps only one input pair listening at a time. The
+Control Strip's global Solo master shows `F` while a PFL input is active; it
+turns the active PFL inputs off and can bring them back, like the ordinary
+Solo master. Playback and output Solo behave normally.
 
 ### What is stored where
 
@@ -527,8 +546,7 @@ would replace the Main mix with the selected stereo input is not implemented.
 | Main and Speaker B assignments | TotalControl preferences |
 | Phones 1–4 destinations | TotalControl preferences |
 | Main Dim amount, Recall level, Talkback/Listenback settings, Speaker B link | TotalControl preferences |
-| Dim and Speaker B active state | Runtime only |
-| Talkback and Listenback active state | Runtime only |
+| Dim, Speaker B, External Input, PFL and Talkback/Listenback active state | Runtime only |
 | Mono, Mute FX and the mixer levels | Mixer scene |
 
 ### Control Room Settings
@@ -550,9 +568,9 @@ five level controls cover `-65.0` to `0.0 dB` in `0.5 dB` steps. The settings
 are saved per device in TotalControl's own preferences, not in the mixer scene.
 
 `OK` applies and saves the values; `Cancel` and `Escape` discard the edits.
-The settings in the dialog are not written while it is open. External Input
-and the Solo/PFL modes are stored, but their runtime signal paths are not
-connected in this build.
+The settings in the dialog are not written while it is open. `OK` applies
+the External Input source and gain and the Solo/PFL modes to the running
+device; `Cancel` and `Escape` leave the current signal paths unchanged.
 
 ### Assigning outputs
 

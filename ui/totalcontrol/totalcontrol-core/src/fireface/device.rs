@@ -552,6 +552,17 @@ pub struct Fireface {
     mute_saved: HashMap<ChannelId, (Vec<f32>, Vec<i8>)>,
     /// Saved output fader while the output is muted.
     output_mute_saved: HashMap<usize, f32>,
+    /// FX-return levels saved while Control Room Mute FX is engaged.
+    mute_fx_saved: Option<Vec<(usize, f32)>>,
+    /// Target pairs and FX-return levels saved while External Input is
+    /// engaged.  The matrix itself is restored from the channel model.
+    external_input_saved: Option<(Vec<usize>, Vec<(usize, f32)>)>,
+    /// Cue target pair and its FX-return levels while PFL is active.
+    pfl_saved: Option<(usize, Vec<(usize, f32)>)>,
+    pfl_active: HashSet<ChannelId>,
+    pfl_target: Option<usize>,
+    pfl_mode: bool,
+    pfl_exclusive: bool,
     /// Speaker pairs and their saved levels while control-room Dim is
     /// engaged.  RME's Dim attenuates the monitor speakers (Main and
     /// Speaker B), not the Phones outputs.
@@ -1064,6 +1075,13 @@ impl Fireface {
             soloed: HashSet::new(),
             mute_saved: HashMap::new(),
             output_mute_saved: HashMap::new(),
+            mute_fx_saved: None,
+            external_input_saved: None,
+            pfl_saved: None,
+            pfl_active: HashSet::new(),
+            pfl_target: None,
+            pfl_mode: false,
+            pfl_exclusive: false,
             dim_saved: Vec::new(),
             dim_amount_db: -20.0,
             speaker_b_linked: false,
@@ -2648,7 +2666,8 @@ impl Fireface {
             }
         }
 
-        let old_flag = (self.settings.mono as u16) << 1;
+        let old_flag = (self.settings.mono as u16) << 1
+            | ((self.settings.external_input as u16) << 5);
         let flag_addr = 0x3f9e;
         push_edit(&mut edits, flag_addr, old_flag, old_flag | 1);
 
@@ -3301,6 +3320,111 @@ impl Fireface {
         self.set_phones_ref(self.settings.phones_ref)?;
         self.set_line_in_ref_58(self.settings.line_in_ref_58)?;
         self.ucx_write_options()
+    }
+
+    /// Current monitor flag word (`0x3f9e`): bit 0 Talkback, bit 1 Mono,
+    /// bit 5 External Input.
+    fn monitor_flags(&self) -> u16 {
+        (self.talkback_active as u16)
+            | ((self.settings.mono as u16) << 1)
+            | ((self.settings.external_input as u16) << 5)
+    }
+
+    /// Write the model's normal sends back into one output pair.
+    fn restore_pair_from_model(&mut self, pair: usize) -> Result<(), Error> {
+        for idx in 0..self.inputs.len() {
+            self.write_input_send(idx, pair)?;
+        }
+        for idx in 0..self.playbacks.len() {
+            self.write_playback_send(idx, pair)?;
+        }
+        Ok(())
+    }
+
+    fn release_external_input(&mut self) -> Result<(), Error> {
+        let Some((pairs, fx)) = self.external_input_saved.take() else {
+            self.settings.external_input = false;
+            return Ok(());
+        };
+        for pair in pairs {
+            self.restore_pair_from_model(pair)?;
+        }
+        for (idx, db) in fx {
+            self.ucx_write_fx_return(idx, db)?;
+        }
+        self.settings.external_input = false;
+        self.write_word(0x3f9e, self.monitor_flags())?;
+        Ok(())
+    }
+
+    /// Rewrite the cue target so it contains only the active PFL inputs at
+    /// unity; all other sources are silent.
+    fn rewrite_pfl_target(&mut self) -> Result<(), Error> {
+        let Some((target, _)) = self.pfl_saved else {
+            return Ok(());
+        };
+        let dsp = ucx::output_pair_dsp(target)
+            .ok_or_else(|| Error::InvalidChannel(format!("cue target {target}")))?;
+        let sources = self.inputs.len() + self.playbacks.len();
+        let mut writes = Vec::new();
+        for source in 0..sources {
+            let Some(channel) = Self::matrix_source_channel(source) else {
+                continue;
+            };
+            let source = match channel {
+                ChannelId::Input(i) => Source::Input(i),
+                ChannelId::Playback(p) => Source::Playback(p),
+                ChannelId::Output(_) => continue,
+            };
+            for block in [dsp, dsp + 1] {
+                writes.push((ucx::matrix_reg(block as u8, source), 0));
+            }
+        }
+        for channel in &self.pfl_active {
+            let ChannelId::Input(idx) = *channel else {
+                continue;
+            };
+            if idx < 4 {
+                for block in [dsp, dsp + 1] {
+                    writes.push((
+                        ucx::matrix_reg(block as u8, Source::Input(idx)),
+                        ucx::matrix_gain(1.0),
+                    ));
+                }
+            } else {
+                let base = idx & !1;
+                if base + 1 < self.inputs.len() {
+                    writes.push((
+                        ucx::matrix_reg(dsp as u8, Source::Input(base)),
+                        ucx::matrix_gain(1.0),
+                    ));
+                    writes.push((
+                        ucx::matrix_reg((dsp + 1) as u8, Source::Input(base + 1)),
+                        ucx::matrix_gain(1.0),
+                    ));
+                }
+            }
+        }
+        self.write_words(&writes)
+    }
+
+    fn release_pfl(&mut self) -> Result<(), Error> {
+        let Some((target, fx)) = self.pfl_saved.take() else {
+            self.pfl_active.clear();
+            return Ok(());
+        };
+        self.restore_pair_from_model(target)?;
+        for (idx, db) in fx {
+            self.ucx_write_fx_return(idx, db)?;
+        }
+        for channel in std::mem::take(&mut self.pfl_active) {
+            if let ChannelId::Input(idx) = channel {
+                if let Some(input) = self.inputs.get_mut(idx) {
+                    input.solo = false;
+                }
+            }
+        }
+        Ok(())
     }
 
 }
@@ -4379,6 +4503,14 @@ impl RmeDevice for Fireface {
         if previous == pair {
             return Ok(());
         }
+        // Mute FX and External Input saved the old target levels; restore
+        // them before the assignment moves.
+        if self.settings.mute_fx {
+            self.set_mute_fx(false)?;
+        }
+        if self.settings.external_input {
+            self.release_external_input()?;
+        }
         // Dim saved the levels of the old Main and Speaker B pairs.
         // Release it before moving or clearing the assignment, so those
         // pairs return to their saved levels.
@@ -4422,6 +4554,12 @@ impl RmeDevice for Fireface {
         if previous == pair {
             return Ok(());
         }
+        if self.settings.mute_fx {
+            self.set_mute_fx(false)?;
+        }
+        if self.settings.external_input {
+            self.release_external_input()?;
+        }
         if self.settings.speaker_b {
             self.set_speaker_b(false)?;
         }
@@ -4454,30 +4592,238 @@ impl RmeDevice for Fireface {
         Ok(())
     }
 
-    /// Control Room Mute FX: the control-room outputs' FX returns drop to
-    /// `0xFD76` (−65 dB) while it is engaged, and are restored from the
-    /// model afterwards (measured H90; no flag register).
+    /// Control Room Mute FX: the assigned Main Out and Speaker B FX returns
+    /// drop to `-65 dB` while it is engaged, and the exact previous levels
+    /// are restored afterwards.  Phones is not part of the monitor-speaker
+    /// pair.
     fn set_mute_fx(&mut self, on: bool) -> Result<(), Error> {
         if self.is_uc() {
             return Err(Error::InvalidChannel(
                 "Mute FX is not decoded on the UC".into(),
             ));
         }
-        const MUTED: u16 = 0xFD76;
-        for reg in [0x1203u16, 0x1303, 0x1803, 0x1903] {
-            let value = if on {
-                MUTED
-            } else {
-                // Restore the model's return for that channel, in 0.1 dB.
-                // The model is Phones-first: 0x12 is AN1/2 and 0x18 is
-                // Phones, not the other way around.
-                let idx = ucx::output_index_from_state(reg & 0xff00)
-                    .ok_or_else(|| Error::InvalidChannel(format!("output 0x{reg:04x}")))?;
-                (self.outputs[idx].fx_return_db.clamp(-65.0, 0.0) * 10.0).round() as i16 as u16
-            };
-            self.write_word(reg, value)?;
+        let Some(main) = self.settings.main_out else {
+            self.settings.mute_fx = false;
+            self.mute_fx_saved = None;
+            return Ok(());
+        };
+        let mut pairs = vec![main];
+        if let Some(b) = self.settings.main_b_out {
+            if b != main {
+                pairs.push(b);
+            }
         }
-        self.settings.mute_fx = on;
+        if on == self.settings.mute_fx {
+            return Ok(());
+        }
+        if on {
+            let mut saved = Vec::with_capacity(pairs.len() * 2);
+            for pair in pairs {
+                for side in 0..2 {
+                    let idx = pair * 2 + side;
+                    let Some(output) = self.outputs.get(idx) else {
+                        continue;
+                    };
+                    saved.push((idx, output.fx_return_db));
+                }
+            }
+            self.mute_fx_saved = Some(saved);
+            let saved = self.mute_fx_saved.clone().unwrap_or_default();
+            for (idx, _) in saved {
+                self.ucx_write_fx_return(idx, -65.0)?;
+            }
+            self.settings.mute_fx = true;
+            return Ok(());
+        }
+
+        let saved = self.mute_fx_saved.take().unwrap_or_else(|| {
+            pairs
+                .iter()
+                .flat_map(|pair| [pair * 2, pair * 2 + 1])
+                .filter_map(|idx| self.outputs.get(idx).map(|out| (idx, out.fx_return_db)))
+                .collect()
+        });
+        for (idx, db) in saved {
+            self.ucx_write_fx_return(idx, db)?;
+        }
+        self.settings.mute_fx = false;
+        Ok(())
+    }
+
+    /// Control Room External Input: route the selected hardware input pair
+    /// into the Main Out and Speaker B submixes at the configured gain,
+    /// mute those pairs' FX returns, and set monitor flag bit 5.
+    fn set_external_input(
+        &mut self,
+        on: bool,
+        source: Option<usize>,
+        gain_db: f32,
+    ) -> Result<(), Error> {
+        if self.is_uc() {
+            return Err(Error::InvalidChannel(
+                "External Input is not decoded on the UC".into(),
+            ));
+        }
+        let _batch = self.begin_write_batch();
+        if self.settings.external_input {
+            self.release_external_input()?;
+        }
+        if !on {
+            return Ok(());
+        }
+        let Some(main) = self.settings.main_out else {
+            return Err(Error::InvalidChannel(
+                "External Input needs an assigned Main Out".into(),
+            ));
+        };
+        let source = source
+            .ok_or_else(|| Error::InvalidChannel("External Input needs a source pair".into()))?;
+        let left = source * 2;
+        let right = left + 1;
+        if right >= self.inputs.len() {
+            return Err(Error::InvalidChannel(format!(
+                "External Input source pair {source}"
+            )));
+        }
+        if self.settings.mute_fx {
+            self.set_mute_fx(false)?;
+        }
+        let mut pairs = vec![main];
+        if let Some(b) = self.settings.main_b_out {
+            if b != main {
+                pairs.push(b);
+            }
+        }
+        let gain = 10f32.powf(gain_db.clamp(-65.0, 0.0) / 20.0).clamp(0.0, 1.0);
+        let mut writes = Vec::new();
+        let mut fx_saved = Vec::new();
+        for pair in &pairs {
+            let dsp = ucx::output_pair_dsp(*pair)
+                .ok_or_else(|| Error::InvalidChannel(format!("output pair {pair}")))?;
+            let sources = self.inputs.len() + self.playbacks.len();
+            for source in 0..sources {
+                let Some(channel) = Self::matrix_source_channel(source) else {
+                    continue;
+                };
+                let source = match channel {
+                    ChannelId::Input(i) => Source::Input(i),
+                    ChannelId::Playback(p) => Source::Playback(p),
+                    ChannelId::Output(_) => continue,
+                };
+                for block in [dsp, dsp + 1] {
+                    writes.push((ucx::matrix_reg(block as u8, source), 0));
+                }
+            }
+            writes.push((
+                ucx::matrix_reg(dsp as u8, Source::Input(left)),
+                ucx::matrix_gain(gain as f64),
+            ));
+            writes.push((
+                ucx::matrix_reg((dsp + 1) as u8, Source::Input(right)),
+                ucx::matrix_gain(gain as f64),
+            ));
+            for side in 0..2 {
+                let idx = pair * 2 + side;
+                if let Some(out) = self.outputs.get(idx) {
+                    fx_saved.push((idx, out.fx_return_db));
+                }
+            }
+        }
+        for (idx, _) in &fx_saved {
+            let dsp = ucx::output_pair_dsp(idx / 2)
+                .ok_or_else(|| Error::InvalidChannel(format!("output {idx}")))?;
+            writes.push((
+                ucx::channel_reg(ucx::output_channel(dsp + idx % 2), ucx::offset::FX_RETURN),
+                0xfd76,
+            ));
+        }
+        self.settings.external_input = true;
+        writes.push((0x3f9e, self.monitor_flags()));
+        self.write_words(&writes)?;
+        self.external_input_saved = Some((pairs, fx_saved));
+        Ok(())
+    }
+
+    fn set_cue_target(&mut self, pair: Option<usize>) -> Result<(), Error> {
+        if let Some(pair) = pair {
+            if pair >= BLOCKS / 2 {
+                return Err(Error::InvalidChannel(format!("cue target {pair}")));
+            }
+        }
+        if self.pfl_saved.is_some() {
+            self.release_pfl()?;
+        }
+        self.pfl_target = pair;
+        Ok(())
+    }
+
+    fn set_pfl_mode(&mut self, pfl: bool, exclusive: bool) -> Result<(), Error> {
+        self.pfl_mode = pfl;
+        self.pfl_exclusive = exclusive;
+        if !pfl && self.pfl_saved.is_some() {
+            self.release_pfl()?;
+        }
+        Ok(())
+    }
+
+    fn set_pfl(&mut self, channel: ChannelId, on: bool) -> Result<(), Error> {
+        if !self.pfl_mode {
+            return self.set_solo(channel, on);
+        }
+        let ChannelId::Input(idx) = channel else {
+            return Ok(());
+        };
+        let _batch = self.begin_write_batch();
+        if idx >= self.inputs.len() {
+            return Err(Error::InvalidChannel(format!("input {idx}")));
+        }
+        if on {
+            if self.pfl_exclusive
+                && !self
+                    .pfl_active
+                    .iter()
+                    .any(|active| matches!(active, ChannelId::Input(i) if i / 2 == idx / 2))
+            {
+                for active in std::mem::take(&mut self.pfl_active) {
+                    if let ChannelId::Input(i) = active {
+                        if let Some(input) = self.inputs.get_mut(i) {
+                            input.solo = false;
+                        }
+                    }
+                }
+            }
+            if let Some(input) = self.inputs.get_mut(idx) {
+                input.solo = true;
+            }
+            self.pfl_active.insert(channel);
+            if self.pfl_saved.is_none() {
+                let target = self
+                    .pfl_target
+                    .ok_or_else(|| Error::InvalidChannel("PFL needs a Cue/PFL target".into()))?;
+                let mut fx_saved = Vec::new();
+                for side in 0..2 {
+                    let out = target * 2 + side;
+                    if let Some(output) = self.outputs.get(out) {
+                        fx_saved.push((out, output.fx_return_db));
+                    }
+                }
+                for (out, _) in &fx_saved {
+                    self.ucx_write_fx_return(*out, -65.0)?;
+                }
+                self.pfl_saved = Some((target, fx_saved));
+            }
+            self.rewrite_pfl_target()?;
+        } else {
+            self.pfl_active.remove(&channel);
+            if let Some(input) = self.inputs.get_mut(idx) {
+                input.solo = false;
+            }
+            if self.pfl_active.is_empty() {
+                self.release_pfl()?;
+            } else {
+                self.rewrite_pfl_target()?;
+            }
+        }
         Ok(())
     }
 
@@ -4527,7 +4873,7 @@ impl RmeDevice for Fireface {
         }
         // Monitor flags: bit 0 Talkback, bit 1 Mono Main Out.  The mask
         // word is 0x83ff while Mono is active and 0xffff when it is idle.
-        let flags = (self.talkback_active as u16) | ((on as u16) << 1);
+        let flags = self.monitor_flags() & !2 | ((on as u16) << 1);
         self.write_words(&[
             (0x3f9e, flags),
             (0x3f98, if on { 0x83ff } else { 0xffff }),
@@ -5195,6 +5541,7 @@ impl RmeDevice for Fireface {
         let mut settings = self.settings.clone();
         settings.dim = false;
         settings.speaker_b = false;
+        settings.external_input = false;
         Scene {
             name: "Auto".into(),
             model: self.canonical_model().to_string(),
@@ -5614,9 +5961,24 @@ impl RmeDevice for Fireface {
             // would dim the Main Out a second time.
             self.settings.dim = false;
             self.dim_saved.clear();
+            self.settings.external_input = false;
+            self.external_input_saved = None;
+            for channel in std::mem::take(&mut self.pfl_active) {
+                if let ChannelId::Input(idx) = channel {
+                    if let Some(input) = self.inputs.get_mut(idx) {
+                        input.solo = false;
+                    }
+                }
+            }
+            self.pfl_saved = None;
             self.write_word(ucx::global::DIM, 0)?;
             self.set_mono(self.settings.mono)?;
-            self.set_mute_fx(self.settings.mute_fx)?;
+            // The scene has just written its FX-return levels.  Force a
+            // fresh Mute FX engagement if the scene requests it.
+            let mute_fx = self.settings.mute_fx;
+            self.settings.mute_fx = false;
+            self.mute_fx_saved = None;
+            self.set_mute_fx(mute_fx)?;
         }
         if !self.is_uc() {
             self.apply_ucx_preamp_state()?;
@@ -6443,6 +6805,14 @@ mod tests {
     }
 
     #[test]
+    fn ucx_control_room_scene_does_not_carry_runtime_external_input() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        dev.settings.external_input = true;
+        let scene = dev.capture_scene();
+        assert!(!scene.settings.external_input);
+    }
+
+    #[test]
     fn ucx_scene_apply_keeps_the_live_speaker_b_state() {
         let (mut dev, _writes) = open(Model::Ucx);
         dev.settings.speaker_b = true;
@@ -6455,6 +6825,7 @@ mod tests {
     #[test]
     fn ucx_scene_apply_restores_mono_and_mute_fx() {
         let (mut dev, writes) = open(Model::Ucx);
+        dev.set_main_out(Some(1)).unwrap();
         dev.settings.mono = true;
         dev.settings.mute_fx = true;
         let scene = dev.capture_scene();
@@ -6471,22 +6842,92 @@ mod tests {
     }
 
     #[test]
-    fn ucx_mute_fx_restores_phones_first_fx_returns() {
+    fn ucx_mute_fx_restores_main_and_speaker_b_fx_returns() {
         let (mut dev, writes) = open(Model::Ucx);
-        // Internal order is Phones, AN1/2, AN3/4...; the registers are
-        // 0x18 for Phones and 0x12 for AN1/2.
-        dev.outputs[0].fx_return_db = -45.5;
-        dev.outputs[1].fx_return_db = -45.5;
+        dev.set_main_out(Some(1)).unwrap();
+        dev.set_main_out_b(Some(2)).unwrap();
+        // Internal order is Phones, AN1/2, AN3/4...; main is AN1/2 and
+        // Speaker B is AN3/4, so Phones must not be touched.
         dev.outputs[2].fx_return_db = -12.3;
         dev.outputs[3].fx_return_db = -12.3;
-        dev.settings.mute_fx = true;
+        dev.outputs[4].fx_return_db = -45.5;
+        dev.outputs[5].fx_return_db = -45.5;
+        dev.set_mute_fx(true).unwrap();
         writes.lock().unwrap().clear();
         dev.set_mute_fx(false).unwrap();
         let words = written_words(&writes);
-        assert!(words.contains(&(0x1803, (-455i16) as u16)));
-        assert!(words.contains(&(0x1903, (-455i16) as u16)));
         assert!(words.contains(&(0x1203, (-123i16) as u16)));
         assert!(words.contains(&(0x1303, (-123i16) as u16)));
+        assert!(words.contains(&(0x1403, (-455i16) as u16)));
+        assert!(words.contains(&(0x1503, (-455i16) as u16)));
+        assert!(!words.iter().any(|(r, _)| *r == 0x1803 || *r == 0x1903));
+    }
+
+    #[test]
+    fn ucx_external_input_routes_the_source_pair_and_sets_the_monitor_flag() {
+        let (mut dev, writes) = open(Model::Ucx);
+        dev.set_main_out(Some(1)).unwrap();
+        dev.set_main_out_b(Some(2)).unwrap();
+        writes.lock().unwrap().clear();
+        dev.set_external_input(true, Some(0), -6.0).unwrap();
+        let words = written_words(&writes);
+        // Main (AN1/2) and Speaker B (AN3/4) carry the selected Mic 1/2 pair
+        // at -6 dB; the Source A side goes to the left block, Source B to
+        // the right.
+        let gain = ucx::matrix_gain(10f64.powf(-6.0 / 20.0));
+        assert!(words.contains(&(ucx::matrix_reg(0, Source::Input(0)), gain)));
+        assert!(words.contains(&(ucx::matrix_reg(1, Source::Input(1)), gain)));
+        assert!(words.contains(&(ucx::matrix_reg(2, Source::Input(0)), gain)));
+        assert!(words.contains(&(ucx::matrix_reg(3, Source::Input(1)), gain)));
+        // Both FX returns of both monitor pairs are muted.
+        for reg in [0x1203, 0x1303, 0x1403, 0x1503] {
+            assert!(words.contains(&(reg, 0xfd76)), "missing FX mute {reg:04x}");
+        }
+        assert!(words.contains(&(0x3f9e, 0x20)));
+        assert!(dev.settings().external_input);
+
+        writes.lock().unwrap().clear();
+        dev.set_external_input(false, None, 0.0).unwrap();
+        let words = written_words(&writes);
+        assert!(words.contains(&(0x3f9e, 0)));
+        assert!(!dev.settings().external_input);
+    }
+
+    #[test]
+    fn ucx_pfl_routes_the_input_at_unity_and_restores_the_target() {
+        let (mut dev, writes) = open(Model::Ucx);
+        dev.set_cue_target(Some(0)).unwrap();
+        dev.set_pfl_mode(true, true).unwrap();
+        writes.lock().unwrap().clear();
+        dev.set_pfl(ChannelId::Input(0), true).unwrap();
+        let words = written_words(&writes);
+        assert!(words.contains(&(ucx::matrix_reg(6, Source::Input(0)), ucx::matrix_gain(1.0))));
+        assert!(dev.inputs[0].solo);
+        assert!(words.contains(&(0x1803, 0xfd76)));
+        assert!(words.contains(&(0x1903, 0xfd76)));
+
+        writes.lock().unwrap().clear();
+        dev.set_pfl(ChannelId::Input(0), false).unwrap();
+        assert!(!dev.inputs[0].solo);
+        // The target FX returns come back and the listening set is empty.
+        assert!(words.contains(&(0x1803, 0xfd76)));
+        assert!(words.contains(&(0x1903, 0xfd76)));
+        assert!(dev.pfl_active.is_empty());
+    }
+
+    #[test]
+    fn ucx_pfl_exclusive_keeps_only_one_input_pair() {
+        let (mut dev, _writes) = open(Model::Ucx);
+        dev.set_cue_target(Some(0)).unwrap();
+        dev.set_pfl_mode(true, true).unwrap();
+        dev.set_pfl(ChannelId::Input(0), true).unwrap();
+        dev.set_pfl(ChannelId::Input(2), true).unwrap();
+        assert!(dev.pfl_active.contains(&ChannelId::Input(2)));
+        assert!(!dev.pfl_active.contains(&ChannelId::Input(0)));
+        assert!(!dev.inputs[0].solo);
+        assert!(dev.inputs[2].solo);
+        dev.set_pfl(ChannelId::Input(2), false).unwrap();
+        assert!(dev.pfl_active.is_empty());
     }
 
     #[test]
