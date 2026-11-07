@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       kernel: ${{ steps.changes.outputs.kernel }}
       core: ${{ steps.changes.outputs.core }}
@@ -23,7 +23,7 @@ jobs:
       usb: ${{ steps.changes.outputs.usb }}
       alsa_plugin: ${{ steps.changes.outputs.alsa_plugin }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -59,18 +59,18 @@ jobs:
           echo "alsa_plugin=$(flag "$rust_all" '^ui/totalcontrol/tools/alsa/')" >> "$GITHUB_OUTPUT"
 
   docs:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Check documentation
         run: python3 scripts/check-docs.py
 
   kernel:
     needs: changes
     if: needs.changes.outputs.kernel == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -81,12 +81,12 @@ jobs:
   core:
     needs: changes
     if: needs.changes.outputs.core == 'true' || needs.changes.outputs.gui == 'true' || needs.changes.outputs.tui == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: ui/totalcontrol
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -101,12 +101,12 @@ jobs:
   gui:
     needs: changes
     if: needs.changes.outputs.core == 'true' || needs.changes.outputs.gui == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: ui/totalcontrol
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -128,12 +128,12 @@ jobs:
   tui:
     needs: changes
     if: needs.changes.outputs.core == 'true' || needs.changes.outputs.tui == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: ui/totalcontrol
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -148,12 +148,12 @@ jobs:
   usb:
     needs: changes
     if: needs.changes.outputs.core == 'true' || needs.changes.outputs.usb == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: ui/totalcontrol
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -170,12 +170,12 @@ jobs:
   alsa_plugin:
     needs: changes
     if: needs.changes.outputs.alsa_plugin == 'true' || needs.changes.outputs.usb == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: ui/totalcontrol
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -200,7 +200,7 @@ jobs:
       - usb
       - alsa_plugin
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Fail when a required job failed
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
