@@ -616,6 +616,8 @@ fn msf_row(state: &TotalControl, scale: f32) -> Element<'_, Message> {
     let mute_held = !any_mute && !state.last_cleared_mutes.is_empty();
     let solo_held = !any_solo && !state.last_cleared_solos.is_empty();
     let has_group = !state.selected.is_empty();
+    let pfl = state.control_room.pfl_replaces_solo;
+    let solo_label = if pfl && any_solo { "F" } else { "S" };
     let cell = |label: &'static str| {
         button(text(label).size(theme::TEXT_SM * scale).center())
             .padding(theme::SPACE_SM * scale)
@@ -638,14 +640,18 @@ fn msf_row(state: &TotalControl, scale: f32) -> Element<'_, Message> {
             scale,
         ),
         hint(
-            cell("S")
+            cell(solo_label)
                 .style(theme::armed_toggle_button(
                     any_solo,
                     solo_held,
                     theme::SOLO_COLOR
                 ))
                 .on_press(Message::GlobalSoloToggle),
-            if solo_held {
+            if pfl && any_solo {
+                "PFL master: switch the active PFL inputs off"
+            } else if pfl {
+                "PFL master: no input is listening"
+            } else if solo_held {
                 "Solo master: bring the held solos back"
             } else {
                 "Solo master: switch the active solos off"

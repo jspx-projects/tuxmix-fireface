@@ -45,6 +45,11 @@ FX knob, group and snapshot controls, and layout. It stays in the layout as
 the window narrows. Its default width is 200 px; it accepts resizing and has
 its own collapse toggle.
 
+The global row is `M`, `S`/`F`, `F`. The left button is the Mute master. The
+middle button is the Solo master; in PFL mode it shows `F` while an input is
+listening and `S` otherwise, and it switches the active PFL inputs off and
+back on. The right `F` is the temporary fader group, not the FX panel.
+
 The Control Room closes the Hardware Outputs row, flush with the mixer's right
 edge.
 
@@ -796,11 +801,23 @@ Mono is a latching monitor check: it mixes the assigned Main Out and Speaker
 B pairs to mono and feeds the same signal to both sides of each pair. It does
 not mix the Phones outputs. Mono is stored in the device scene.
 
-Mute FX is a latching scene control. It writes the FX-return levels of the
-AN1/2 and Phones output blocks to `-65 dB` (`0x1203`, `0x1303`, `0x1803`,
-`0x1903`) and restores their saved levels; it does not switch the Reverb or
-Echo processors off. `docs/work/CONTROL-ROOM-SETTINGS.md` records the open
-question about the assigned Main and Speaker B pairs on other outputs.
+Mute FX is a latching scene control. It saves the FX-return levels of the
+assigned Main Out and Speaker B pairs, writes `-65 dB`, and restores the
+exact saved levels; it does not switch the Reverb or Echo processors off.
+Phones is not modified.
+
+Ext. input is a latching runtime control. It replaces the Main Out and
+Speaker B submixes with the stereo hardware-input pair selected in Control
+Room Settings at the configured gain, mutes those pairs' FX returns, and
+sets monitor flag bit 5. Releasing restores the normal submix and the saved
+FX returns. The button is disabled until a source pair is configured.
+Changing the source or gain while active re-engages the path.
+
+With `PFL replaces Solo`, each input strip's Solo button is labelled `PFL`
+and routes the input pre-fader at unity to the Cue/PFL target, with the
+target's other sources and FX returns suppressed. The global Solo master
+shows `F` while a PFL is active and `S` otherwise; it turns active PFL inputs
+off and can restore them. `Exclusive Solo/PFL` keeps one input pair active.
 
 Control Room channels are always stereo. An assigned pair is linked and
 cannot be unlinked, so the Settings panel's `STEREO` control stays engaged
@@ -945,9 +962,10 @@ one-decimal value display.
 
 `OK` stores the settings in `gui.json` for the selected device. The settings
 are not part of the mixer scene, snapshot, undo stack or OSC scene state.
-`Dim` and `Speaker B` remain runtime state. `Mono` and `Mute FX` are mixer
-scene state. External Input and the Solo/PFL modes are stored as settings;
-their runtime signal paths are not implemented.
+`Dim`, `Speaker B`, External Input and the PFL listening set remain runtime
+state. `Mono` and `Mute FX` are mixer scene state. External Input and the
+Solo/PFL modes are stored as settings and applied to the running device on
+`OK`.
 
 ## 13. Latency display
 

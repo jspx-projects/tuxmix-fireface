@@ -229,7 +229,7 @@ stream live state changes.
 | `0x3f10` | constant `0x7070` |
 | `0x3f50` | constant `0` |
 | `0x3d03` | DIM |
-| `0x3f9e` | monitor flags; bit 0 = Talkback active, bit 1 = Mono Main Out |
+| `0x3f9e` | monitor flags; bit 0 = Talkback active, bit 1 = Mono Main Out, bit 5 = External Input active |
 | `0x0002`, `0x0102` | input stereo mode |
 | `0x0202`, `0x0302` | input stereo mode, second pair |
 | `0x1204`, `0x1304` | output stereo mode |
@@ -408,7 +408,7 @@ The fader base is submix-dependent: the selected hardware output chooses the
 | `0x3d45`, `0x3d46` | unknown | writable words |
 | `0x3f00` | heartbeat / window | sequence |
 | `0x3f98` | monitor mask; `0x83ff` with Mono, `0xfc40` with Cue, `0xffff` idle | — |
-| `0x3f9e` | monitor flags; bit 0 Talkback, bit 1 Mono Main Out | — |
+| `0x3f9e` | monitor flags; bit 0 Talkback, bit 1 Mono Main Out, bit 5 External Input | — |
 
 The requested dump emits only `0x3d00`–`0x3d04`, `0x3d20`–`0x3d22` and
 `0x3d40`–`0x3d46`. `0x3d05`–`0x3d1f` and `0x3d23`–`0x3d3f` are not present.
@@ -433,6 +433,26 @@ Switching Speaker B on writes `NN02` bit 1 on the Main pair, clears it on the
 Speaker B pair, and writes `0x3d00 = 1`. Switching it off reverses the two
 mode words and writes `0x3d00 = 0`. Bit 0 is the output mute and is preserved
 in both writes.
+
+Mute FX is host-driven. It saves the FX-return levels (`NN03`) of both sides
+of the assigned Main Out and Speaker B pairs, writes `0xFD76` (−65 dB) to
+them, and restores the saved levels when released. Phones is not part of the
+monitor-speaker pair and is not modified.
+
+External Input replaces the Main Out and Speaker B submixes with a hardware
+input pair. For each target pair it zeroes every input and playback
+crosspoint, routes the selected input pair's left and right sources at the
+configured gain, writes `0xFD76` to both FX returns, and sets `0x3f9e` bit 5.
+Releasing restores the submix from the channel model, restores the saved
+FX-return levels and clears bit 5. The source is a stereo hardware-input
+pair; playback sources are not eligible.
+
+PFL is a host-driven alternative to Solo for input channels. The selected
+Cue/PFL output pair is rewritten to contain only the active PFL inputs at
+unity; every other input and playback crosspoint in that pair is zeroed and
+both FX returns are set to `0xFD76`. Releasing the last PFL input restores the
+pair from the channel model and restores its FX returns. PFL has no device
+flag; the monitor mask and other monitor flags are not changed.
 
 ### 4.5 Setup store
 

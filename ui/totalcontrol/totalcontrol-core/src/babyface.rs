@@ -1329,6 +1329,7 @@ impl RmeDevice for BabyfacePro {
                 main_b_out: None,
                 mono: false,
                 mute_fx: false,
+                external_input: false,
                 fx_send_db: None,
                 reverb: None,
                 echo: None,

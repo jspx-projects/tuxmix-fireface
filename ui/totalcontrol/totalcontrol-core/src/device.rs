@@ -145,6 +145,11 @@ pub struct DeviceSettings {
     /// outputs' FX-return levels, and part of the mixer scene.
     #[serde(default)]
     pub mute_fx: bool,
+    /// Control-room External Input engaged.  Runtime monitor state; the
+    /// source pair and gain come from the GUI preferences and are passed to
+    /// [`RmeDevice::set_external_input`].
+    #[serde(default)]
+    pub external_input: bool,
     /// FX send level in dB (-65..0, None = unset). 0 dB = max send.
     /// `Option` so old scenes (no send) stay untouched on apply.
     #[serde(default)]
@@ -697,6 +702,41 @@ pub trait RmeDevice {
         Err(Error::InvalidChannel(
             "Mute FX is not supported on this backend".into(),
         ))
+    }
+
+    /// Control-room External Input: replace the Main Out and Speaker B
+    /// submixes with the selected hardware input pair at `gain_db`, and set
+    /// the monitor flag.  Releasing restores the normal matrix.
+    fn set_external_input(
+        &mut self,
+        on: bool,
+        source: Option<usize>,
+        gain_db: f32,
+    ) -> Result<(), Error> {
+        let _ = (on, source, gain_db);
+        Err(Error::InvalidChannel(
+            "External Input is not supported on this backend".into(),
+        ))
+    }
+
+    /// The output pair that receives PFL / Cue monitoring.  `None` means
+    /// the backend has no separate cue target.
+    fn set_cue_target(&mut self, pair: Option<usize>) -> Result<(), Error> {
+        let _ = pair;
+        Ok(())
+    }
+
+    /// PFL replaces Solo for input channels.  The input is routed
+    /// pre-fader and at unity to the cue target while the source's normal
+    /// sends are suppressed.
+    fn set_pfl(&mut self, channel: ChannelId, on: bool) -> Result<(), Error> {
+        self.set_solo(channel, on)
+    }
+
+    /// Select PFL mode and whether only one input may listen at a time.
+    fn set_pfl_mode(&mut self, pfl: bool, exclusive: bool) -> Result<(), Error> {
+        let _ = (pfl, exclusive);
+        Ok(())
     }
 
     /// Control-room Speaker B switch.

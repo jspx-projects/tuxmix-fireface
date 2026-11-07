@@ -596,6 +596,23 @@ impl RmeDevice for DeviceHandle {
     fn set_mute_fx(&mut self, on: bool) -> Result<(), totalcontrol_core::Error> {
         delegate!(self, set_mute_fx(on))
     }
+    fn set_external_input(
+        &mut self,
+        on: bool,
+        source: Option<usize>,
+        gain_db: f32,
+    ) -> Result<(), totalcontrol_core::Error> {
+        delegate!(self, set_external_input(on, source, gain_db))
+    }
+    fn set_cue_target(&mut self, pair: Option<usize>) -> Result<(), totalcontrol_core::Error> {
+        delegate!(self, set_cue_target(pair))
+    }
+    fn set_pfl(&mut self, channel: ChannelId, on: bool) -> Result<(), totalcontrol_core::Error> {
+        delegate!(self, set_pfl(channel, on))
+    }
+    fn set_pfl_mode(&mut self, pfl: bool, exclusive: bool) -> Result<(), totalcontrol_core::Error> {
+        delegate!(self, set_pfl_mode(pfl, exclusive))
+    }
     fn set_channel_fx_send(
         &mut self,
         channel: ChannelId,
@@ -2141,6 +2158,8 @@ pub enum Message {
     ControlRoomMono(bool),
     /// Control-room Mute FX option (host-side).
     ControlRoomMuteFx(bool),
+    /// Control-room External Input engaged (device-backed).
+    ExternalInput(bool),
     /// Control-room Talkback on/off.
     TalkbackChanged(bool),
     /// Control Room Settings dialog.
@@ -3383,6 +3402,42 @@ pub fn apply_prefs(state: &mut TotalControl, prefs: crate::prefs::Prefs) {
 /// device's `main_out`/`main_b_out` are separate records; Dim and Recall
 /// read the device model, so the two must agree after startup, a device
 /// switch or a scene load.
+/// Output pair currently selected as the Cue/PFL target.
+fn control_room_cue_pair(state: &TotalControl) -> Option<usize> {
+    let dest = state.cue_target();
+    state.assign.get(dest).and_then(|slot| *slot)
+}
+
+/// Push the runtime-only Control Room state (Cue target, PFL mode, External
+/// Input) into the device.  Safe to call after connects, scene loads and
+/// settings changes.
+fn sync_control_room_runtime(state: &mut TotalControl) {
+    if let Err(e) = state.device.set_cue_target(control_room_cue_pair(state)) {
+        log::warn!("Could not set the Cue/PFL target: {e}");
+    }
+    if let Err(e) = state.device.set_pfl_mode(
+        state.control_room.pfl_replaces_solo,
+        state.control_room.exclusive_solo_pfl,
+    ) {
+        log::warn!("Could not set PFL mode: {e}");
+    }
+    let active = state.device.settings().external_input;
+    if active {
+        if let Err(e) = state.device.set_external_input(false, None, 0.0) {
+            log::warn!("Could not release External Input: {e}");
+        }
+        if let Some(source) = state.control_room.external_input {
+            if let Err(e) = state.device.set_external_input(
+                true,
+                Some(source),
+                state.control_room.external_gain_db,
+            ) {
+                log::warn!("Could not re-engage External Input: {e}");
+            }
+        }
+    }
+}
+
 pub fn apply_control_room_assignments(
     state: &mut TotalControl,
 ) -> Result<(), totalcontrol_core::Error> {
@@ -3412,6 +3467,7 @@ pub fn apply_control_room_assignments(
         .device
         .set_speaker_b_linked(state.control_room.speaker_b_linked)?;
     enforce_control_room_stereo(state);
+    sync_control_room_runtime(state);
     Ok(())
 }
 
@@ -4278,6 +4334,21 @@ fn set_channel_pan(state: &mut TotalControl, cid: ChannelId, out: usize, pan: i8
 
 /// Same idea as `set_channel_volume`, for solo.
 fn set_channel_solo(state: &mut TotalControl, cid: ChannelId, s: bool) {
+    if state.control_room.pfl_replaces_solo {
+        if let ChannelId::Input(ch) = cid {
+            let pair = ch / 2;
+            let (left, right) = (pair * 2, pair * 2 + 1);
+            let _ = if state.device.input_pair_linked(pair) {
+                state
+                    .device
+                    .set_pfl(ChannelId::Input(left), s)
+                    .and_then(|_| state.device.set_pfl(ChannelId::Input(right), s))
+            } else {
+                state.device.set_pfl(ChannelId::Input(ch), s)
+            };
+            return;
+        }
+    }
     let _ = match cid {
         ChannelId::Input(ch) => state.device.set_input_solo(ch / 2, ch % 2, s),
         ChannelId::Playback(ch) => state.device.set_playback_solo(ch / 2, ch % 2, s),
@@ -4925,6 +4996,12 @@ fn global_channel_messages(
         ChannelControl::TalkbackSel(on) if bus == crate::osc_global::Bus::Output => {
             vec![Message::TalkbackReceiveChanged(channel, *on)]
         }
+        ChannelControl::Pfl(on)
+            if bus == crate::osc_global::Bus::Input
+                && state.control_room.pfl_replaces_solo =>
+        {
+            vec![Message::Solo(cid, *on)]
+        }
         ChannelControl::LowCut(control) if bus != crate::osc_global::Bus::Playback => {
             global_lowcut_messages(cid, control)
         }
@@ -4981,6 +5058,11 @@ fn global_control_room_messages(
         ControlRoomControl::Dim(on) => vec![Message::Dim(*on)],
         ControlRoomControl::SpeakerB(on) => vec![Message::SpeakerB(*on)],
         ControlRoomControl::MuteFx(on) => vec![Message::ControlRoomMuteFx(*on)],
+        ControlRoomControl::ExternalIn(on) => vec![Message::ExternalInput(*on)],
+        ControlRoomControl::ExtInChannel(channel) => {
+            vec![Message::ControlRoomExternalInput(Some(channel / 2))]
+        }
+        ControlRoomControl::ExtInGain(db) => vec![Message::ControlRoomExternalGain(*db)],
         ControlRoomControl::Talkback(on) => vec![Message::TalkbackChanged(*on)],
         ControlRoomControl::LinkAB(on) => vec![Message::SpeakerBLinked(*on)],
         ControlRoomControl::Recall => vec![Message::ControlRoomRecall],
@@ -5335,7 +5417,7 @@ fn global_control_room_state(state: &TotalControl) -> Vec<crate::osc_global::Glo
         )));
     }
     out.push(GlobalCommand::ControlRoom(ControlRoomControl::ExternalIn(
-        state.control_room.external_input.is_some(),
+        state.device.settings().external_input,
     )));
     if let Some(pair) = state.control_room.external_input {
         out.push(GlobalCommand::ControlRoom(ControlRoomControl::ExtInChannel(
@@ -8462,6 +8544,7 @@ pub fn update(state: &mut TotalControl, message: Message) -> Task<Message> {
             if CUE_TARGETS.contains(&target) {
                 state.assign[CUE_DEST] = Some(target);
             }
+            sync_control_room_runtime(state);
         }
         Message::AssignOutput(dest, pair) => {
             // Choosing an output ends the menu, like TotalMix's.
@@ -8939,6 +9022,21 @@ pub fn update(state: &mut TotalControl, message: Message) -> Task<Message> {
             state.device.settings_mut().mute_fx = on;
             notify_osc_bool(state, "/mute_fx", on);
         }
+        Message::ExternalInput(on) => {
+            let source = state.control_room.external_input;
+            if on && source.is_none() {
+                return Task::none();
+            }
+            if let Err(e) = state.device.set_external_input(
+                on,
+                source,
+                state.control_room.external_gain_db,
+            ) {
+                fail(state, "external input", &e);
+            }
+            state.device.settings_mut().external_input = on;
+            notify_osc_bool(state, "/external_input", on);
+        }
         Message::TalkbackChanged(on) => {
             if let Err(e) = state.device.set_talkback_with(on, &talkback_config(state)) {
                 fail(state, "talkback", &e);
@@ -8973,6 +9071,7 @@ pub fn update(state: &mut TotalControl, message: Message) -> Task<Message> {
             {
                 fail(state, "speaker B link", &e);
             }
+            sync_control_room_runtime(state);
         }
         Message::ResetControlRoomSettings => {
             state.control_room_draft = ControlRoomSettings::default();
@@ -9000,9 +9099,18 @@ pub fn update(state: &mut TotalControl, message: Message) -> Task<Message> {
         }
         Message::ControlRoomExternalInput(pair) => {
             state.control_room_draft.external_input = pair;
+            if !state.control_room_settings_open {
+                state.control_room.external_input = pair;
+                sync_control_room_runtime(state);
+            }
         }
         Message::ControlRoomExternalGain(db) => {
-            state.control_room_draft.external_gain_db = round_half_db(db);
+            let db = round_half_db(db);
+            state.control_room_draft.external_gain_db = db;
+            if !state.control_room_settings_open {
+                state.control_room.external_gain_db = db;
+                sync_control_room_runtime(state);
+            }
         }
         Message::ControlRoomPflReplacesSolo(on) => {
             state.control_room_draft.pfl_replaces_solo = on;
@@ -11436,6 +11544,8 @@ fn strip_params<'a>(
             .find(|(c, _)| *c == cid)
             .map(|(_, k)| *k),
         mute: false,
+        pfl: state.control_room.pfl_replaces_solo
+            && matches!(cid, ChannelId::Input(_)),
         solo: false,
         mute_armed: false,
         solo_armed: false,
@@ -15059,7 +15169,15 @@ fn control_room_panel(
                     .is_ucx_model()
                     .then_some(Message::TalkbackChanged(!state.talkback_on)),
             ),
-            cell("ext. input", theme::TEXT_SM, false, None),
+            cell(
+                "ext. input",
+                theme::TEXT_SM,
+                settings.external_input,
+                state
+                    .control_room
+                    .external_input
+                    .map(|_| Message::ExternalInput(!settings.external_input)),
+            ),
             cell(
                 "mute FX",
                 theme::TEXT_MD,
